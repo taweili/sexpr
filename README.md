@@ -65,16 +65,55 @@ any agent's debugger, patch a function, and let it continue.
 ## Repository
 
 ```
+sexpr.asd              ASDF system definition
+src/
+  package.lisp         :sexpr package
+  sexpr.lisp           identity + `hello' entry point
+qlfile                 Qlot deps (empty for now)
+Makefile               `make hello`, `make load`, `make clean`
 notes/
-  sexpr.md            — thesis, layer-by-layer mapping, open questions
-  agent.md            — 2025 harness research (context engineering, skills, MCP)
-  symbolics-lisp.md   — Symbolics / Genera / Dynamic Windows lineage
-  sbcl.md             — SBCL, Quicklisp, hot-patching, condition system, save-lisp-and-die
-  sbcl-libs.md        — CL library survey mapped to the sexpr design
+  sexpr.md             — thesis, layer-by-layer mapping, open questions
+  agent.md             — 2025 harness research (context engineering, skills, MCP)
+  symbolics-lisp.md    — Symbolics / Genera / Dynamic Windows lineage
+  sbcl.md              — SBCL, Quicklisp, hot-patching, condition system, save-lisp-and-die
+  sbcl-libs.md         — CL library survey mapped to the sexpr design
 ```
 
-`notes/sexpr.md` is the entry point. The others are the research base it's
-synthesized from.
+`notes/sexpr.md` is the entry point for the design. The others are the research
+base it's synthesized from.
+
+## Getting started
+
+Prerequisites: **SBCL** and **Quicklisp**. One-time bootstrap:
+
+```sh
+curl -O https://beta.quicklisp.org/quicklisp.lisp
+sbcl --load quicklisp.lisp --eval '(quicklisp-quickstart:install)' \
+     --eval '(ql:add-to-init-file)'
+```
+
+Then register this project with Quicklisp (one-time, from a checkout):
+
+```sh
+ln -s "$PWD" ~/quicklisp/local-projects/sexpr
+```
+
+Run the smoke test:
+
+```sh
+make hello
+# or, directly:
+sbcl --load ~/.sbclinit \
+     --eval '(ql:quickload "sexpr")' \
+     --eval '(sexpr:hello)'
+```
+
+Load into an interactive session for development:
+
+```sh
+make load
+# type: (sexpr:hello)
+```
 
 ## Status
 

@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: Unlicense
+# qlfile — Qlot dependency file.
+#
+# External Quicklisp systems the project depends on, one per line.
+# The project currently has no external dependencies; the sexpr kernel
+# is self-contained. Add dependencies here as the project grows, e.g.:
+#   alexandria
+#   bordeaux-threads
+#   eclector

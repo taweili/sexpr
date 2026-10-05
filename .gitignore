@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Unlicense
+# FASLs and other build artifacts
+*.fasl
+*.fbas
+*.lib
+*.al
+
+# Qlot / Quicklisp workdirs
+.ql/
+.ql-bin/
+ql/
+
+# Editor cruft
+*~
+.#*
+#*.lock
+
+# OS cruft
+.DS_Store
+Thumbs.db
