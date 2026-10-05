@@ -7,4 +7,5 @@
   (:export
    #:name
    #:version
-   #:hello))
+   #:hello
+   #:hello-llm))

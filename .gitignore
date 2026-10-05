@@ -18,3 +18,10 @@ ql/
 # OS cruft
 .DS_Store
 Thumbs.db
+
+# Agent / harness cruft (pi, gsd, claude, mcp) — machine-specific
+.bg-shell/
+.claude/
+.gsd/
+.mcp.json
+

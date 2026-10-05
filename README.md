@@ -68,8 +68,11 @@ any agent's debugger, patch a function, and let it continue.
 sexpr.asd              ASDF system definition
 src/
   package.lisp         :sexpr package
-  sexpr.lisp           identity + `hello' entry point
-qlfile                 Qlot deps (empty for now)
+  sexpr.lisp           identity + `hello' entry point; test-op method
+  provider/            the "Ivory" layer — LLM providers as sockets
+    package.lisp       :sexpr.provider package
+    provider.lisp      provider-call GF + configuration (cl-llm-provider transport)
+qlfile                 Qlot deps (cl-llm-provider, GitHub-pinned)
 Makefile               `make hello`, `make load`, `make clean`
 notes/
   sexpr.md             — thesis, layer-by-layer mapping, open questions
@@ -98,6 +101,15 @@ Then register this project with Quicklisp (one-time, from a checkout):
 ln -s "$PWD" ~/quicklisp/local-projects/sexpr
 ```
 
+sexpr depends on **cl-llm-provider** (the unified LLM transport — Anthropic,
+OpenAI, Gemini, Ollama, OpenRouter). It is not (yet) in the Quicklisp dist, so
+vendor it into local-projects too:
+
+```sh
+git clone https://github.com/quasi/cl-llm-provider \
+  ~/quicklisp/local-projects/cl-llm-provider
+```
+
 Run the smoke test:
 
 ```sh
@@ -115,12 +127,49 @@ make load
 # type: (sexpr:hello)
 ```
 
+## Model provider
+
+The model is a socket (`notes/sexpr.md` §2). `src/provider/` is the "Ivory"
+layer: a single generic function, `sexpr.provider:provider-call`, that returns
+s-expression transcript nodes (`:content`, `:tool-calls`, `:model`, `:usage`,
+`:finish`) — never raw provider objects. cl-llm-provider is the concrete
+transport; tool *execution* stays in the sexpr kernel (transport only, by
+design).
+
+**Configure** via environment variables (API keys are read directly by
+cl-llm-provider):
+
+```sh
+export OPENAI_API_KEY="sk-..."        # or ANTHROPIC_API_KEY, OPENROUTER_API_KEY, ...
+export SEXPR_PROVIDER="openai"        # :anthropic | :openai | :gemini | :ollama | :openrouter
+export SEXPR_MODEL="gpt-4o-mini"      # optional; defaults to the provider's default
+```
+
+Then from Lisp:
+
+```lisp
+(ql:quickload :sexpr)
+(in-package :sexpr.provider)
+(configure-provider)                    ; picks up the env vars above
+;; or, explicitly:
+(configure-provider :provider :anthropic :model "claude-3-5-sonnet-latest")
+```
+
+`*model-endpoint*` is realized lazily on the first `provider-call` (so
+configuration never fails just because a key isn't set yet). Swap providers by
+rebinding — `(let ((*model-endpoint* (make-provider :ollama))) ...)` — the
+central design invariant.
+
 ## Status
 
-Brainstorm / design phase. No code yet. The design has been cross-checked against
-a concrete library survey (see `notes/sbcl-libs.md`) — most of the substrate
-exists in Quicklisp; the novel pieces are the transcript compactor, the
-token-budgeted presentation renderer, and a capability-restricted eval sandbox.
+Design phase, with the model/transport layer wired. The cl-llm-provider
+dependency is installed and `src/provider/` exposes the `provider-call` boundary
+(verified end-to-end: configuration → provider realization → HTTP → the
+provider's condition/restart error recovery). The design has been
+cross-checked against a concrete library survey (see `notes/sbcl-libs.md`) —
+most of the substrate exists in Quicklisp; the novel pieces still ahead are the
+transcript compactor, the token-budgeted presentation renderer, and a
+capability-restricted eval sandbox.
 
 ## Open questions
 
