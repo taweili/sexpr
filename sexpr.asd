@@ -59,6 +59,7 @@
   ((:module "tests"
      :components
      ((:file "package")
+      (:file "provider" :depends-on ("package"))
       (:file "smoke" :depends-on ("package"))
       (:file "transcript" :depends-on ("package"))
       (:file "kernel" :depends-on ("package"))
