@@ -19,8 +19,12 @@
   (:nicknames :$.cli)
   (:use :cl :sexpr.transcript :sexpr.kernel)
   (:export
+   #:build
    #:chat
    #:chat-loop
    #:chat-session
    #:chat-session-agent
-   #:chat-session-cursor))
+   #:chat-session-cursor
+   #:main
+   #:parse-args
+   #:print-usage))

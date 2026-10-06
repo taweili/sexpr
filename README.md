@@ -72,6 +72,9 @@ src/
   provider/            the "Ivory" layer — LLM providers as sockets
     package.lisp       :sexpr.provider package
     provider.lisp      provider-call GF + configuration (cl-llm-provider transport)
+  transcript/          events, print/read round-trip, the GC substrate
+  kernel/              the agent: budget, transcript, model-step, run-until-finished
+  cli/                 the Listener: chat loop, slash commands, SIGINT, argv/main/build
 qlfile                 Qlot deps (cl-llm-provider, GitHub-pinned)
 Makefile               `make hello`, `make load`, `make clean`
 notes/
@@ -159,6 +162,74 @@ Then from Lisp:
 configuration never fails just because a key isn't set yet). Swap providers by
 rebinding — `(let ((*model-endpoint* (make-provider :ollama))) ...)` — the
 central design invariant.
+
+## Chat interface
+
+`sexpr.cli` is the Listener — the terminal front end. The image is the
+state; the transcript is its conversation slice; the model is a socket
+reached only through the kernel, never imported into the Listener (R015).
+Each line you type becomes a transcript event; `run-until-finished` folds
+one bounded model turn; new events render back to the screen.
+
+```sh
+./sexpr --goal "summarize the design"
+```
+
+Ctrl-C aborts a running turn and returns to the prompt — the partial
+transcript stays readable, no rollback (R013). A second Ctrl-C at an idle
+prompt exits.
+
+### Slash commands
+
+| Command        | Effect                                              |
+|----------------|-----------------------------------------------------|
+| `/exit`        | quit the session                                    |
+| `/quit`        | quit the session                                    |
+| `/help`        | list the commands                                   |
+| `/transcript`  | print the whole transcript                          |
+| `/system TEXT` | set the system prompt (persona)                     |
+| `/save FILE`   | write the session transcript to FILE                |
+| `/load FILE`   | load a transcript from FILE, replacing the session  |
+| `/retry`       | pop the last model reply and re-run one turn        |
+
+`/save` and `/load` round-trip through the transcript's own `print`/`read`
+(`with-standard-io-syntax`, `*read-eval*` nil) — no separate serializer
+(R012).
+
+### Flags
+
+```sh
+./sexpr --goal "TEXT" [--load FILE] [--provider NAME] [--model NAME] [--help | -h]
+```
+
+| Flag              | Meaning                                            |
+|-------------------|----------------------------------------------------|
+| `--goal TEXT`     | the agent's goal (required to enter the loop)       |
+| `--load FILE`     | start from a saved transcript                      |
+| `--provider NAME` | configure the provider transport (qualified call)  |
+| `--model NAME`    | configure the model name                           |
+| `--help`, `-h`    | print usage and exit (never enters chat)           |
+
+`--provider`/`--model` reach the transport by the single qualified
+`sexpr.provider:configure-provider` reference; the Listener never imports
+the transport package (R015).
+
+### Deliberately out (R016)
+
+History, streaming, multiline input, and tool dispatch are **not** in the
+Listener. Line history and editing come from an external tool like
+`rlwrap` — wrap the binary, do not depend on it here:
+
+```sh
+rlwrap ./sexpr --goal "..."
+```
+
+No readline, no threading, no streaming — the transcript is the state,
+and each turn is one bounded fold over it.
+
+> The `Makefile` `build`/`chat` targets and the actual `./sexpr` binary
+> verification are S03; the in-image definitions (`main`, `build`) ship
+> in `src/cli/`.
 
 ## Status
 

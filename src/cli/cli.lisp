@@ -11,9 +11,9 @@
 ;;;; BOUNDARY (AGENT.md invariants #1/#3, R015): :sexpr.provider is
 ;;;; deliberately NOT in :use. The model is reached only transitively
 ;;;; via run-until-finished → model-step → provider-call. This module
-;;;; never imports the provider transport. (The single qualified
-;;;; sexpr.provider:configure-provider reference for --provider/--model
-;;;; lands in the arg parser — a later task.)
+;;;; never imports the provider transport; the single qualified
+;;;; sexpr.provider:configure-provider reference (for --provider/--model)
+;;;; lives in main below.
 
 (in-package :sexpr.cli)
 
@@ -196,28 +196,61 @@ aborts it and returns to the prompt (R013); the partial transcript stays
 readable. Returns SESSION.
 
 Read EOF with the missing-arg form (read-line input nil :eof) and test
-the sentinel — never the error-signaling form, or scripted input hangs."
+the sentinel — never the error-signaling form, or scripted input hangs.
+
+R013's two interrupt paths share one handler form. A Ctrl-C *inside* a
+running turn aborts that turn only and returns to the prompt (see
+run-turn-and-render). A Ctrl-C at an *idle* prompt is a two-press contract:
+the first press prints a notice and re-prompts, the second exits.
+"
   (let ((agent (chat-session-agent session))
         (in    (or input  *standard-input*))
-        (out   (or output *standard-output*)))
-    (loop :for line = (read-line in nil :eof)
-          :until (eq line :eof)
-          :do
-          (multiple-value-bind (cmd rest) (parse-slash-command line)
-            (cond
-              (cmd
-               (when (eq :exit (dispatch-slash-command
-                                 session cmd rest
-                                 :output out :max-steps max-steps))
-                 (return-from chat-loop session)))
-              (t
-               (let ((tr (agent-transcript agent)))
-                 ;; The human already sees their line on the terminal;
-                 ;; record it and point the cursor past it so only model
-                 ;; events render.
-                 (append-event tr (make-user-event line))
-                 (setf (chat-session-cursor session) (transcript-length tr))
-                 (run-turn-and-render session out max-steps))))))
+        (out   (or output *standard-output*))
+        ;; Two-Ctrl-C-at-idle-exits contract (R013). A SIGINT arriving while
+        ;; read-line blocks at the prompt sets this flag, prints a notice, and
+        ;; re-prompts; a SECOND SIGINT while the flag is already set returns
+        ;; from chat-loop. The flag resets on every successfully-read line
+        ;; (including :eof), so a turn's own work between two idle interrupts
+        ;; never counts as the "second" one.
+        (idle-sigint-seen nil))
+    (loop
+       (let (line)
+         ;; Wrap the idle read-line: on a live terminal a Ctrl-C delivered
+         ;; while read-line blocks arrives as sb-sys:interactive-interrupt —
+         ;; the same condition run-turn-and-render catches, so this one handler
+         ;; form covers both the OS-delivered and the explicitly-signaled
+         ;; paths. When it fires LINE stays NIL, and the guard below re-prompts.
+         (handler-case
+             (setf line (read-line in nil :eof))
+           (sb-sys:interactive-interrupt ()
+             (cond
+               (idle-sigint-seen
+                (return-from chat-loop session))
+               (t
+                (setf idle-sigint-seen t)
+                (format out
+                        "~&; [interrupted at prompt — Ctrl-C again to exit]~%")
+                (finish-output out)))))
+         (when line
+           ;; A line actually arrived — clear the idle-SIGINT flag.
+           (setf idle-sigint-seen nil)
+           (when (eq line :eof)
+             (return-from chat-loop session))
+           (multiple-value-bind (cmd rest) (parse-slash-command line)
+             (cond
+               (cmd
+                (when (eq :exit (dispatch-slash-command
+                                  session cmd rest
+                                  :output out :max-steps max-steps))
+                  (return-from chat-loop session)))
+               (t
+                (let ((tr (agent-transcript agent)))
+                  ;; The human already sees their line on the terminal;
+                  ;; record it and point the cursor past it so only model
+                  ;; events render.
+                  (append-event tr (make-user-event line))
+                  (setf (chat-session-cursor session) (transcript-length tr))
+                  (run-turn-and-render session out max-steps))))))))
     session))
 (export 'chat-loop)
 
@@ -246,3 +279,126 @@ standard streams. Returns the chat session."
               :output    output
               :max-steps max-steps)))
 (export 'chat)
+
+;;; --- the executable toplevel (T04; binary = S03) -------------------
+;;;
+;;; parse-args is a hand-written loop (R016: no flag library). main is
+;;; the save-lisp-and-die toplevel; --help routes to an early return so it
+;;; never enters the chat loop. build dumps the image; the actual ./sexpr
+;;; binary and the Makefile targets are verified in S03.
+
+(defun parse-args (argv)
+  "Parse ARGV (a list of program-argument strings, argv[0] first) into a
+plist of options.
+
+argv[0] (the program name) is skipped. Recognizes --goal VALUE, --load
+FILE, --help / -h, --provider VALUE, and --model VALUE. A flag expecting
+a value that is last (with none following) binds nil. An unrecognized
+token is collected under :rest in argv order so the caller can diagnose
+it. No external dependency (R016: hand-written, not a flag library)."
+  (let ((args (rest argv))            ; skip argv[0] — the program name
+        (plist nil)
+        (unknown nil))
+    (loop :while args
+          :do (let ((arg (pop args)))
+                (cond
+                  ((or (string= arg "--help") (string= arg "-h"))
+                   (setf (getf plist :help) t))
+                  ((string= arg "--goal")
+                   (setf (getf plist :goal) (pop args)))
+                  ((string= arg "--load")
+                   (setf (getf plist :load) (pop args)))
+                  ((string= arg "--provider")
+                   (setf (getf plist :provider) (pop args)))
+                  ((string= arg "--model")
+                   (setf (getf plist :model) (pop args)))
+                  (t
+                   (push arg unknown)))))
+    ;; unknown accumulated in reverse by push; flip to argv order.
+    (when unknown
+      (setf (getf plist :rest) (nreverse unknown)))
+    plist))
+(export 'parse-args)
+
+(defun print-usage (&optional (stream *standard-output*))
+  "Print the flag list and the slash commands to STREAM.
+
+The flags drive the executable toplevel; the slash commands drive the
+chat loop. --help is the one place a human looks, so both surfaces are
+listed here."
+  (format stream "~&usage: sexpr [--goal TEXT] [--load FILE]~%")
+  (format stream "~&                  [--provider NAME] [--model NAME]~%")
+  (format stream "~&                  [--help | -h]~%")
+  (format stream "~&~%")
+  (format stream "~&flags:~%")
+  (format stream "~&  --goal TEXT        the agent's goal (required to enter the loop)~%")
+  (format stream "~&  --load FILE        start from a saved transcript~%")
+  (format stream "~&  --provider NAME    configure the provider transport~%")
+  (format stream "~&  --model NAME       configure the model name~%")
+  (format stream "~&  --help, -h         print this usage and exit~%")
+  (format stream "~&~%")
+  (format stream "~&slash commands (inside the chat loop):~%")
+  (format stream "~&  /exit              quit the session~%")
+  (format stream "~&  /quit              quit the session~%")
+  (format stream "~&  /help              show the command list~%")
+  (format stream "~&  /transcript        print the whole transcript~%")
+  (format stream "~&  /system TEXT       set the system prompt~%")
+  (format stream "~&  /save FILE         save the session to FILE~%")
+  (format stream "~&  /load FILE         load a session from FILE~%")
+  (format stream "~&  /retry             re-run the last model turn~%")
+  (finish-output stream))
+(export 'print-usage)
+
+(defun main (&optional (argv sb-ext:*posix-argv*) &key input output)
+  "The executable toplevel: parse ARGV (defaulting to sb-ext:*posix-argv*)
+and dispatch.
+
+--help / -h prints usage and returns — it never enters the chat loop, so
+a test or a help-seeking user cannot hang. --provider / --model reach the
+provider transport by the single qualified sexpr.provider:configure-provider
+reference (R015: :sexpr.provider is NOT in :use). --load FILE reads a
+transcript via sexpr.transcript:read-transcript. Then the chat loop runs
+with :endpoint nil — the model is reached only transitively via
+run-until-finished. INPUT / OUTPUT pass through to chat for testability; a
+real run leaves them nil so chat defaults to the standard streams.
+
+Returns nil for --help; otherwise returns the chat session (a real run
+exits only on /exit, /quit, EOF, or a second idle Ctrl-C)."
+  (let ((opts (parse-args argv)))
+    (if (getf opts :help)
+        (print-usage (or output *standard-output*))
+        (progn
+          ;; The ONLY sexpr.provider reference in this module: a qualified
+          ;; call, never an import. Pass just the flags that were given so
+          ;; configure-provider's p-supp/m-supp branches see only what the
+          ;; user set — passing :model nil would clobber an env var.
+          (when (or (getf opts :provider) (getf opts :model))
+            (apply #'sexpr.provider:configure-provider
+                   (nconc (when (getf opts :provider)
+                            (list :provider (getf opts :provider)))
+                          (when (getf opts :model)
+                            (list :model (getf opts :model))))))
+          (let ((transcript nil))
+            (when (getf opts :load)
+              (with-open-file (stream (getf opts :load) :direction :input)
+                (setf transcript (read-transcript stream))))
+            (chat :goal     (getf opts :goal)
+                  :endpoint nil
+                  :transcript transcript
+                  :input      input
+                  :output     output))))))
+(export 'main)
+
+(defun build (&optional (name "sexpr"))
+  "Dump an executable image named NAME with sexpr.cli:main as the toplevel.
+
+:save-runtime-options t preserves SBCL's SIGINT delivery so a Ctrl-C at
+the binary still arrives as sb-sys:interactive-interrupt (R013 under the
+executable). save-lisp-and-die terminates the image, so this is defined
+but not exercised by the rove suite; the ./sexpr binary and the Makefile
+build target are verified in S03."
+  (sb-ext:save-lisp-and-die name
+    :executable t
+    :toplevel 'sexpr.cli:main
+    :save-runtime-options t))
+(export 'build)

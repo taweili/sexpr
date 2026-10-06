@@ -44,8 +44,18 @@ src/package.lisp        :sexpr package (nickname :$)
 src/sexpr.lisp          identity, hello, hello-llm, asdf test-op method
 src/provider/package.lisp    :sexpr.provider (nickname :$.provider)
 src/provider/provider.lisp   the "Ivory" layer — provider-call boundary
+src/transcript/         events, print/read round-trip, the GC substrate
+src/kernel/             the agent: budget, transcript, model-step, run-until-finished
+src/cli/                the Listener: chat loop, slash commands, SIGINT turn-abort, parse-args/main/build (R015: never :use :sexpr.provider)
 notes/                  design notes + research base (see below)
 ```
+
+`src/cli/` (the Listener) is provider-agnostic by construction (R015):
+`sexpr.cli` `:use` is `(:cl :sexpr.transcript :sexpr.kernel)` — never
+`:sexpr.provider`. The model is reached only transitively via
+`run-until-finished` → `model-step` → `provider-call`; the single qualified
+`sexpr.provider:configure-provider` reference (for `--provider`/`--model`)
+is the only place the Listener names the transport.
 
 `notes/` is the reference literature for the project, not commentary.
 `notes/sexpr.md` is the design thesis and the layer-by-layer mapping

@@ -200,3 +200,110 @@
     (ok (= (transcript-length
              (agent-transcript (chat-session-agent session))) 0)
         "no user event was appended for an unknown command")))
+
+;;;; --- SIGINT abort fixture ------------------------------------------
+;;;;
+;;;; sigint-stub raises sb-sys:interactive-interrupt on its FIRST provider
+;;;; call and returns a normal node afterwards, so the abort path is driven
+;;;; deterministically — no real signals, no threads. It is signaled, not
+;;;; thrown, because that is the same path a live Ctrl-C takes: SBCL delivers
+;;;; an interactive-interrupt from the OS, and a signaled one is caught by the
+;;;; identical handler-case form in cli.lisp. Both routes share one handler.
+;;;;
+;;;; The IDLE two-Ctrl-C-exits contract in chat-loop is implemented in code
+;;;; but deliberately NOT covered by an automated test. Simulating a Ctrl-C
+;;;; that lands while read-line blocks needs either a real signal (out of
+;;;; scope here) or a fixture stream that overrides read-line to signal — but
+;;;; in SBCL 2.6.8 both read-line and read-char are ordinary functions, not
+;;;; generic, so no stream subclass can interpose. Verified on this build.
+
+(defclass sigint-stub (stub-endpoint)
+  ()
+  (:documentation "A stub-endpoint that raises sb-sys:interactive-interrupt on
+its first provider call and returns a normal node thereafter."))
+
+(defmethod sexpr.provider:provider-call ((endpoint sigint-stub) messages
+                                          &key system tools temperature
+                                          max-tokens)
+  "First call raises sb-sys:interactive-interrupt (an aborted turn); later
+calls return a normal :stop node."
+  (declare (ignore messages system tools temperature max-tokens))
+  (incf (stub-call-count endpoint))
+  (if (= (stub-call-count endpoint) 1)
+      (error 'sb-sys:interactive-interrupt)
+      (list :content "resumed reply" :finish :stop)))
+
+(rove:deftest chat-aborts-a-turn-on-sigint-and-continues
+  "A Ctrl-C during a turn aborts it — notice printed, transcript not rolled
+back — and the loop returns to the prompt and keeps going (R013)."
+  (let* ((stub (make-instance 'sigint-stub))
+         (out  (make-string-output-stream))
+         (session (chat :goal "g" :endpoint stub
+                        :input  (make-string-input-stream
+                                  (format nil "hello~%world"))
+                        :output out
+                        :max-steps 1)))
+    (let* ((agent  (chat-session-agent session))
+           (tr     (agent-transcript agent))
+           (events (transcript-events tr))
+           (output (get-output-stream-string out)))
+      (ok (search "turn aborted" output)
+          "the aborted turn printed its notice")
+      (ok (= (stub-call-count stub) 2)
+          "the model was called twice — once aborted for hello, once for world")
+      (ok (search "resumed reply" output)
+          "the second turn ran normally and its reply was rendered")
+      (ok (= (length events) 3)
+          "the transcript holds user-hello, user-world, and one model reply")
+      (ok (eq (event-type (aref events 0)) :user)
+          "the aborted turn's user event was kept — no rollback")
+      (ok (eq (event-type (aref events 1)) :user)
+          "the second line's user event landed after the abort")
+      (ok (eq (event-type (aref events 2)) :model)
+          "the resumed turn's model reply is the final event")
+      (ok (render-events tr)
+          "the transcript reads back without error after the abort")
+      (ok (= (chat-session-cursor session) (transcript-length tr))
+          "the render cursor is consistent with the transcript after the abort"))))
+
+;;; --- parse-args / main (T04; binary build = S03) --------------------
+;;;
+;;; parse-args is pure: a list of strings in, a plist out. main routes
+;;; --help to an early return so the help test never enters the chat loop.
+;;; build (sexpr.cli:build) is defined but intentionally NOT exercised —
+;;; sb-ext:save-lisp-and-die terminates the image; the ./sexpr binary and
+;;; the Makefile build target are verified in S03.
+
+(rove:deftest parse-args-parses-goal-and-load
+  "parse-args skips argv[0] and binds --goal and --load to their values."
+  (let ((opts (parse-args (list "sexpr" "--goal" "g" "--load" "f.sexp"))))
+    (ok (string= (getf opts :goal) "g")
+        ":goal is the value after --goal")
+    (ok (string= (getf opts :load) "f.sexp")
+        ":load is the value after --load")))
+
+(rove:deftest parse-args-help-flag-returns-help
+  "parse-args binds :help to t for --help and for -h."
+  (ok (getf (parse-args (list "sexpr" "--help")) :help)
+      ":help is true for --help")
+  (ok (getf (parse-args (list "sexpr" "-h")) :help)
+      ":help is true for -h"))
+
+(rove:deftest parse-args-collects-unknown-flags-under-rest
+  "An unrecognized token does not crash parse-args; known flags still bind
+and unknown tokens collect under :rest in argv order (negative path)."
+  (let ((opts (parse-args (list "sexpr" "--bogus" "--goal" "g" "--zzz"))))
+    (ok (string= (getf opts :goal) "g")
+        "the known --goal still binds despite surrounding unknowns")
+    (ok (equal (getf opts :rest) '("--bogus" "--zzz"))
+        "unknown tokens are collected under :rest in argv order")))
+
+(rove:deftest main-help-prints-usage-and-returns-without-chat
+  "main with --help prints usage to the output stream and returns without
+entering the chat loop — no endpoint, no goal, so make-agent would signal
+if main had called chat."
+  (let ((out (make-string-output-stream)))
+    (ok (null (main (list "sexpr" "--help") :output out))
+        "main returns nil for --help without entering chat")
+    (ok (search "--goal" (get-output-stream-string out))
+        "the usage output mentions the --goal flag")))
