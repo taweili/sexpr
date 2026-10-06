@@ -43,7 +43,7 @@ verify: build
 	@echo '[probe 1] --help exits 0 and prints usage'
 	@./sexpr --help | grep -q 'usage: sexpr'
 	@echo '[probe 2] scripted session runs and exits 0'
-	@printf '/help\n/exit\n' | ./sexpr --goal "verify" | grep -q 'slash commands'
+	@printf '/help\n/exit\n' | ./sexpr --goal "verify" | grep -q 'Commands:'
 	@echo '[probe 3] cross-process --load round-trips'
 	@tmp=$$(mktemp --suffix=.sexp); printf "/save $$tmp\n/exit\n" | ./sexpr --goal "verify"; test -s $$tmp; ./sexpr --goal "verify" --load $$tmp </dev/null; rc=$$?; rm -f $$tmp; exit $$rc
 	@echo '[probe 4] R015 provider seam clean'
