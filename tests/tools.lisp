@@ -241,7 +241,7 @@
       (ok (search "capability-denied" msg) "the report names the reason")
       (ok (search "lisp-eval" msg) "and the required capability"))))
 
-(rove:deftest check-capability-refuses-an-unganted-capability
+(rove:deftest check-capability-refuses-an-ungated-capability
   "The gate refuses a tool whose declared capability is not in the granted set."
   (reset-tool-registry!)
   (define-tool my-eval (form)
@@ -250,7 +250,7 @@
     form)
   (let ((record (find-tool 'my-eval)))
     (let ((err (handler-case (check-capability record '(:fs-read)) (tool-error (c) c))))
-      (ok err "an unganted capability signals")
+      (ok err "an ungated capability signals")
       (ok (eq (tool-error-reason err) :capability-denied) ":reason is :capability-denied")
       (ok (string= (tool-error-tool err) "my-eval") ":tool names the tool")
       (ok (search "lisp-eval" (tool-error-detail err))
