@@ -76,7 +76,7 @@ src/
   kernel/              the agent: budget, transcript, model-step, run-until-finished
   cli/                 the Listener: chat loop, slash commands, SIGINT, argv/main/build
 qlfile                 Qlot deps (cl-llm-provider, GitHub-pinned)
-Makefile               `make hello`, `make load`, `make clean`
+Makefile               `make hello`, `make test`, `make build`, `make chat`, `make clean`
 notes/
   sexpr.md             — thesis, layer-by-layer mapping, open questions
   agent.md             — 2025 harness research (context engineering, skills, MCP)
@@ -227,9 +227,44 @@ rlwrap ./sexpr --goal "..."
 No readline, no threading, no streaming — the transcript is the state,
 and each turn is one bounded fold over it.
 
-> The `Makefile` `build`/`chat` targets and the actual `./sexpr` binary
-> verification are S03; the in-image definitions (`main`, `build`) ship
-> in `src/cli/`.
+### Building the binary
+
+`make build` produces a self-contained `./sexpr` executable via
+`sb-ext:save-lisp-and-die` — no Quicklisp or SBCL needed at runtime.
+`make build` always runs `make test` first, so a broken suite never
+ships a binary:
+
+```sh
+make build       # ./sexpr at the repo root, ~64 MB
+make chat        # sugar for: ./sexpr --goal "pair programmer"
+make verify      # binary-level health gate: --help, scripted session,
+                 # cross-process --load round-trip, R015 seam
+make clean       # removes ./sexpr alongside the fasl/ql artifacts
+```
+
+`make chat` accepts `CHAT_ARGS` to override the default goal:
+
+```sh
+make chat CHAT_ARGS='--goal "summarize the design" --provider ollama --model llama3'
+```
+
+Sessions persist through the transcript's own print/read path — save from
+inside the loop, load at startup:
+
+```sh
+./sexpr --goal "pair programmer"
+; inside the loop:
+; /save my-session.sexp
+; /exit
+
+./sexpr --goal "pair programmer" --load my-session.sexp
+```
+
+A scripted session runs from a clean shell with no terminal:
+
+```sh
+printf '/help\n/exit\n' | ./sexpr --goal "verify"
+```
 
 ## Status
 
