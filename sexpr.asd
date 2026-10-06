@@ -68,4 +68,5 @@
       (:file "smoke" :depends-on ("package"))
       (:file "transcript" :depends-on ("package"))
       (:file "kernel" :depends-on ("package"))
-      (:file "cli" :depends-on ("package" "kernel"))))))
+      (:file "cli" :depends-on ("package" "kernel"))
+      (:file "tools" :depends-on ("package"))))))
