@@ -32,14 +32,20 @@
    (last-system
     :accessor stub-last-system
     :initform nil
-    :documentation "The :system argument the last call received, for inspection."))
+    :documentation "The :system argument the last call received, for inspection.")
+   (last-tools
+    :initarg :last-tools
+    :accessor stub-last-tools
+    :initform nil
+    :documentation "The :tools argument the last call received, for inspection."))
   (:documentation "A canned provider endpoint for tests."))
 
 (defmethod sexpr.provider:provider-call ((endpoint stub-endpoint) messages
                                           &key system tools temperature max-tokens)
-  (declare (ignore tools temperature max-tokens))
+  (declare (ignore temperature max-tokens))
   (setf (stub-last-messages endpoint) messages)
   (setf (stub-last-system endpoint) system)
+  (setf (stub-last-tools endpoint) tools)
   (incf (stub-call-count endpoint))
   (let ((next (first (stub-responses endpoint)))
         (rest (rest (stub-responses endpoint))))
@@ -256,3 +262,212 @@
           "the transcript holds exactly three events")
       (ok (eq tr (agent-transcript agent))
           "run-until-finished returns the agent's transcript"))))
+
+;;; --- tool rounds ---------------------------------------------------
+;;; R021: the loop acts on a tool round. R019/R020: the gate refuses before a
+;;; tool body runs. Two notes on these groups:
+;
+;;;; Each one starts with reset-tool-registry! — the registry is process-wide,
+;;;; so a tool registered by an earlier group would otherwise leak in and change
+;;;; what the model is told it can call.
+;
+;;;; Tool names are unique per group. define-tool emits a defun, so a repeated
+;;;; name would make a later group's definition replace an earlier group's under
+;;;; a record that still holds the first group's schema.
+;
+;;;; Nothing here reaches a model server: every reply comes from stub-endpoint.
+
+(rove:deftest finished-p-and-tool-round-p-agree-on-a-tool-round
+  (let* ((calls (list (list :id "1" :name "get-weather"
+                            :arguments (list :city "Paris"))))
+         ;; :finish :tool-calls alongside :tool-calls is exactly what an
+         ;; OpenAI-compatible server returns; keying finished-p on :finish
+         ;; alone made the loop return before dispatch ever ran.
+         (event (make-model-event "" :tool-calls calls :finish :tool-calls)))
+    (ok (tool-round-p event) "tool-round-p sees the non-empty :tool-calls list")
+    (ok (not (finished-p event))
+        "finished-p stays nil for a tool round despite :finish :tool-calls")
+    (ok (tool-round-p (make-model-event "thinking" :tool-calls calls))
+        "tool-round-p does not depend on :finish at all")
+    (ok (not (tool-round-p (make-model-event "thinking")))
+        "a reply with no tool calls is not a tool round")
+    (ok (not (tool-round-p (make-model-event "thinking" :tool-calls '())))
+        "an empty :tool-calls list is not a tool round")))
+
+(rove:deftest model-step-passes-the-tool-schema-list-to-the-provider
+  (reset-tool-registry!)
+  (define-tool lookup-things (path)
+    "Look up PATH."
+    path)
+  (let* ((stub (make-instance 'stub-endpoint
+                              :responses (list (list :content "ok" :finish :stop))))
+         (agent (spawn :goal "g" :endpoint stub)))
+    (model-step agent)
+    (ok (not (null (stub-last-tools stub))) ":tools was actually sent")
+    (ok (equal (stub-last-tools stub) (tool-schema-list))
+        ":tools carries the derived sexpr schemas, not the transport's type")))
+
+(rove:deftest a-tool-round-dispatches-and-folds-back-as-a-user-message
+  (reset-tool-registry!)
+  (define-tool add-one-to (n)
+    "Add one to N."
+    :types ((n . :integer))
+    (1+ n))
+  (let* ((stub (make-instance
+                 'stub-endpoint
+                 :responses (list
+                             (list :content ""
+                                   :finish :tool-calls
+                                   :tool-calls (list
+                                               (list :id "1"
+                                                     :name "add-one-to"
+                                                     :arguments (list :n 5))))
+                             (list :content "done" :finish :stop))))
+         (agent (spawn :goal "g" :endpoint stub))
+         (tr (run-until-finished agent)))
+      (ok (= (stub-call-count stub) 2)
+          "the tool round took a follow-up turn, so the loop did not stop early")
+      (ok (= (transcript-length tr) 3)
+          "a model turn, a result event, then the final model turn")
+      (ok (eq (event-type (aref (transcript-events tr) 0)) :model)
+          "the first event is the model's tool round")
+      (let ((result (aref (transcript-events tr) 1)))
+        (ok (eq (event-type result) :result) "the second event is a result event")
+        (ok (eq (event-value result) 6) "it carries the live object")
+        (ok (string= (event-text result) "6")
+            "it carries the printed projection, recorded at record time"))
+      (ok (eq (event-type (aref (transcript-events tr) 2)) :model)
+          "the third event is the final model turn")
+      (ok (equal (stub-last-messages stub)
+                 (list (list :role "assistant" :content "")
+                       (list :role "user" :content "Tool result: 6")))
+          "the result folded back as a :user message on the next call")
+      (ok (equal (event-to-message (aref (transcript-events tr) 1))
+                 (list :role "user" :content "Tool result: 6"))
+          "event-to-message renders the :text projection for a result event")))
+
+(rove:deftest a-tool-body-that-signals-becomes-a-caught-result-and-the-loop-continues
+  (reset-tool-registry!)
+  (define-tool explode-quietly (path)
+    "Always signals."
+    (error "the disk is on fire"))
+  (let* ((stub (make-instance
+                 'stub-endpoint
+                 :responses (list
+                             (list :content ""
+                                   :finish :tool-calls
+                                   :tool-calls (list
+                                               (list :id "1"
+                                                     :name "explode-quietly"
+                                                     :arguments (list :path "/x"))))
+                             (list :content "recovered" :finish :stop))))
+         (agent (spawn :goal "g" :endpoint stub)))
+    (let ((tr (run-until-finished agent)))
+      (ok (= (stub-call-count stub) 2)
+          "the loop survived the tool body signal — nothing propagated")
+      (let ((result (aref (transcript-events tr) 1)))
+        (ok (eq (event-type result) :result)
+            "the failure is a result event, not an escaping exception")
+        (ok (equal (event-value result)
+                   '(:tool "explode-quietly" :reason :body-error
+                     :detail "the disk is on fire"))
+            "the :value is a structured failure plist")
+        (ok (search "explode-quietly" (event-text result))
+            "the :text names the offending tool")
+        (ok (search "the disk is on fire" (event-text result))
+            "the :text carries the error text for the model to read")))))
+
+(rove:deftest a-capability-denial-records-a-refusal-and-the-loop-continues
+  (reset-tool-registry!)
+  (define-tool run-shell-command (cmd)
+    "Run a shell command."
+    :capability :lisp-eval
+    cmd)
+  (let* ((stub (make-instance
+                 'stub-endpoint
+                 :responses (list
+                             (list :content ""
+                                   :finish :tool-calls
+                                   :tool-calls (list
+                                               (list :id "1"
+                                                     :name "run-shell-command"
+                                                     :arguments (list :cmd "ls"))))
+                             (list :content "denied" :finish :stop))))
+         ;; The agent is granted :fs-read only, so the :lisp-eval gate refuses.
+         (agent (spawn :goal "g" :endpoint stub
+                       :capabilities '(:fs-read))))
+    (let ((tr (run-until-finished agent)))
+      (ok (= (stub-call-count stub) 2) "the loop survived the refusal")
+      (let ((result (aref (transcript-events tr) 1)))
+        (ok (eq (event-type result) :result) "the refusal is a result event")
+        (ok (eq (getf (event-value result) :reason) :capability-denied)
+            "the :value plist carries :capability-denied")
+        (ok (string= (getf (event-value result) :tool) "run-shell-command")
+            "the :value plist names the refused tool")
+        (ok (search "CAPABILITY-DENIED" (event-text result))
+            "the :text names the reason")
+        (ok (search "lisp-eval" (event-text result))
+            "the :text names the capability that was required")))))
+
+(rove:deftest an-unknown-tool-records-a-result-naming-the-available-tools
+  (reset-tool-registry!)
+  (define-tool the-only-tool (path)
+    "The only registered tool."
+    path)
+  (let* ((stub (make-instance
+                 'stub-endpoint
+                 :responses (list
+                             (list :content ""
+                                   :finish :tool-calls
+                                   :tool-calls (list
+                                               (list :id "1"
+                                                     :name "no-such-tool"
+                                                     :arguments nil)))
+                             (list :content "ok" :finish :stop))))
+         (agent (spawn :goal "g" :endpoint stub)))
+    (let ((tr (run-until-finished agent)))
+      (let ((result (aref (transcript-events tr) 1)))
+        (ok (eq (getf (event-value result) :reason) :unknown-tool)
+            "the :value plist carries :unknown-tool")
+        (ok (string= (getf (event-value result) :tool) "no-such-tool")
+            "the :value plist names the unknown tool")
+        (ok (equal (getf (event-value result) :detail) (tool-names))
+            "the :detail is the list of registered tool names")
+        (ok (search "the-only-tool" (event-text result))
+            "the :text names an available tool so the model can retry")))))
+
+(rove:deftest a-tool-round-at-max-steps-dispatches-and-then-stops
+  (reset-tool-registry!)
+  (define-tool read-some-file (path)
+    "Read PATH."
+    path)
+  (let* ((stub (make-instance
+                 'stub-endpoint
+                 ;; Only ONE reply: a tool round. If the loop asked the model
+                 ;; again after the cap, the stub would signal "exhausted" and
+                 ;; this test would fail loudly.
+                 :responses (list
+                             (list :content ""
+                                   :finish :tool-calls
+                                   :tool-calls (list
+                                               (list :id "1"
+                                                     :name "read-some-file"
+                                                     :arguments (list :path "/x")))))))
+         (agent (spawn :goal "g" :endpoint stub)))
+    (let ((tr (run-until-finished agent :max-steps 1)))
+      (ok (= (stub-call-count stub) 1)
+          "max-steps 1 made exactly one model call — no follow-up turn")
+      (ok (= (transcript-length tr) 2)
+          "the tool round dispatched BEFORE the cap stopped the loop")
+      (ok (eq (event-type (aref (transcript-events tr) 0)) :model)
+          "the first event is the model's tool round")
+      (let ((result (aref (transcript-events tr) 1)))
+        (ok (eq (event-type result) :result) "the second event is the dispatched result")
+        (ok (string= (event-value result) "/x") "the tool's return value is recorded")
+        (ok (string= (event-text result) "/x") "and its projection")))))
+
+(rove:deftest event-to-message-falls-back-to-the-value-for-a-result-without-text
+  "A result event holding only :value (no recorded :text) still renders." (let ((event (list :type :result :value 42)))
+    (ok (equal (event-to-message event)
+               (list :role "user" :content "Tool result: 42"))
+        "event-to-message falls back to the printed :value")))

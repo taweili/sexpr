@@ -26,7 +26,7 @@
         ((:file "package")
          (:file "transcript" :depends-on ("package"))))
       (:module "kernel"
-        :depends-on ("package" "transcript")
+        :depends-on ("package" "transcript" "tools")
         :components
         ((:file "package")
          (:file "kernel" :depends-on ("package"))))

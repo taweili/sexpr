@@ -7,8 +7,11 @@
 ;;;; BOUNDARY: :sexpr.provider is deliberately NOT in :use. The kernel reaches
 ;;;; the model through sexpr.provider:provider-call by qualified name only, so
 ;;;; there is exactly one seam to the world and it stays visible in the source
-;;;; (invariants #1 and #3). Tool execution, approvals (§5) and capability
-;;;; enforcement are later milestones.
+;;;; (invariants #1 and #3). The tool registry is reached the same way —
+;;;; sexpr.tools:tool-schema-list and sexpr.tools:perform-tool as qualified
+;;;; calls, never :use'd — so the kernel names no transport type at all, and
+;;;; :sexpr.tools keeps no knowledge of the kernel (D009, the one-way
+;;;; dependency kernel -> tools). Approvals (§5) are later.
 
 (defpackage :sexpr.kernel
   (:nicknames :$.kernel)
@@ -32,6 +35,8 @@
    #:spawn
    #:model-step
    #:integrate
+   #:tool-round-p
+   #:dispatch-tool-call
    #:finished-p
    #:agent-loop
    #:run-until-finished
