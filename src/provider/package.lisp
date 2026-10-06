@@ -32,5 +32,6 @@
    #:*model-endpoint*
    #:*provider-type*
    #:*default-model-name*
+   #:*default-base-url*
    #:make-default-provider
    #:configure-provider))

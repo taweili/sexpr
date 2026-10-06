@@ -12,8 +12,7 @@
 ;;;; deliberately NOT in :use. The model is reached only transitively
 ;;;; via run-until-finished → model-step → provider-call. This module
 ;;;; never imports the provider transport; the single qualified
-;;;; sexpr.provider:configure-provider reference (for --provider/--model)
-;;;; lives in main below.
+;;;; sexpr.provider:configure-provider reference lives in main below.
 
 (in-package :sexpr.cli)
 
@@ -369,15 +368,16 @@ exits only on /exit, /quit, EOF, or a second idle Ctrl-C)."
         (print-usage (or output *standard-output*))
         (progn
           ;; The ONLY sexpr.provider reference in this module: a qualified
-          ;; call, never an import. Pass just the flags that were given so
-          ;; configure-provider's p-supp/m-supp branches see only what the
-          ;; user set — passing :model nil would clobber an env var.
-          (when (or (getf opts :provider) (getf opts :model))
-            (apply #'sexpr.provider:configure-provider
-                   (nconc (when (getf opts :provider)
-                            (list :provider (getf opts :provider)))
-                          (when (getf opts :model)
-                            (list :model (getf opts :model))))))
+          ;; call, never an import. configure-provider is called
+          ;; unconditionally so SEXPR_PROVIDER / SEXPR_MODEL / SEXPR_BASE_URL
+          ;; env vars take effect without a CLI flag; when no flags are given
+          ;; the list is empty and every supplied-p flag stays false, so
+          ;; configure-provider falls through to the env-var branches.
+          (apply #'sexpr.provider:configure-provider
+                 (nconc (when (getf opts :provider)
+                          (list :provider (getf opts :provider)))
+                        (when (getf opts :model)
+                          (list :model (getf opts :model)))))
           (let ((transcript nil))
             (when (getf opts :load)
               (with-open-file (stream (getf opts :load) :direction :input)

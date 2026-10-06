@@ -23,6 +23,13 @@ the SEXPR_PROVIDER env var, e.g. `SEXPR_PROVIDER=openai`.")
   "Default model name override, or NIL for the provider's default.
 Override with the SEXPR_MODEL env var.")
 
+(defparameter *default-base-url* nil
+  "Default base URL override, or NIL for the provider's built-in default.
+Override with the SEXPR_BASE_URL env var; R025 auto-infers the provider
+to :openai-compatible when SEXPR_BASE_URL is set and SEXPR_PROVIDER is
+not, so a local OpenAI-compatible server is a first-class default with
+no API key.")
+
 (defparameter *model-endpoint* nil
   "The resident provider object. Rebind this (e.g. with LET around a
 subagent, or setf globally) to swap providers — the central design
@@ -37,44 +44,65 @@ invariant (notes/sexpr.md §2). NIL means resolve lazily on first call.")
 (defun make-default-provider ()
   "Realize a provider object from current configuration. API keys are
 read directly by cl-llm-provider from OPENAI_API_KEY / ANTHROPIC_API_KEY
-/ etc."
-  (make-provider *provider-type* :model *default-model-name*))
+/ etc. Only passes :base-url when *DEFAULT-BASE-URL* is non-nil —
+passing :base-url nil would clobber the transport's per-instance default
+(MEM020)."
+  (if *default-base-url*
+      (make-provider *provider-type* :model *default-model-name*
+                     :base-url *default-base-url*)
+      (make-provider *provider-type* :model *default-model-name*)))
 (export 'make-default-provider)
 
 (defun configure-provider (&key (provider nil p-supp)
                               (model nil m-supp)
+                              (base-url nil b-supp)
                               (max-tokens nil mt-supp)
                               (temperature nil t-supp))
   "Set provider defaults. Does NOT realize the provider object — that
 is deferred to the first PROVIDER-CALL so configuration never fails just
 because an API key is not yet set in the environment.
 
-When PROVIDER/MODEL are omitted, falls back to the SEXPR_PROVIDER and
-SEXPR_MODEL env vars, then to the existing *PROVIDER-TYPE*. API keys
-are read by cl-llm-provider from the standard env vars
+When PROVIDER/MODEL/BASE-URL are omitted, falls back to the SEXPR_PROVIDER,
+SEXPR_MODEL, and SEXPR_BASE_URL env vars, then to the current
+*PROVIDER-TYPE*. R025 auto-infer: when SEXPR_PROVIDER is unset but
+SEXPR_BASE_URL is set, *PROVIDER-TYPE* becomes :openai-compatible so a
+local OpenAI-compatible server is a first-class default with no API key.
+An explicit SEXPR_PROVIDER (env or kwarg) always wins over the inference.
+API keys are read by cl-llm-provider from the standard env vars
 \(OPENAI_API_KEY, ANTHROPIC_API_KEY, ...); do NOT pass keys through here.
 
 Returns *PROVIDER-TYPE* (the effective provider type)."
-  (setf *provider-type*
-        (if p-supp
-            (if (keywordp provider)
-                provider
-                (alexandria:make-keyword (string-upcase (string provider))))
-            (alexandria:make-keyword
-             (string-upcase (env "SEXPR_PROVIDER" (string *provider-type*))))))
-  (setf *default-model-name*
-        (if m-supp
-            model
-            (or *default-model-name* (env "SEXPR_MODEL"))))
-  ;; mirror into cl-llm-provider's own defaults so any direct complete
-  ;; calls agree with provider-call's lazily-resolved endpoint.
-  (setf cl-llm-provider:*default-model* *default-model-name*
-        cl-llm-provider:*default-provider* *provider-type*)
-  (when mt-supp (setf cl-llm-provider:*default-max-tokens* max-tokens))
-  (when t-supp (setf cl-llm-provider:*default-temperature* temperature))
-  ;; invalidate any previously-realized endpoint so the next call picks
-  ;; up the new config.
-  (setf *model-endpoint* nil)
+  (let ((env-provider (env "SEXPR_PROVIDER"))
+        (env-base-url (env "SEXPR_BASE_URL"))
+        (env-model    (env "SEXPR_MODEL")))
+    ;; *DEFAULT-BASE-URL* is set before *PROVIDER-TYPE* so the R025
+    ;; auto-infer branch below sees the effective value.
+    (setf *default-base-url*
+          (if b-supp base-url (or *default-base-url* env-base-url)))
+    (setf *provider-type*
+          (cond
+            (p-supp
+             (if (keywordp provider)
+                 provider
+                 (alexandria:make-keyword (string-upcase (string provider)))))
+            (env-provider
+             (alexandria:make-keyword (string-upcase env-provider)))
+            ((not (null *default-base-url*))
+             :openai-compatible)
+            (t *provider-type*)))
+    (setf *default-model-name*
+          (if m-supp
+              model
+              (or *default-model-name* env-model)))
+    ;; mirror into cl-llm-provider's own defaults so any direct complete
+    ;; calls agree with provider-call's lazily-resolved endpoint.
+    (setf cl-llm-provider:*default-model* *default-model-name*
+          cl-llm-provider:*default-provider* *provider-type*)
+    (when mt-supp (setf cl-llm-provider:*default-max-tokens* max-tokens))
+    (when t-supp (setf cl-llm-provider:*default-temperature* temperature))
+    ;; invalidate any previously-realized endpoint so the next call picks
+    ;; up the new config.
+    (setf *model-endpoint* nil))
   *provider-type*)
 (export 'configure-provider)
 
