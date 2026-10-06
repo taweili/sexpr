@@ -145,7 +145,7 @@ multi-agent milestone can fill it in without changing the class."
 ;;;; inspectable: (trace sexpr.kernel:model-step) shows every model round trip.
 
 (defun event-to-message (event)
-  "Convert one transcript EVENT into a cl-llm-provider message plist.
+  "Convert one transcript EVENT into a provider message plist.
 
 Messages are the transport's vocabulary (:role/:content plists), so the
 conversion lives in the kernel — the transport never sees a transcript object.
@@ -219,18 +219,25 @@ agent is the start of a tool round — not in this milestone."
   (not (null (event-finish event))))
 (export 'finished-p)
 
-(defun agent-loop (agent)
-  "Run AGENT's loop: model-step, integrate, repeat until finished-p.
-
-Returns the agent's transcript. Single-threaded and unbounded: there is no turn
-limit and no budget check, because enforcement is a later milestone. A
-well-behaved provider terminates the loop by returning :finish; a stuck one
-will spin. That is a known gap, not a hidden one — see notes/sexpr.md §2.
-Redefined by (defun sexpr.kernel:agent-loop ...), which is how §9 wants it."
+(defun run-until-finished (agent &key max-steps)
+  "Run AGENT's loop: model-step, integrate, repeat until finished-p or
+MAX-STEPS. Returns the transcript. With MAX-STEPS nil the loop is unbounded
+(the contract agent-loop preserves); with a positive integer it stops after
+that many model turns — the chat safety cap (R017)."
   (loop
-     (let ((event (model-step agent)))
-       (integrate agent event)
-       (when (finished-p event)
-         (return))))
+     :with step-count = 0
+     :for event = (model-step agent)
+     :do (integrate agent event)
+         (incf step-count)
+         (when (or (finished-p event)
+                   (and max-steps (>= step-count max-steps)))
+           (return)))
   (agent-transcript agent))
+(export 'run-until-finished)
+
+(defun agent-loop (agent)
+  "Run AGENT's loop to completion. Delegates to run-until-finished with no
+max-steps, preserving the unbounded contract. Chat callers use
+run-until-finished with :max-steps."
+  (run-until-finished agent))
 (export 'agent-loop)

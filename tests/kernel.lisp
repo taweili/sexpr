@@ -242,3 +242,17 @@
     (agent-loop agent)
     (ok (= (transcript-length (agent-transcript agent)) 1) "only the model turn is recorded")
     (ok (string= (agent-goal agent) "fix the bug in parser.lisp") "the goal is still on the agent")))
+
+(rove:deftest run-until-finished-respects-max-steps
+  (let* ((stub (make-instance
+                 'stub-endpoint
+                 ;; Ten never-finishing replies; max-steps must stop the loop.
+                 :responses (loop :repeat 10 :collect (list :content "thinking"))))
+         (agent (spawn :goal "g" :endpoint stub)))
+    (let ((tr (run-until-finished agent :max-steps 3)))
+      (ok (= (stub-call-count stub) 3)
+          "max-steps 3 stops the loop after exactly three model calls")
+      (ok (= (transcript-length tr) 3)
+          "the transcript holds exactly three events")
+      (ok (eq tr (agent-transcript agent))
+          "run-until-finished returns the agent's transcript"))))

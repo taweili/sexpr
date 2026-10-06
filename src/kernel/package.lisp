@@ -34,5 +34,6 @@
    #:integrate
    #:finished-p
    #:agent-loop
+   #:run-until-finished
    #:event-to-message
    #:transcript-to-messages))
