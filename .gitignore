@@ -4,6 +4,7 @@
 *.fbas
 *.lib
 *.al
+sexpr
 
 # Qlot / Quicklisp workdirs
 .ql/
