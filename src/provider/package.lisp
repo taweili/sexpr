@@ -34,4 +34,5 @@
    #:*default-model-name*
    #:*default-base-url*
    #:make-default-provider
-   #:configure-provider))
+   #:configure-provider
+   #:translate-tool-schemas))

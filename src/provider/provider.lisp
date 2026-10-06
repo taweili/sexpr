@@ -6,7 +6,9 @@
 ;;;; providers = rebinding one function." This file is that function.
 ;;;;
 ;;;; BOUNDARY: cl-llm-provider is used as transport only (complete /
-;;;; response parsing). Tool *execution* stays in the sexpr kernel;
+;;;; response parsing) plus one construction site: TRANSLATE-TOOL-SCHEMAS
+;;;; is the single function in the project that names the transport's
+;;;; tool-definition class. Tool *execution* stays in the sexpr kernel;
 ;;;; cl-llm-provider's tool registry/approval/hooks are deliberately
 ;;;; not adopted here — two sources of truth for "what a tool is"
 ;;;; would corrupt the design.
@@ -117,6 +119,65 @@ Returns *PROVIDER-TYPE* (the effective provider type)."
     (t (error "~S is not a provider designator (keyword, provider, or NIL)"
               endpoint))))
 
+;;; --- tool-schema translation (the one transport construction site) --
+;;;
+;;;; sexpr.tools produces tool schemas as plain sexpr plists. This is the
+;;;; ONE place those plists become cl-llm-provider:tool-definition
+;;;; objects, so the kernel and the tools package never name a transport
+;;;; type. Validation is fail-fast here (sexpr-shaped errors), not
+;;;; deferred to the transport's validate-tool-definition.
+
+(defun translate-tool-schemas (tool-plists)
+  "Translate a list of sexpr tool-schema plists into a list of
+cl-llm-provider:tool-definition objects suitable for COMPLETE's :tools
+argument.
+
+Each input plist must have the shape derive-schema produces plus :name
+and :description:
+
+  (:name        "read-file"                    ; non-empty string
+   :description "Read the file at PATH."          ; string
+   :parameters  ((:name "path" :type :string) ...) ; list of param plists
+   :required    ("path"))                       ; list of strings
+
+Malformed plists are rejected with an error here, not deferred to the
+transport's validator, so failures are sexpr-shaped. Returns one
+tool-definition per input plist, in order. NIL input yields NIL."
+  (mapcar #'translate-tool-schema tool-plists))
+
+(defun translate-tool-schema (plist)
+  "Translate one sexpr tool-schema plist into a
+cl-llm-provider:tool-definition. Signals an error on a malformed plist."
+  (let* ((name   (getf plist :name))
+         (desc   (getf plist :description))
+         (params (getf plist :parameters))
+         (reqs   (getf plist :required)))
+    (unless (and (stringp name) (not (string= name "")))
+      (error "tool-schema plist ~S: :name must be a non-empty string" plist))
+    (unless (stringp desc)
+      (error "tool-schema plist ~S: :description must be a string" plist))
+    (unless (listp params)
+      (error "tool-schema plist ~S: :parameters must be a list" plist))
+    (unless (and (listp reqs) (every #'stringp reqs))
+      (error "tool-schema plist ~S: :required must be a list of strings" plist))
+    (make-instance 'cl-llm-provider:tool-definition
+                   :name name
+                   :description desc
+                   :parameters (mapcar #'%translate-param params)
+                   :required reqs)))
+
+(defun %translate-param (param)
+  "Copy one derived parameter plist into the transport's param shape.
+
+The input already matches ((:name str :type keyword) ...); sexpr-only
+keys are dropped. A :description is synthesized as the empty string —
+the transport accepts any string, and the tool-level docstring stays the
+single source of truth for documentation. A missing :type defaults to
+:STRING, matching derive-schema's default."
+  (list :name (getf param :name)
+        :type (getf param :type :string)
+        :description (or (getf param :description) "")))
+
 ;;; --- the boundary: provider-call → sexpr -----------------------------
 
 (defgeneric provider-call (endpoint messages &key system tools temperature
@@ -140,10 +201,11 @@ is the only function the sexpr kernel should call to reach the model."))
 (defmethod provider-call ((endpoint t) messages
                            &key system tools temperature max-tokens)
   (let* ((provider (%resolve-endpoint endpoint))
+         (provider-tools (when tools (translate-tool-schemas tools)))
          (response (complete messages
                              :provider provider
                              :system system
-                             :tools tools
+                             :tools provider-tools
                              :temperature temperature
                              :max-tokens max-tokens)))
     ;; Translate the transport object into an sexpr transcript node.
