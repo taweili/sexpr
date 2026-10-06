@@ -30,7 +30,12 @@
         :components
         ((:file "package")
          (:file "kernel" :depends-on ("package"))))
-      (:file "sexpr" :depends-on ("provider" "transcript" "kernel")))))
+      (:module "cli"
+        :depends-on ("package" "transcript" "kernel")
+        :components
+        ((:file "package")
+         (:file "cli" :depends-on ("package"))))
+      (:file "sexpr" :depends-on ("provider" "transcript" "kernel" "cli")))))
   ;; test-op is defined as a method in src/sexpr.lisp, not inline here:
   ;; inline :perform bodies are miscompiled by this Quicklisp-bundled
   ;; ASDF when the system has real dependencies (the leading DECLARE is
@@ -56,4 +61,5 @@
      ((:file "package")
       (:file "smoke" :depends-on ("package"))
       (:file "transcript" :depends-on ("package"))
-      (:file "kernel" :depends-on ("package"))))))
+      (:file "kernel" :depends-on ("package"))
+      (:file "cli" :depends-on ("package" "kernel"))))))
