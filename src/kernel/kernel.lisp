@@ -181,12 +181,18 @@ Calls sexpr.provider:provider-call — the only model entry point
 (invariant #1) — with AGENT's endpoint, or NIL so the provider's resident
 *MODEL-ENDPOINT* is resolved instead (invariant #4).
 
+The agent's system prompt is sent as :system: agent-system when set, falling
+back to agent-goal otherwise (R014), so NIL on the system slot stays the
+meaningful 'use the goal as the system prompt' signal. The system prompt is
+passed as :system, never appended to the transcript.
+
 The provider's reply node (:content / :tool-calls / :model / :usage / :finish)
 is copied straight into a sexpr.transcript:model-event. Tool calls are
 RECORDED on the event but not executed in this milestone."
   (let ((node (sexpr.provider:provider-call
                 (agent-endpoint agent)
-                (transcript-to-messages (agent-transcript agent)))))
+                (transcript-to-messages (agent-transcript agent))
+                :system (or (agent-system agent) (agent-goal agent)))))
     (make-model-event (getf node :content)
                       :tool-calls (getf node :tool-calls)
                       :model (getf node :model)

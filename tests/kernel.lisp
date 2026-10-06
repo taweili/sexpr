@@ -28,13 +28,18 @@
     :initarg :call-count
     :accessor stub-call-count
     :initform 0
-    :documentation "How many times this endpoint has been called."))
+    :documentation "How many times this endpoint has been called.")
+   (last-system
+    :accessor stub-last-system
+    :initform nil
+    :documentation "The :system argument the last call received, for inspection."))
   (:documentation "A canned provider endpoint for tests."))
 
 (defmethod sexpr.provider:provider-call ((endpoint stub-endpoint) messages
                                           &key system tools temperature max-tokens)
-  (declare (ignore system tools temperature max-tokens))
+  (declare (ignore tools temperature max-tokens))
   (setf (stub-last-messages endpoint) messages)
+  (setf (stub-last-system endpoint) system)
   (incf (stub-call-count endpoint))
   (let ((next (first (stub-responses endpoint)))
         (rest (rest (stub-responses endpoint))))
@@ -148,6 +153,26 @@
       (ok (equal (second (stub-last-messages stub))
                  (list :role "assistant" :content "thinking..."))
           "the second message is the model turn"))))
+
+(rove:deftest model-step-sends-the-goal-as-system-by-default
+  (let* ((stub (make-instance 'stub-endpoint
+                              :responses (list (list :content "ok" :finish :stop))))
+         (agent (spawn :goal "g" :endpoint stub)))
+    (model-step agent)
+    (ok (string= (stub-last-system stub) "g")
+        "with no :system set, the goal is sent as :system (goal fallback)")
+    (ok (null (agent-system agent))
+        "agent-system reads nil when no persona was set")))
+
+(rove:deftest model-step-sends-an-explicit-system-prompt
+  (let* ((stub (make-instance 'stub-endpoint
+                              :responses (list (list :content "ok" :finish :stop))))
+         (agent (spawn :goal "g" :system "persona" :endpoint stub)))
+    (model-step agent)
+    (ok (string= (stub-last-system stub) "persona")
+        "an explicit :system prompt is sent as :system, not the goal")
+    (ok (string= (agent-system agent) "persona")
+        "agent-system reads the persona back")))
 
 (rove:deftest integrate-appends-to-the-transcript
   (let ((agent (spawn :goal "g"))
