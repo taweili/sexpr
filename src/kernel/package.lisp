@@ -22,6 +22,7 @@
    #:agent
    #:agent-name
    #:agent-goal
+   #:agent-system
    #:agent-transcript
    #:agent-budget
    #:agent-capabilities

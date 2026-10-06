@@ -65,6 +65,11 @@ means 'no limit yet'. A later milestone turns these numbers into policy."
     :accessor agent-goal
     :type string
     :documentation "What this agent is here to accomplish.")
+   (system
+    :initarg :system
+    :accessor agent-system
+    :initform nil
+    :documentation "The agent's system prompt, or NIL to fall back to the goal. Distinct from GOAL so chat can set a persona while autonomous agents still send their objective as the system prompt (R014).")
    (transcript
     :initarg :transcript
     :accessor agent-transcript
@@ -99,7 +104,7 @@ capability set, and a provider endpoint.
 This milestone gives the agent a body (the loop) and no thread."))
 (export 'agent)
 
-(defun make-agent (&key name goal transcript budget capabilities thread endpoint)
+(defun make-agent (&key name goal system transcript budget capabilities thread endpoint)
   "Return a new agent.
 
 Low-level constructor: supplies defaults for everything except GOAL, which is
@@ -110,6 +115,7 @@ case of an agent starting with an empty transcript."
   (make-instance 'agent
                  :name (or name "agent")
                  :goal goal
+                 :system system
                  :transcript (or transcript (make-transcript))
                  :budget (or budget (make-budget))
                  :capabilities (or capabilities '(:fs-read))
@@ -117,7 +123,7 @@ case of an agent starting with an empty transcript."
                  :endpoint endpoint))
 (export 'make-agent)
 
-(defun spawn (&key name goal endpoint capabilities budget)
+(defun spawn (&key name goal system endpoint capabilities budget)
   "Create and return a new agent with a fresh, empty transcript.
 
 Does NOT start a thread: this milestone is single-threaded, and agent-loop is
@@ -125,6 +131,7 @@ called directly on the returned agent. The thread slot exists now so the
 multi-agent milestone can fill it in without changing the class."
   (make-agent :name name
               :goal goal
+              :system system
               :endpoint endpoint
               :capabilities capabilities
               :budget budget))
