@@ -37,6 +37,12 @@
 ;;;; first day even though tool execution is deferred — the seam already has the
 ;;;; room, so downstream milestones (tools §1.3, capabilities §5) extend it
 ;;;; instead of rewriting it.
+;;;;
+;;;; R023: a result event carries BOTH the live object (:value) and the printed
+;;;; projection captured at record time (:text). The projection is what survives
+;;;; print/read — an object such as a hash table has no readable print form, so
+;;;; serialization drops the live object and keeps the text. The live object
+;;;; stays process-local; nothing rehydrates it until presentations (§4) land.
 
 (defun event-type (event)
   "Return the :type key of EVENT (:user, :model, or :result)."
@@ -73,9 +79,22 @@ Recorded, not executed, in this milestone."
 
 (defun event-value (event)
   "Return the :value key of a result event — the live object, not its string —
-or NIL."
+or NIL.
+
+NIL is also what a deserialized result event returns: the live object is dropped
+at serialize time (R023), so a transcript read back from disk holds the
+projection, not the object."
   (getf event :value))
 (export 'event-value)
+
+(defun event-text (event)
+  "Return the :text key of an event — the printed projection captured when the
+event was recorded — or NIL.
+
+Recorded at record time, never re-derived at render time (R023): the projection
+is the part of a result event that print/read can carry back."
+  (getf event :text))
+(export 'event-text)
 
 (defun make-user-event (content)
   "Build a user event wrapping CONTENT (a string).
@@ -99,12 +118,19 @@ kernel's conversion stays a straight copy with no knowledge of the transport."
         :finish finish))
 (export 'make-model-event)
 
-(defun make-result-event (value)
+(defun make-result-event (value &key text)
   "Build a result event wrapping VALUE.
 
 VALUE is the live object (a buffer, a hash table, an AST), not its printed
-form — the transcript holds references, which is the whole point of §1.2."
-  (list :type +event-type-result+ :value value))
+form — the transcript holds references, which is the whole point of §1.2.
+
+TEXT is the printed projection recorded at record time (R023). It defaults to
+(format nil "~A" value) rather than write-to-string: the projection is what a
+reader sees, so quoting a string value would change what the model is sent.
+When TEXT is supplied it wins over the default."
+  (list :type +event-type-result+
+        :value value
+        :text (or text (format nil "~A" value))))
 (export 'make-result-event)
 
 ;;;; --- the transcript -------------------------------------------------
@@ -192,7 +218,7 @@ slice. Events are plists so the whole transcript round-trips through print/read.
                    (format nil " (+~a tool-calls)" (length calls))
                    ""))))
     (:result
-     (format nil "~a" (event-value event)))
+     (format nil "~a" (or (event-text event) (event-value event))))
     (otherwise
      (format nil "~a" event))))
 (export 'render-event)
@@ -224,6 +250,24 @@ slice. Events are plists so the whole transcript round-trips through print/read.
 ;;;; that is deliberately not depended on here, and that is the milestone that
 ;;;; adds it.
 
+;;; A result event's live object is dropped here: it has no readable print form,
+;;; so the projection recorded at record time is what the round trip can carry
+;;; (R023). serialize-event builds a new plist and never mutates the live event.
+
+(defun serialize-event (event)
+  "Return a print/read-safe copy of EVENT for transcript-to-list.
+
+A result event loses its :value key and keeps its :text projection; the copy is
+built fresh so the live event is never mutated and the object stays available to
+the process that recorded it. Other event kinds are returned as they are."
+  (if (eq (event-type event) +event-type-result+)
+      (let ((copy '()))
+        (loop for (key value) on event by #'cddr
+              unless (eq key :value)
+              do (setf copy (append copy (list key value))))
+        copy)
+      event))
+
 (defun transcript-to-list (transcript)
   "Return an s-expression form for TRANSCRIPT: a :transcript tag followed by
 its events, oldest first.
@@ -231,8 +275,10 @@ its events, oldest first.
 Only the event log is serialized. Anchors and the presentation registry are
 excluded on purpose: anchors are empty in this milestone, and the registry
 holds live objects that print/read cannot reconstruct — presentations
-(notes/sexpr.md §4) supply the rehydration story later."
-  (append (list :transcript) (events-list transcript)))
+(notes/sexpr.md §4) supply the rehydration story later. A result event's live
+:value is dropped for the same reason (R023): its :text projection is what
+survives the round trip."
+  (append (list :transcript) (mapcar #'serialize-event (events-list transcript))))
 (export 'transcript-to-list)
 
 (defun transcript-from-list (data)

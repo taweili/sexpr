@@ -3,7 +3,10 @@
 ;;;;
 ;;;; Scope: events are typed plists, append preserves order, rendering is
 ;;;; readable, and the transcript round-trips through print/read with
-;;;; *read-eval* nil. Nothing here talks to a model.
+;;;; *read-eval* nil. A result event carries the live object AND the printed
+;;;; projection captured at record time (R023); serialization drops the live
+;;;; object, so only the projection can be read back. Nothing here talks to a
+;;;; model.
 
 (in-package :sexpr-tests)
 
@@ -86,6 +89,34 @@
   (ok (string= (render-event (make-result-event (list 1 2 3))) "(1 2 3)")
       "a result renders its live value"))
 
+(rove:deftest make-result-event-keeps-the-object-and-its-text
+  "R023: a result event holds the live object and the printed projection, and
+the projection is captured at record time, not re-derived at render time."
+  (let ((table (make-hash-table :test 'eql)))
+    (let ((event (make-result-event table)))
+      (ok (eq (event-value event) table) "the live object is held, not copied")
+      (ok (stringp (event-text event)) "the projection is a string")
+      (ok (string= (event-text event) (format nil "~A" table))
+          "the default projection is the printed value"))
+    (ok (string= (event-text (make-result-event "patched")) "patched")
+        "a string value prints bare — the projection is not a read form")
+    (ok (string= (event-text (make-result-event (list 1 2 3))) "(1 2 3)")
+        "a list value prints in readable form")
+    (ok (string= (event-text (make-result-event "42" :text "explicit")) "explicit")
+        "an explicit :text wins over the default")))
+
+(rove:deftest render-event-uses-text-for-results
+  "Human rendering reads the projection recorded at record time, so a result
+still renders after its live object has been dropped by serialization."
+  (ok (string= (render-event (make-result-event (list 1 2 3))) "(1 2 3)")
+      "the default projection renders, agreeing with the existing rendering")
+  (ok (string= (render-event (make-result-event "patched" :text "patched by tool"))
+               "patched by tool")
+      "render-event shows the recorded text, not a re-derived print")
+  (ok (string= (render-event (list :type :result :text "the printed form"))
+               "the printed form")
+      "a result event read back with no live :value still renders"))
+
 ;;;; --- serialization --------------------------------------------------
 
 (rove:deftest transcript-round-trips-through-print-and-read
@@ -115,6 +146,34 @@
       (ok (null (transcript-anchors back)) "anchors are not serialized yet")
       (ok (zerop (hash-table-count (transcript-objects back)))
           "the presentation registry is not serialized yet"))))
+
+(rove:deftest result-event-round-trips-with-the-live-object-dropped
+  "R023 serialization half: the projection survives, the live object does not.
+A hash table has no readable print form (SBCL writes it as #.(MAKE-HASH-TABLE)
+or #<HASH-TABLE ...>), so the live object must be dropped at serialize time
+instead of emitted as a token the reader would refuse under *read-eval* nil.
+This group is red before the strip: the pre-fix form carries that token and
+cannot be read back."
+  (let ((tr (make-transcript))
+        (table (make-hash-table :test 'eql)))
+    (append-event tr (make-user-event "hello"))
+    (append-event tr (make-result-event table))
+    (let* ((live-event (aref (transcript-events tr) 1))
+           (form (write-transcript tr))
+           (back (handler-case (read-transcript-from-string form) (error () nil))))
+      (ok back "the form reads back — no unreadable object print token")
+      (ok (not (search "#." form))
+          "no read-time eval escape is emitted for the live object")
+      (ok (not (search ":VALUE" form)) "the live-object key is dropped from the form")
+      (ok (search ":TEXT" form) "the projection is what the form carries")
+      (when back
+        (let ((back-event (aref (transcript-events back) 1)))
+          (ok (eq (event-type back-event) :result) "the event type survives")
+          (ok (null (event-value back-event)) "the live object is dropped")
+          (ok (string= (event-text back-event) (event-text live-event))
+              "the printed projection survives the round trip")))
+      (ok (eq (event-value live-event) table)
+          "the live event still holds the object — serialization never mutates it"))))
 
 (rove:deftest read-transcript-keeps-escapes-in-strings-inert
   "The realistic case: content is always a string, so a #. or #, inside it is

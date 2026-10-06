@@ -43,6 +43,7 @@
    #:event-usage
    #:event-finish
    #:event-value
+   #:event-text
    #:+event-type-user+
    #:+event-type-model+
    #:+event-type-result+))
