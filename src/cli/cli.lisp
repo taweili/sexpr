@@ -32,17 +32,165 @@ own input on the terminal) so only the model's new reply renders."
 (export 'chat-session-agent)
 (export 'chat-session-cursor)
 
-;;; --- the chat loop (R009) -----------------------------------------
+;;; --- slash-command parsing (R010) ---------------------------------
+
+(defun parse-slash-command (line)
+  "If LINE (after trimming whitespace) starts with #\\/, return (values
+command-string argument-string); otherwise return (values nil nil).
+
+The command is the token after the slash up to the first space; the
+argument is the rest of the line, trimmed. A bare /exit has an empty
+argument. A line not starting with #\\/ is the normal user-event path —
+this function returns nil for the command so the caller falls through."
+  (let* ((trimmed (string-trim '(#\Space #\Tab #\Return) line)))
+    (if (and (> (length trimmed) 0) (char= (char trimmed 0) #\/))
+        (let* ((body (subseq trimmed 1))
+               (pos  (position #\Space body)))
+          (if pos
+              (values (subseq body 0 pos)
+                      (string-trim '(#\Space) (subseq body (1+ pos))))
+              (values body "")))
+        (values nil nil))))
+
+;;; --- turn runner (shared by chat-loop and /retry) ------------------
+
+(defun run-turn-and-render (session output max-steps)
+  "Run one bounded turn on SESSION's agent and render the new transcript
+events to OUTPUT. A Ctrl-C (sb-sys:interactive-interrupt) aborts the turn
+and returns to the prompt (R013). The render cursor skips already-printed
+events; after the turn, events in [cursor, transcript-length) are printed
+and the cursor advances to the new length."
+  (let* ((agent (chat-session-agent session))
+         (tr    (agent-transcript agent)))
+    (handler-case
+        (run-until-finished agent :max-steps max-steps)
+      (sb-sys:interactive-interrupt ()
+        (format output "~&; [interrupted — turn aborted]~%")))
+    (let* ((events  (transcript-events tr))
+           (new-len (length events))
+           (start   (chat-session-cursor session)))
+      (loop :for i :from start :below new-len
+            :do (format output "~&~a~%" (render-event (aref events i))))
+      (setf (chat-session-cursor session) new-len))
+    (finish-output output)))
+
+;;; --- slash-command handlers (R010) ---------------------------------
+;;;;
+;;;; Each cmd-* function takes the session (and where relevant the
+;;;; argument text / output stream / max-steps) and produces its side
+;;;; effect. A function returns :EXIT to signal chat-loop to return; nil
+;;;; to continue. Commands never append a user event unless they choose
+;;;; to (none do).
+
+(defun cmd-exit ()
+  "Signal the chat loop to terminate cleanly."
+  :exit)
+
+(defun cmd-help (&key output)
+  "Print a one-line-per-command usage list to OUTPUT."
+  (format output "~&Commands:~%")
+  (format output "~&  /exit              quit the session~%")
+  (format output "~&  /quit              quit the session~%")
+  (format output "~&  /help              show this list~%")
+  (format output "~&  /transcript        print the whole transcript~%")
+  (format output "~&  /system TEXT       set the system prompt~%")
+  (format output "~&  /save FILE         save the session to FILE~%")
+  (format output "~&  /load FILE         load a session from FILE~%")
+  (format output "~&  /retry             re-run the last model turn~%")
+  (finish-output output))
+
+(defun cmd-transcript (session &key output)
+  "Print the whole transcript to OUTPUT, ignoring the render cursor."
+  (let ((agent (chat-session-agent session)))
+    (format output "~&~a~%" (render-events (agent-transcript agent)))
+    (finish-output output)))
+
+(defun cmd-system (session text &key output)
+  "Set the agent's system prompt (persona) to TEXT and confirm (R014)."
+  (let ((agent (chat-session-agent session)))
+    (setf (agent-system agent) text)
+    (format output "~&; system prompt set.~%")
+    (finish-output output)))
+
+(defun cmd-save (session file &key output)
+  "Write the session transcript to FILE using print-transcript (R012).
+
+Reuses the tested transcript round-trip: print-transcript writes under
+with-standard-io-syntax; read-transcript reads back with *read-eval* nil
+— no separate serializer is written here."
+  (let ((agent (chat-session-agent session)))
+    (with-open-file (stream file :direction :output
+                                  :if-exists :supersede
+                                  :if-does-not-exist :create)
+      (print-transcript (agent-transcript agent) stream))
+    (format output "~&; saved to ~a~%" file)
+    (finish-output output)))
+
+(defun cmd-load (session file &key output)
+  "Load a transcript from FILE and install it on the agent (R012).
+
+The render cursor resets to the new transcript-length so loaded history
+is not re-printed (MEM016)."
+  (let ((agent (chat-session-agent session)))
+    (with-open-file (stream file :direction :input)
+      (let ((new (read-transcript stream)))
+        (setf (agent-transcript agent) new)
+        (setf (chat-session-cursor session) (transcript-length new))))
+    (format output "~&; loaded from ~a~%" file)
+    (finish-output output)))
+
+(defun cmd-retry (session &key output max-steps)
+  "Pop the single trailing :model event and re-run one bounded turn.
+
+Simplest honest semantics: remove the last model reply, move the cursor
+back to that index, and run one turn — the new model event renders and
+the cursor ends at length. If the last event is not a model event, there
+is nothing to retry."
+  (let* ((agent  (chat-session-agent session))
+         (tr     (agent-transcript agent))
+         (events (transcript-events tr)))
+    (cond
+      ((and (> (length events) 0)
+            (eq (event-type (aref events (1- (length events)))) :model))
+       (vector-pop events)
+       (setf (chat-session-cursor session) (transcript-length tr))
+       (run-turn-and-render session output max-steps))
+      (t
+       (format output "~&; nothing to retry — no trailing model event.~%")
+       (finish-output output)))))
+
+(defun dispatch-slash-command (session command rest &key output max-steps)
+  "Dispatch COMMAND (a string) with REST (the argument text) to the
+per-command function via a case. Returns :EXIT when the chat loop should
+terminate; nil otherwise. An unknown command prints a notice and
+continues — it never appends a user event or runs a turn."
+  (case (intern (string-upcase command) :keyword)
+    ((:exit :quit) (cmd-exit))
+    (:help         (cmd-help :output output))
+    (:transcript   (cmd-transcript session :output output))
+    (:system       (cmd-system session rest :output output))
+    (:save         (cmd-save session rest :output output))
+    (:load         (cmd-load session rest :output output))
+    (:retry        (cmd-retry session :output output :max-steps max-steps))
+    (otherwise
+     (format output "~&unknown command: ~a~%" command)
+     (finish-output output)
+     nil)))
+
+;;; --- the chat loop (R009, R010) ------------------------------------
 
 (defun chat-loop (session &key input output (max-steps 1))
-  "Drive SESSION's chat loop: read a line from INPUT, append it as a user
-event, run one bounded turn (MAX-STEPS), and render the new transcript
-events to OUTPUT. Repeat until INPUT reaches EOF.
+  "Drive SESSION's chat loop: read a line from INPUT, and either dispatch
+it as a slash command (R010) or append it as a user event and run one
+bounded turn (MAX-STEPS). New transcript events render to OUTPUT. Repeat
+until INPUT reaches EOF or a command signals exit.
 
 INPUT and OUTPUT default to *standard-input* and *standard-output* so the
-loop runs on a live terminal, but tests pass string streams. The render
-cursor skips the just-entered user event (the human already sees their
-input) and prints only the model's new events in [cursor,
+loop runs on a live terminal, but tests pass string streams. A line
+starting with #\\/ is a command — it is never appended as a user event
+(unknown commands print a notice and continue). All other lines follow
+the T01 turn path: append a user event, set the cursor past it, run one
+bounded turn, and render the model's new events in [cursor,
 transcript-length). A Ctrl-C (sb-sys:interactive-interrupt) during a turn
 aborts it and returns to the prompt (R013); the partial transcript stays
 readable. Returns SESSION.
@@ -55,27 +203,22 @@ the sentinel — never the error-signaling form, or scripted input hangs."
     (loop :for line = (read-line in nil :eof)
           :until (eq line :eof)
           :do
-          (let ((tr (agent-transcript agent)))
-            ;; The human already sees their line on the terminal; record it
-            ;; and point the cursor past it so only model events render.
-            (append-event tr (make-user-event line))
-            (setf (chat-session-cursor session) (transcript-length tr))
-            ;; One bounded turn. A Ctrl-C aborts it and returns to the
-            ;; prompt (R013). The handler body is finalized in a later
-            ;; task; for now it notes the abort.
-            (handler-case
-                (run-until-finished agent :max-steps max-steps)
-              (sb-sys:interactive-interrupt ()
-                (format out "~&; [interrupted — turn aborted]~%")))
-            ;; Render the model's new events in [cursor, new-length).
-            (let* ((events  (transcript-events tr))
-                   (new-len (length events))
-                   (start   (chat-session-cursor session)))
-              (loop :for i :from start :below new-len
-                    :do (format out "~&~a~%" (render-event (aref events i))))
-              (setf (chat-session-cursor session) new-len))
-            (finish-output out))))
-  session)
+          (multiple-value-bind (cmd rest) (parse-slash-command line)
+            (cond
+              (cmd
+               (when (eq :exit (dispatch-slash-command
+                                 session cmd rest
+                                 :output out :max-steps max-steps))
+                 (return-from chat-loop session)))
+              (t
+               (let ((tr (agent-transcript agent)))
+                 ;; The human already sees their line on the terminal;
+                 ;; record it and point the cursor past it so only model
+                 ;; events render.
+                 (append-event tr (make-user-event line))
+                 (setf (chat-session-cursor session) (transcript-length tr))
+                 (run-turn-and-render session out max-steps))))))
+    session))
 (export 'chat-loop)
 
 ;;; --- the convenience entry point ----------------------------------
