@@ -28,7 +28,8 @@
 
 This is the smoke-test entry point for the project: it proves that the
 ASDF system loads, the package is usable, and the runtime is wired.
-`asdf:test-op' on :sexpr invokes this."
+`make hello' runs it; the test suite runs through `asdf:test-op' instead
+(see the test-op method at the foot of this file)."
   (format stream
           "~&sexpr ~a~%~
   An Agent OS in Common Lisp.~%~
@@ -72,5 +73,20 @@ print the response. Returns the sexpr transcript node from provider-call."
 
 (defmethod asdf:perform ((op asdf:test-op)
                           (sys (eql (asdf:find-system :sexpr))))
+  "Run the rove test suite.
+
+:sexpr/tests is a separate secondary system (see sexpr.asd) declared in :sexpr's
+:in-order-to, so ASDF plans it as a real dependency of test-op rather than a
+recursive OPERATE. That keeps rove out of a plain `ql:quickload :sexpr`, which
+runs load-op only.
+
+rove is referenced through uiop:symbol-call because it is a dependency of
+:sexpr/tests, not of :sexpr — a bare `(rove:run ...)` in this file would fail at
+read time, before rove is loaded. rove:run takes a system designator, so the
+argument is the :sexpr/tests system name, not a package.
+
+Returns NIL on success. Errors when rove reports failures, so that
+`asdf:test-system` (and therefore `make test`) exits non-zero."
   (declare (ignore op))
-  (funcall (find-symbol "HELLO" "SEXPR")))
+  (unless (uiop:symbol-call :rove :run :sexpr/tests)
+    (error "rove reported failing tests")))

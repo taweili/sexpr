@@ -94,6 +94,8 @@ Recommendation: threads + lparallel promises for agents; chanl-style channels fo
 | **fiveam** / **parachute** / **rove** | Test frameworks — the agent's `run-tests` tool; rove has nice interactive/debug integration |
 | **trivial-indent** | Correct re-indentation of generated code |
 
+Design note: **rove** is the chosen framework (wired as `:sexpr-tests` in `sexpr.asd`, run by `make test`). Over fiveam — rove's built-in reporters and live REPL integration beat a hand-rolled harness for this stage; parachute's stack/branch model is heavier than the suite needs now and can be added later if the suite grows branches.
+
 ## 8. Interface layer (presentations & Listener)
 
 | Library | Role |

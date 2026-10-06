@@ -2,6 +2,7 @@
 # sexpr — build & run targets.
 #
 #   make hello      Run the sexpr:hello entry point.
+#   make test       Run the rove test suite (asdf:test-op).
 #   make load       Load the system into an interactive SBCL session.
 #   make clean      Remove build artifacts.
 
@@ -9,13 +10,19 @@ SBCL      ?= sbcl
 SBCLINIT  ?= $(HOME)/.sbclinit
 SYSTEM    := sexpr
 
-.PHONY: hello load clean help
+.PHONY: hello test load clean help
 
 hello:
 	$(SBCL) --non-interactive \
 		--load $(SBCLINIT) \
 		--eval '(ql:quickload "$(SYSTEM)" :print t)' \
 		--eval '(sexpr:hello)'
+
+test:
+	$(SBCL) --non-interactive \
+		--load $(SBCLINIT) \
+		--eval '(ql:quickload "$(SYSTEM)" :print t)' \
+		--eval "(asdf:test-system :$(SYSTEM))"
 
 load:
 	$(SBCL) --load $(SBCLINIT) \
@@ -29,6 +36,7 @@ clean:
 help:
 	@echo "sexpr — targets:"
 	@echo "  hello   Run sexpr:hello"
+	@echo "  test    Run the rove test suite"
 	@echo "  load    Load the system interactively"
 	@echo "  clean   Remove build artifacts"
 	@echo "  help    This message"

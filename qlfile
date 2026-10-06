@@ -8,3 +8,4 @@
 # migrating to Qlot-managed builds, pin it explicitly:
 #   qlot add https://github.com/quasi/cl-llm-provider.git
 cl-llm-provider
+rove

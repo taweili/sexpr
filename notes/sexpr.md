@@ -195,6 +195,16 @@ SBCL research pay-off: sexpr agents are **online-modifiable systems**.
 4. **Multi-agent coherence**: shared heap invites races. Lisp answer: the world model lives behind transactional accessors (STM-lite or a rules engine), not naked globals.
 5. **How much LLM, how much symbolics?** The interesting frontier: hybrid cognition — the model proposes, symbolic machinery (type system, planner, conditions) disposes. Keep the model's role *proposal generation under uncertainty*; keep control flow symbolic.
 
+**Where M001 (kernel spine + transcript) stands on these** — recorded so the deferrals are explicit rather than silent:
+
+- **(3) partly settled in shape.** Model responses are recorded as typed `:model` events, and a transcript round-trips through print/read with `*read-eval* nil` — that is the replay substrate. The canned-response stub provider the kernel tests drive `agent-loop` with is "replay with canned responses" in miniature. Replay itself is not built.
+- **(2) deferred, seam named.** `model-step` renders the *whole* transcript every turn; the token-budgeted `render-for-model` (§4, `:view :model`) is a later milestone, and the kernel comment says so. Until then nothing bounds context growth.
+- **(1) deferred.** Model events carry `:tool-calls` from day one so the seam has room, but nothing executes them: no sandbox, no capability enforcement, `capabilities` is an advisory slot.
+- **(4) deferred.** `agent-loop` is single-threaded and `agent`'s `thread` slot is always NIL; `spawn` deliberately does *not* start a thread.
+- **(5) untouched.** No planner or symbolic disposition yet.
+
+Two deliberate deviations from the §9 sketch below, both to keep M001 loop-closing and honest: `spawn` takes keyword arguments (`:goal` required, `:endpoint` for a per-agent provider) rather than a positional goal, and it returns an agent *without* starting a thread. The `with-capabilities` / `with-budget` / `effect-requested` machinery in that sketch is not implemented — `budget` is recorded but unenforced.
+
 ## 9. Sketch: the smallest honest kernel
 
 ```lisp
