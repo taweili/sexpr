@@ -8,6 +8,11 @@
 ;;;; BOUNDARY: no transport type is named here. Tool schemas are plain sexpr
 ;;;; data; sexpr.provider:translate-tool-schemas owns the conversion to
 ;;;; the transport's tool-definition.
+;;;;
+;;;; BOUNDARY: this package never references :sexpr.kernel. The gate takes the
+;;;; capability SET as an argument, not an agent, so the dependency stays
+;;;; one-way (kernel -> tools); reading agent-capabilities here would create
+;;;; an ASDF package cycle.
 
 (in-package :sexpr.tools)
 
@@ -224,3 +229,190 @@ capability is :FS-READ."
                          (derive-schema ',lambda-list ',types))
                 :capability ,capability))
          nil))))
+
+;;; --- the gate ---------------------------------------------------------
+;;;;
+;;;; DESIGN (notes/sexpr.md §1.3 and R019/R020): a tool is a function wearing
+;;;; metadata, and the metadata is what makes a call checkable. S02 stored
+;;;; :capability on every record but enforced nothing; this section is where
+;;;; the registry can refuse. Three failure shapes, all conditions:
+;;;;   :unknown-tool       — the model named a tool that is not registered
+;;;;   :capability-denied  — the record's capability is not in the granted set
+;;;;   :argument-error     — the arguments do not match the derived schema
+;;;;
+;;;; No restarts. §5's condition-and-restart approval machinery is out of
+;;;; scope for this milestone (R027), so this is the minimal synchronous gate:
+;;;; signal, and let the caller (the kernel's dispatch) record the failure as a
+;;;; result event and keep the loop alive.
+
+(define-condition tool-error (error)
+  ((tool
+    :initarg :tool
+    :reader tool-error-tool
+    :documentation "The tool name the failure is attributed to (a lowercase string).")
+   (reason
+    :initarg :reason
+    :reader tool-error-reason
+    :documentation ":unknown-tool, :capability-denied, or :argument-error.")
+   (detail
+    :initarg :detail
+    :reader tool-error-detail
+    :documentation "What was wrong: the offending argument name, the required
+capability, or the list of registered tool names."))
+  (:report (lambda (condition stream)
+            (format stream "tool ~a: ~a~@[ — ~a~]"
+                    (tool-error-tool condition)
+                    (tool-error-reason condition)
+                    (tool-error-detail condition))))
+  (:documentation
+   "A tool failure at the gate: unknown tool, capability denial, or argument
+validation failure. The kernel catches these and records a result event, so a
+bad call is data in the transcript rather than an exception that kills the
+agent loop."))
+
+(defun check-capability (record capabilities)
+  "Return T when RECORD's declared capability is granted in CAPABILITIES.
+
+Signals TOOL-ERROR with :reason :capability-denied naming the required
+capability when it is not granted. A record with no declared capability is
+ungated and returns T: DEFINE-TOOL always declares one, but REGISTER-TOOL!
+accepts hand-built records, so the gate only refuses tools that name a
+capability. CAPABILITIES is the capability SET (a list of keywords), not an
+agent — this package must not know about :sexpr.kernel.
+
+The gate is a membership test, not a sandbox. A granted :process capability can
+run anything through a shell tool; that is the honest limit of a v1 gate."
+  (let ((required (getf record :capability)))
+    (unless required
+      (return-from check-capability t))
+    (when (member required capabilities)
+      (return-from check-capability t))
+    (error 'tool-error
+           :tool (getf record :name)
+           :reason :capability-denied
+           :detail (format nil "~(~A~) required, granted: ~a" required (or capabilities '())))))
+
+(defun %argument-key (key)
+  "Normalize an incoming argument KEY to a lowercase string.
+
+The transport interns JSON argument keys as UPPERCASE keywords, so the schema
+parameter name \"path\" arrives as :PATH on every call, and keys longer than
+128 characters stay strings. Both keyword and string keys are accepted here, so
+the schema name is the only thing a caller has to get right."
+  (string-downcase (string key)))
+
+(defun %type-predicate (type)
+  "The predicate the six accepted schema types check values against.
+
+NIL for a type outside the six means 'check nothing' — derive-schema already
+refuses those at definition time, so this is a defensive branch, not a hole."
+  (case type
+    (:string #'stringp)
+    (:integer #'integerp)
+    (:number #'numberp)
+    (:boolean #'(lambda (value) (or (eq value t) (null value))))
+    (:array #'listp)
+    (:object #'(lambda (value) (and (listp value) (evenp (length value)))))
+    (otherwise nil)))
+
+(defun validate-tool-arguments (record args)
+  "Validate ARGS (the model's argument plist) against RECORD's derived schema.
+
+Returns a normalized (name . value) alist on success, where each NAME is the
+lowercase schema parameter name. Signals TOOL-ERROR with :reason
+:argument-error naming the offending argument for: a missing required key, a
+value that fails the type predicate for the six accepted types, an extra key
+not in the derived schema, and NIL arguments when the tool has required
+parameters — the transport returns NIL when it cannot parse the model's JSON,
+so 'no arguments at all' must be a recorded failure, not a vacuously valid
+zero-argument call. A malformed (odd-length) argument plist is refused the same
+way.
+
+Keys are normalized to lowercase strings, so :PATH, :path, and \"path\" all
+match the schema parameter \"path\"."
+  (let* ((schema (getf record :schema))
+         (params (getf schema :parameters))
+         (required (getf schema :required))
+         (tool-name (getf record :name)))
+    (when (null args)
+      (when required
+        (error 'tool-error
+               :tool tool-name
+               :reason :argument-error
+               :detail (format nil "no arguments supplied; required: ~a" required)))
+      (return-from validate-tool-arguments nil))
+    (unless (evenp (length args))
+      (error 'tool-error
+             :tool tool-name
+             :reason :argument-error
+             :detail (format nil "malformed argument plist ~a" args)))
+    (let ((normalized '()))
+      (loop for (key value) on args by #'cddr
+            for name = (%argument-key key)
+            do (let ((param (find name params
+                                  :key #'(lambda (p) (getf p :name))
+                                  :test #'string=)))
+                 (unless param
+                   (error 'tool-error
+                          :tool tool-name
+                          :reason :argument-error
+                          :detail (format nil "extra argument ~a is not in the schema" name)))
+                 (let ((predicate (%type-predicate (getf param :type))))
+                   (when (and predicate (not (funcall predicate value)))
+                     (error 'tool-error
+                            :tool tool-name
+                            :reason :argument-error
+                            :detail (format nil "argument ~a expects ~a, got ~a"
+                                            name (getf param :type) value))))
+                 (push (cons name value) normalized)))
+      (dolist (name required)
+        (unless (assoc name normalized :test #'string=)
+          (error 'tool-error
+                 :tool tool-name
+                 :reason :argument-error
+                 :detail (format nil "missing required argument ~a" name))))
+      (nreverse normalized))))
+
+(defun perform-tool (tool-call &key capabilities)
+  "Execute TOOL-CALL — the transport-shaped plist (:id .. :name .. :arguments ..).
+
+Order is the gate: find-tool on :name (TOOL-ERROR :unknown-tool with the
+registered names in the detail), check-capability, validate-tool-arguments,
+then apply — required parameters positional in derived-schema order, the rest
+as keyword arguments. Returns the tool's return value. Errors raised inside a
+tool body propagate to the caller; the kernel's dispatch catches them and
+records a failure result, so nothing here swallows anything.
+
+CAPABILITIES is the capability SET, not the agent: :sexpr.tools never reads
+:sexpr.kernel, since kernel depends on tools and reading agent-capabilities
+here would create an ASDF package cycle (D009).
+
+Tools must use &key for optional parameters. A &optional parameter is not a
+keyword argument, so a call that passes one signals at call time and is caught
+by the loop — that is why S05's five tools use &key."
+  (let* ((raw-name (getf tool-call :name))
+         (tool-name (and raw-name (string-downcase (string raw-name))))
+         (record (and tool-name (find-tool tool-name))))
+    (unless record
+      (error 'tool-error
+             :tool tool-name
+             :reason :unknown-tool
+             :detail (tool-names)))
+    (check-capability record capabilities)
+    (let* ((args (validate-tool-arguments record (getf tool-call :arguments)))
+          (schema (getf record :schema))
+          (params (getf schema :parameters))
+          (required (getf schema :required))
+          (positional nil)
+          (keywords nil))
+      (dolist (param params)
+        (let* ((name (getf param :name))
+               (cell (assoc name args :test #'string=))
+               (reqp (member name required :test #'string=)))
+          (when (and cell reqp)
+            (push (cdr cell) positional))
+          (when (and cell (not reqp))
+            (push (intern (string-upcase name) :keyword) keywords)
+            (push (cdr cell) keywords))))
+      (apply (getf record :symbol)
+             (append (nreverse positional) (nreverse keywords))))))

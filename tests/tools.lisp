@@ -2,8 +2,9 @@
 ;;;; tests/tools.lisp — the tool registry and schema derivation (R018, R024).
 ;;;;
 ;;;; Scope: define-tool, derive-schema, find-tool, apropos-tool, tool-names,
-;;;; tool-schema-list, register-tool! collision, and the transport translation
-;;;; in sexpr.provider:translate-tool-schemas.
+;;;; tool-schema-list, register-tool! collision, the capability gate and
+;;;; argument validation (R019, R020), and the transport translation in
+;;;; sexpr.provider:translate-tool-schemas.
 ;;;;
 ;;;; Every test calls reset-tool-registry! first: the registry is a process-wide
 ;;;; hash table, so without that isolation a tool registered by one test leaks
@@ -188,3 +189,211 @@
       "&rest cannot be represented as a JSON schema parameter")
   (ok (signals (derive-schema '(path) '((path . :blob))))
       "a type outside the six the transport validator accepts is refused"))
+
+;;; --- the gate (R019, R020) -----------------------------------------
+;;;;
+;;;; The registry was honest about being unenforced in S02: every record
+;;;; carried :capability and nothing refused. These groups are where the gate
+;;;; has something real to refuse — the three failure shapes (unknown tool,
+;;;; capability denial, argument validation failure) and the apply step that
+;;;; turns a validated argument alist back into a lambda-list call.
+;;;;
+;;;; Each group calls reset-tool-registry! first, like the rest of this file.
+;;;; Conditions are captured with handler-case rather than rove's `signals`,
+;;;; because `signals` returns T and the assertions here need the condition's
+;;;; readers (tool-error-tool / -reason / -detail).
+
+(rove:deftest perform-tool-unknown-tool-names-the-registered-tools
+  "perform-tool signals :unknown-tool with the registered names in the detail."
+  (reset-tool-registry!)
+  (define-tool my-read-file (path)
+    "Read the file at PATH."
+    path)
+  (let ((err (handler-case (perform-tool (list :id "1" :name "no-such-tool"
+                                               :arguments (list :path "/x")))
+              (tool-error (c) c))))
+    (ok err "an unregistered name signals")
+    (ok (eq (tool-error-reason err) :unknown-tool) ":reason is :unknown-tool")
+    (ok (string= (tool-error-tool err) "no-such-tool")
+        ":tool names the tool the model asked for")
+    (ok (equal (tool-error-detail err) '("my-read-file"))
+        "the detail lists the tools that do exist"))
+  (let ((err (handler-case (perform-tool (list :id "2" :arguments (list :path "/x")))
+              (tool-error (c) c))))
+    (ok err "a call with no :name signals rather than erroring on the name")
+    (ok (eq (tool-error-reason err) :unknown-tool)
+        "a nameless call is the same failure shape")))
+
+(rove:deftest tool-error-report-names-the-tool-and-the-reason
+  "The condition prints a readable log line naming the tool and the reason."
+  (reset-tool-registry!)
+  (define-tool my-eval (form)
+    "Evaluate FORM."
+    :capability :lisp-eval
+    form)
+  (let ((err (handler-case (check-capability (find-tool 'my-eval) '(:fs-read))
+              (tool-error (c) c))))
+    ;; ~A prints the condition through its :report option, which is the log
+    ;; line. The case is normalized because the reason keyword prints through
+    ;; *print-case*, so an exact lowercase search would be implementation noise.
+    (let ((msg (string-downcase (format nil "~a" err))))
+      (ok (search "my-eval" msg) "the report names the tool")
+      (ok (search "capability-denied" msg) "the report names the reason")
+      (ok (search "lisp-eval" msg) "and the required capability"))))
+
+(rove:deftest check-capability-refuses-an-unganted-capability
+  "The gate refuses a tool whose declared capability is not in the granted set."
+  (reset-tool-registry!)
+  (define-tool my-eval (form)
+    "Evaluate FORM."
+    :capability :lisp-eval
+    form)
+  (let ((record (find-tool 'my-eval)))
+    (let ((err (handler-case (check-capability record '(:fs-read)) (tool-error (c) c))))
+      (ok err "an unganted capability signals")
+      (ok (eq (tool-error-reason err) :capability-denied) ":reason is :capability-denied")
+      (ok (string= (tool-error-tool err) "my-eval") ":tool names the tool")
+      (ok (search "lisp-eval" (tool-error-detail err))
+          "the detail names the required capability"))
+    (ok (eq (check-capability record '(:fs-read :lisp-eval)) t)
+        "the same tool is granted when the capability is in the set")
+    (ok (eq (check-capability (list :name "hand-built" :description "d") '(:fs-read)) t)
+        "a record with no declared capability is ungated")))
+
+(rove:deftest perform-tool-runs-a-tool-when-its-capability-is-granted
+  "A granted capability lets the tool run and returns its value."
+  (reset-tool-registry!)
+  (define-tool my-add (a b)
+    "Add A and B."
+    :types ((a . :integer) (b . :integer))
+    (+ a b))
+  (ok (= (perform-tool (list :id "1" :name "my-add" :arguments (list :a 2 :b 3))
+                       :capabilities '(:fs-read))
+         5)
+      "the tool ran and returned 5")
+  (ok (= (perform-tool (list :id "2" :name "my-add" :arguments (list :A 10 :B 20))
+                       :capabilities '(:fs-read))
+         30)
+      "the transport's uppercase keyword keys reach the tool unchanged")
+  (define-tool my-failing (path)
+    "Read PATH and fail."
+    (error "the tool body signals"))
+  (ok (signals (perform-tool (list :id "3" :name "my-failing"
+                                   :arguments (list :path "/x"))
+                             :capabilities '(:fs-read)))
+      "a tool body that signals propagates to the caller — the gate swallows nothing"))
+
+(rove:deftest validate-tool-arguments-refuses-missing-wrong-typed-and-extra-keys
+  "Missing key, wrong type, and extra key each signal :argument-error naming the argument."
+  (reset-tool-registry!)
+  (define-tool my-read-file (path &key count)
+    "Read the file at PATH."
+    :types ((count . :integer))
+    (list path count))
+  (let ((record (find-tool 'my-read-file)))
+    (let ((err (handler-case (validate-tool-arguments record (list :count 2))
+                (tool-error (c) c))))
+      (ok err "a missing required key signals")
+      (ok (eq (tool-error-reason err) :argument-error) ":reason is :argument-error")
+      (ok (search "path" (tool-error-detail err)) "the detail names the missing argument"))
+    (let ((err (handler-case (validate-tool-arguments record (list :path "/x" :count "3"))
+                (tool-error (c) c))))
+      (ok err "a value that fails its type predicate signals")
+      (ok (search "count" (tool-error-detail err)) "the detail names the mistyped argument"))
+    (let ((err (handler-case (validate-tool-arguments record (list :path "/x" :mode "r"))
+                (tool-error (c) c))))
+      (ok err "an extra key not in the derived schema signals")
+      (ok (search "mode" (tool-error-detail err)) "the detail names the extra argument"))
+    (ok (equal (validate-tool-arguments record (list :path "/x"))
+               '(("path" . "/x")))
+        "a call that supplies only the required parameters is valid")))
+
+(rove:deftest validate-tool-arguments-refuses-nil-arguments-for-required-params
+  "NIL arguments with required parameters is a recorded failure, not a vacuous pass."
+  (reset-tool-registry!)
+  (define-tool my-read-file (path)
+    "Read the file at PATH."
+    path)
+  (define-tool my-ping ()
+    "Ping."
+    'pong)
+  (let ((err (handler-case (validate-tool-arguments (find-tool 'my-read-file) nil)
+              (tool-error (c) c))))
+    (ok err "the transport returns NIL when it cannot parse the model's JSON")
+    (ok (eq (tool-error-reason err) :argument-error) ":reason is :argument-error")
+    (ok (search "path" (tool-error-detail err)) "the detail names the required argument"))
+  (ok (null (validate-tool-arguments (find-tool 'my-ping) nil))
+      "a zero-parameter tool still accepts NIL: nothing was required"))
+
+(rove:deftest validate-tool-arguments-checks-the-six-schema-types
+  "Each of the six accepted types has its own predicate."
+  (reset-tool-registry!)
+  (define-tool my-tool (path &key count flag tags obj)
+    "Read PATH with options."
+    :types ((count . :integer) (flag . :boolean) (tags . :array) (obj . :object))
+    (list path count flag tags obj))
+  (let ((record (find-tool 'my-tool)))
+    (ok (equal (validate-tool-arguments record
+                                       (list :path "/x" :count 3 :flag t :tags '("a")
+                                             :obj '("k" 1)))
+               '(("path" . "/x") ("count" . 3) ("flag" . t) ("tags" . ("a"))
+                 ("obj" . ("k" 1))))
+        "a well-typed call returns the normalized (name . value) alist")
+    (dolist (bad (list (list :path 42)
+                       (list :path "/x" :count "3")
+                       (list :path "/x" :flag "yes")
+                       (list :path "/x" :tags "a b")
+                       (list :path "/x" :obj '("k"))
+                       (list :path "/x" :count 3.5)))
+      (let ((err (handler-case (validate-tool-arguments record bad) (tool-error (c) c))))
+        (ok err (format nil "~a is refused" bad))
+        (ok (eq (tool-error-reason err) :argument-error)
+            "the failure shape is the same for every type")))))
+
+(rove:deftest argument-keys-normalize-to-lowercase-schema-names
+  ":PATH, :path, and \"path\" all match the schema parameter \"path\"."
+  (reset-tool-registry!)
+  (define-tool my-read-file (path)
+    "Read the file at PATH."
+    path)
+  (let ((record (find-tool 'my-read-file)))
+    (ok (equal (validate-tool-arguments record (list :PATH "/etc/hosts"))
+               '(("path" . "/etc/hosts")))
+        "the transport's uppercase keyword key normalizes to the schema name")
+    (ok (equal (validate-tool-arguments record (list "path" "/etc/hosts"))
+               '(("path" . "/etc/hosts")))
+        "a key the transport keeps as a string (longer than 128 chars) matches too")
+    (ok (string= (perform-tool (list :id "1" :name 'my-read-file
+                                     :arguments (list :PATH "/etc/hosts"))
+                               :capabilities '(:fs-read))
+                 "/etc/hosts")
+        "perform-tool applies the normalized key through the gate")))
+
+(rove:deftest perform-tool-applies-parameters-in-lambda-list-shape
+  "Required parameters go positional in derived-schema order; the rest as keywords."
+  (reset-tool-registry!)
+  (define-tool my-describe (dir depth &key verbose)
+    "Describe DIR to DEPTH."
+    :types ((depth . :integer) (verbose . :boolean))
+    (format nil "~a:~a~a" dir depth (if verbose "*" "")))
+  (ok (string= (perform-tool (list :id "1" :name "my-describe"
+                                   :arguments (list :dir "/tmp" :depth 2 :verbose t))
+                             :capabilities '(:fs-read))
+               "/tmp:2*")
+      "the required params went positional in schema order, the &key param as a keyword")
+  (ok (string= (perform-tool (list :id "2" :name "my-describe"
+                                   :arguments (list :dir "/tmp" :depth 1))
+                             :capabilities '(:fs-read))
+               "/tmp:1")
+      "an omitted optional key keeps its lambda-list default"))
+
+(rove:deftest perform-tool-signals-at-call-time-for-an-optional-parameter
+  "A &optional parameter is not a keyword argument: the call itself signals."
+  (reset-tool-registry!)
+  (define-tool my-optional (path &optional verbose)
+    "Read PATH, optionally verbosely."
+    (list path verbose))
+  (ok (signals (perform-tool (list :id "1" :name "my-optional"
+                                   :arguments (list :path "/x" :verbose "yes"))
+                             :capabilities '(:fs-read)))
+      "the argument passes validation but the apply signals — tools must use &key"))

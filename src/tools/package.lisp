@@ -29,4 +29,11 @@
    #:apropos-tool
    #:tool-schema-list
    #:reset-tool-registry!
-   #:*tool-registry*))
+   #:*tool-registry*
+   #:tool-error
+   #:tool-error-tool
+   #:tool-error-reason
+   #:tool-error-detail
+   #:check-capability
+   #:validate-tool-arguments
+   #:perform-tool))
