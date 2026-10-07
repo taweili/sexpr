@@ -11,7 +11,7 @@ SBCLINIT  ?= $(HOME)/.sbclinit
 SYSTEM    := sexpr
 CHAT_ARGS ?= --goal "pair programmer"
 
-.PHONY: hello test load build chat verify diagnostic-tool-call test-live clean help
+.PHONY: hello test load build chat verify diagnostic-tool-call diagnostic-live-round test-live clean help
 
 hello:
 	$(SBCL) --non-interactive \
@@ -48,13 +48,35 @@ diagnostic-tool-call:
 		--eval '(ql:quickload "$(SYSTEM)" :print t)' \
 		--load tools/diagnostic-tool-call.lisp
 
-test-live: build
-	@echo '[live] local model round-trip'
-	@printf '/exit\n' | \
+diagnostic-live-round:
 	SEXPR_PROVIDER=openai-compatible \
 	SEXPR_BASE_URL=http://localhost:6969/v1 \
 	SEXPR_MODEL=Qwythos-9B-v2 \
-	./sexpr --goal "Say hello in one word."
+	timeout 420 $(SBCL) --non-interactive \
+		--load $(SBCLINIT) \
+		--eval '(ql:quickload "$(SYSTEM)" :print t)' \
+		--load tools/diagnostic-live-round.lisp
+
+test-live: build
+	@echo '[live] local model round-trip'
+	@tmp=$$(mktemp --suffix=.sexp); \
+	trap 'rm -f $$tmp /tmp/sexpr-live-readme.txt' EXIT; \
+	printf 'hello world from s05\n' > /tmp/sexpr-live-readme.txt; \
+	echo "$$(date -u +%H:%M:%S) [1/4] prompting model to read /tmp/sexpr-live-readme.txt"; \
+	printf 'Use the read-file tool to read /tmp/sexpr-live-readme.txt, then tell me exactly what it contains.\n/save %s\n/exit\n' $$tmp | \
+	SEXPR_PROVIDER=openai-compatible \
+	SEXPR_BASE_URL=http://localhost:6969/v1 \
+	SEXPR_MODEL=Qwythos-9B-v2 \
+	  timeout 420 ./sexpr --goal "You are a terse assistant. Use tools when asked." \
+	  > /tmp/sexpr-live-out.txt 2>&1; \
+	rc=$$?; \
+	echo "$$(date -u +%H:%M:%S) [2/4] sexpr exited $$rc"; \
+	echo '=== output ==='; cat /tmp/sexpr-live-out.txt; \
+	echo "$$(date -u +%H:%M:%S) [3/4] checking recorded events in transcript"; \
+	if [ $$rc -ne 0 ]; then echo 'FAIL: sexpr exited non-zero'; exit 1; fi; \
+	grep -q ':RESULT' $$tmp || { echo 'FAIL: no :RESULT event — model did not call a tool (or dispatch failed)'; exit 1; }; \
+	grep -q 'hello world from s05' $$tmp || { echo 'FAIL: file contents not in transcript — read-file did not return the file'; exit 1; }; \
+	echo "$$(date -u +%H:%M:%S) [4/4] LIVE MODEL ROUND-TRIP PASSED"
 
 verify: build
 	@echo '[probe 1] --help exits 0 and prints usage'
@@ -81,6 +103,7 @@ help:
 	@echo "  chat    Run ./sexpr (override with CHAT_ARGS='--goal \"...\"')"
 	@echo "  verify  Run binary probes: --help, scripted session, cross-process load, R015 seam"
 	@echo "  diagnostic-tool-call  Probe a live local server for a usable :tool-calls node"
+	@echo "  diagnostic-live-round  In-process live turn: assert the recorded events and the live :value"
 	@echo "  test-live  Run ./sexpr against the live local model (requires a running server)"
 	@echo "  clean   Remove build artifacts"
 	@echo "  help    This message"

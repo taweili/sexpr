@@ -178,7 +178,7 @@ continues — it never appends a user event or runs a turn."
 
 ;;; --- the chat loop (R009, R010) ------------------------------------
 
-(defun chat-loop (session &key input output (max-steps 1))
+(defun chat-loop (session &key input output (max-steps 10))
   "Drive SESSION's chat loop: read a line from INPUT, and either dispatch
 it as a slash command (R010) or append it as a user event and run one
 bounded turn (MAX-STEPS). New transcript events render to OUTPUT. Repeat
@@ -255,7 +255,7 @@ the first press prints a notice and re-prompts, the second exits.
 
 ;;; --- the convenience entry point ----------------------------------
 
-(defun chat (&key goal system endpoint input output (max-steps 1) transcript)
+(defun chat (&key goal system endpoint input output (max-steps 10) transcript)
   "Build an agent and run chat-loop over it.
 
 GOAL is required — an agent without a goal is not an agent; make-agent
