@@ -31,7 +31,7 @@
         ((:file "package")
          (:file "kernel" :depends-on ("package"))))
       (:module "cli"
-        :depends-on ("package" "transcript" "kernel")
+        :depends-on ("package" "transcript" "kernel" "repl")
         :components
         ((:file "package")
          (:file "cli" :depends-on ("package"))))

@@ -96,6 +96,7 @@ and the cursor advances to the new length."
   (format output "~&  /save FILE         save the session to FILE~%")
   (format output "~&  /load FILE         load a session from FILE~%")
   (format output "~&  /retry             re-run the last model turn~%")
+  (format output "~&  /repl              escape into a CL dev REPL (,exit to return)~%")
   (finish-output output))
 
 (defun cmd-transcript (session &key output)
@@ -158,11 +159,33 @@ is nothing to retry."
        (format output "~&; nothing to retry — no trailing model event.~%")
        (finish-output output)))))
 
-(defun dispatch-slash-command (session command rest &key output max-steps)
+(defun cmd-repl (session &key input output)
+  "Escape into an unrestricted CL REPL sharing the live agent.
+
+sexpr.repl:*agent* is bound to the session's agent, so a dev can inspect
+and mutate it directly — (agent-transcript *agent*), (setf (agent-system
+*agent*) ...), (trace sexpr.tools:perform-tool), hot-redefine a tool, etc.
+,exit returns to chat-loop; the loop resumes with any redefinitions now
+in effect (the inspect-fix-retry dev loop). The REPL shares chat-loop's
+input/output streams, so ,exit (not EOF) is the escape — EOF would also
+end the chat loop.
+
+Returns nil — /repl is never an exit command. The model is never called
+here; the REPL reaches it only if the dev evaluates a provider-call form
+themselves."
+  (sexpr.repl:repl :agent (chat-session-agent session)
+                   :input input
+                   :output output)
+  nil)
+(export 'cmd-repl)
+
+(defun dispatch-slash-command (session command rest &key input output max-steps)
   "Dispatch COMMAND (a string) with REST (the argument text) to the
 per-command function via a case. Returns :EXIT when the chat loop should
 terminate; nil otherwise. An unknown command prints a notice and
-continues — it never appends a user event or runs a turn."
+continues — it never appends a user event or runs a turn. :repl forwards
+INPUT and OUTPUT so the REPL shares chat-loop's streams (the ,exit escape
+returns here without EOF'ing the shared input)."
   (case (intern (string-upcase command) :keyword)
     ((:exit :quit) (cmd-exit))
     (:help         (cmd-help :output output))
@@ -171,6 +194,7 @@ continues — it never appends a user event or runs a turn."
     (:save         (cmd-save session rest :output output))
     (:load         (cmd-load session rest :output output))
     (:retry        (cmd-retry session :output output :max-steps max-steps))
+    (:repl         (cmd-repl session :input input :output output))
     (otherwise
      (format output "~&unknown command: ~a~%" command)
      (finish-output output)
@@ -240,7 +264,7 @@ the first press prints a notice and re-prompts, the second exits.
                (cmd
                 (when (eq :exit (dispatch-slash-command
                                   session cmd rest
-                                  :output out :max-steps max-steps))
+                                  :input in :output out :max-steps max-steps))
                   (return-from chat-loop session)))
                (t
                 (let ((tr (agent-transcript agent)))
@@ -390,6 +414,7 @@ capability and it will be honored here without further wiring."
   (format stream "~&  /save FILE         save the session to FILE~%")
   (format stream "~&  /load FILE         load a session from FILE~%")
   (format stream "~&  /retry             re-run the last model turn~%")
+  (format stream "~&  /repl              escape into a CL dev REPL (,exit to return)~%")
   (finish-output stream))
 (export 'print-usage)
 

@@ -201,6 +201,57 @@
              (agent-transcript (chat-session-agent session))) 0)
         "no user event was appended for an unknown command")))
 
+;;; --- /repl escape (sexpr.repl integration) -------------------------
+;;;
+;;;; /repl hands chat-loop's input/output to sexpr.repl:repl with the
+;;;; live agent. ,exit returns to chat-loop without EOF'ing the shared
+;;;; input stream. The REPL is exercised in isolation in tests/repl.lisp;
+;;;; these two tests prove the chat-loop wiring (dispatch, *agent*
+;;;; binding, return-to-chat, continued turn).
+
+(rove:deftest repl-command-enters-and-returns-to-chat
+  "(/repl) enters the REPL, ,exit returns to chat, and a following line
+runs a normal turn. The REPL shared chat-loop's input stream, so ,exit
+(not EOF) returns control without ending the chat."
+  (let* ((stub (make-instance 'stub-endpoint
+                              :responses (list (list :content "reply" :finish :stop))))
+         (out (make-string-output-stream))
+         (session (chat :goal "g" :endpoint stub
+                        :input  (make-string-input-stream
+                                  (format nil "/repl~%,exit~%hello"))
+                        :output out
+                        :max-steps 1)))
+    (let ((text (get-output-stream-string out))
+          (events (transcript-events
+                   (agent-transcript (chat-session-agent session)))))
+      (ok (search "REPL" text)
+          "the REPL banner was printed on entry")
+      (ok (search "reply" text)
+          "the model reply rendered after returning from the REPL")
+      (ok (= (stub-call-count stub) 1)
+          "the model was called once — only the hello line ran a turn")
+      (ok (= (length events) 2)
+          "the transcript holds the hello user event and the reply model event")
+      (ok (eq (event-type (aref events 0)) :user)
+          "the first event is the hello user line")
+      (ok (eq (event-type (aref events 1)) :model)
+          "the second event is the model reply"))))
+
+(rove:deftest repl-command-sees-live-agent
+  "(/repl) binds *agent* to the session's agent — (agent-goal *agent*)
+at the REPL prompt returns the live goal. No turn runs: ,exit returns
+before the model is ever called."
+  (let* ((stub (make-instance 'stub-endpoint))
+         (out (make-string-output-stream))
+         (session (chat :goal "live-goal" :endpoint stub
+                        :input  (make-string-input-stream
+                                  (format nil "/repl~%(agent-goal *agent*)~%,exit"))
+                        :output out
+                        :max-steps 1)))
+    (declare (ignore session))
+    (ok (search "live-goal" (get-output-stream-string out))
+        "the live agent's goal was visible via *agent* at the REPL prompt")))
+
 ;;;; --- SIGINT abort fixture ------------------------------------------
 ;;;;
 ;;;; sigint-stub raises sb-sys:interactive-interrupt on its FIRST provider
