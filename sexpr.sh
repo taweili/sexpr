@@ -261,4 +261,8 @@ else
     args=("${caps_arg[@]}" "$@")
 fi
 
-exec rlwrap ./sexpr "${args[@]}"
+# sexpr's chat-loop calls (read-line) and never prints its own "> " marker,
+# so without rlwrap's -S the user sees a bare cursor. -S substitutes a fixed
+# prompt before each read. Note: in this rlwrap build -p is
+# --prompt-colour (not "set prompt"), and -s is --histsize (not "silent").
+exec rlwrap -S "sexpr> " ./sexpr "${args[@]}"
