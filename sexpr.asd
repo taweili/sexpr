@@ -55,7 +55,18 @@
       (:module "builtins" :depends-on ("tools" "sandbox")
         :components
         ((:file "builtins")))
-      (:file "sexpr" :depends-on ("provider" "transcript" "kernel" "cli" "tools" "sandbox" "builtins")))))
+      ;; :sexpr.repl is an aggregating dev package (:use transcript/kernel/
+      ;; tools/sandbox). It loads AFTER those four so defpackage's :use lists
+      ;; resolve. :sexpr.cli references sexpr.repl:repl by qualified name
+      ;; (Task 2), so :cli also depends-on "repl" — repl must exist at
+      ;; cli.lisp read time. NOT :use'ing :sexpr.cli here avoids the cycle
+      ;; (cli -> repl at read time, repl -> cli at defpackage time).
+      (:module "repl"
+        :depends-on ("transcript" "kernel" "tools" "sandbox")
+        :components
+        ((:file "package")
+         (:file "repl" :depends-on ("package"))))
+      (:file "sexpr" :depends-on ("provider" "transcript" "kernel" "cli" "tools" "sandbox" "builtins" "repl")))))
   ;; test-op is defined as a method in src/sexpr.lisp, not inline here:
   ;; inline :perform bodies are miscompiled by this Quicklisp-bundled
   ;; ASDF when the system has real dependencies (the leading DECLARE is
@@ -86,4 +97,5 @@
       (:file "cli" :depends-on ("package" "kernel"))
       (:file "tools" :depends-on ("package"))
       (:file "sandbox" :depends-on ("package"))
+      (:file "repl" :depends-on ("package"))
       (:file "five" :depends-on ("package"))))))
