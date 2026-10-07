@@ -1,16 +1,35 @@
 ;;; SPDX-License-Identifier: GPL-3.0-or-later
 ;;;; sexpr.sandbox — the restricted-read eval sandbox (read path).
 ;;;;
-;;;; This file implements the read half of the sandbox: a restricted
-;;;; eclector readtable (sharp-S / sharp-C disabled, sharp-dot blocked by
-;;;; *read-eval* nil) and the condition taxonomy the whole sandbox
-;;;; reports through. eval-in-sandbox and the :sexpr.kernel load-time
-;;;; lock land in S04-T02.
+;;;; This file implements the sandbox: a restricted eclector readtable
+;;;; (sharp-S / sharp-C disabled, sharp-dot blocked by *read-eval* nil),
+;;;; a locked scratch package for eval, a wall-clock timeout around the
+;;;; eval, and a process-wide lock on :sexpr.kernel at load time. It
+;;;; owns the condition taxonomy the sandbox reports through.
 ;;;;
-;;;; HONEST LIMIT (R021): the read path refuses reader-escape macros and
-;;;; read-time interning into a locked package. It does NOT, on its own,
-;;;; stop run-time sb-ext / filesystem access — that is the documented
-;;;; v1 trade-off, not a bug. See the BOUNDARY note in package.lisp.
+;;;; BOUNDARY / HONESTY LIMIT (R021 — "soft-but-honest"):
+;;;;   what the sandbox DOES stop:
+;;;;     * reader-escape macros: #. (via *read-eval* nil), #S, #C;
+;;;;     * read-time intern into a locked package (sandbox or
+;;;;       :sexpr.kernel); both signal cl/sb-ext:package-locked-error,
+;;;;       which read-sandboxed-form wraps as read-refusal;
+;;;;     * eval-time intern into a locked package (a form like
+;;;;       (defun foo ...) that would create a new symbol is refused at
+;;;;       eval via eval-refusal; the class is preserved in :error);
+;;;;     * writes into :sexpr.kernel (locked at load time; the lock is
+;;;;       process-wide, so nothing — test fixtures, dispatch, model
+;;;;       code, or the sandbox itself — can intern into it or write
+;;;;       definitions into it).
+;;;;   what the sandbox does NOT stop:
+;;;;     * sb-ext, run-program, UIOP/filesystem access — those packages
+;;;;       are not locked and the sandbox does not lock them. A form
+;;;;       like (sb-ext:invoke-function (sb-ext:make-fun-lock nil))
+;;;;       would run with full privileges inside eval-in-sandbox.
+;;;;   v1 does not overclaim "no code can escape", only
+;;;;   "no reader escapes, no new symbols in locked packages, no writes
+;;;;   into :sexpr.kernel". This is a documented v1 trade-off, not a
+;;;;   bug. The BOUNDARY note in package.lisp restates the R015 seam
+;;;;   rule (this directory never names the provider transport).
 
 (in-package :sexpr.sandbox)
 
@@ -203,3 +222,75 @@ locking. The caller MUST call lock-sandbox before eval."
 is idempotent in SBCL, so reloads and double-locks are safe."
   (sb-ext:lock-package package)
   package)
+
+;;;; --- eval-in-sandbox ----------------------------------------------
+;;;;
+;;;; The eval half of the sandbox: bind *package* to the caller's
+;;;; locked sandbox, evaluate FORM inside a wall-clock timeout, and
+;;;; translate the resulting condition into the sandbox's own taxonomy.
+;;;;
+;;;; SANDBOXING TRADE-OFF (R021, honest): CL's EVAL compiles the form
+;;;; into a scratch lexenv at eval time — the form gets a real compiled
+;;;; function, so it can reach anything the calling image's reader can
+;;;; reach (sb-ext, run-program, filesystem, network). Package locks
+;;;; stop intern into :sexpr.kernel and the sandbox package, but they
+;;;; do not stop code from *calling* arbitrary global functions. This
+;;;; is documented as a v1 trade-off, not a bug. The BOUNDARY comment
+;;;; at the top of this file names the limits.
+
+(defun eval-in-sandbox (form sandbox &key (seconds 5.0))
+  "Evaluate FORM inside the SANDBOX package under a wall-clock timeout
+of SECONDS seconds, returning the value on success.
+
+Signalled conditions:
+  * TIMEOUT-REFUSAL    — sb-ext:with-timeout fired; the form was
+                         cut off at SECONDS seconds.
+  * EVAL-REFUSAL       — the form signalled any other error; :form is
+                         FORM, :reason is (TYPE-OF e) (e.g.
+                         UNDEFINED-FUNCTION, PACKAGE-LOCKED-ERROR),
+                         and :error is the original condition.
+
+SANDBOX is the caller's sandbox package — the caller is responsible
+for calling lock-sandbox first if they want read-time intern refusal.
+
+Note: EVAL compiles FORM into a scratch lexenv, so the form can call
+any function the calling image can reach. Package locks only stop
+new symbol interning into the sandbox / :sexpr.kernel — they do not
+stop calls into sb-ext or the filesystem. This is the documented v1
+trade-off (see R021 above)."
+  (let ((*package* sandbox))
+    (handler-case
+        (sb-ext:with-timeout seconds (eval form))
+      (sb-ext:timeout ()
+         (error 'timeout-refusal :seconds seconds))
+      (error (e)
+         (error 'eval-refusal
+                :form form
+                :reason (type-of e)
+                :error e)))))
+
+;;;; --- :sexpr.kernel load-time lock --------------------------------
+;;;;
+;;;; The milestone criterion "after loading, :sexpr.kernel is locked"
+;;;; (and "(defun sexpr.kernel:foo) from a fixture fails") needs a
+;;;; process-wide lock on :sexpr.kernel that takes effect as soon as
+;;;; the sandbox module is loaded. :sexpr.kernel exists by then
+;;;; (asd: :module "sandbox" :depends-on ("package" "kernel")), but
+;;;; the guard is cheap robustness — some test harnesses may load in a
+;;;; different order.
+;;;
+;;;; Package locks are PROCESS-WIDE: once :sexpr.kernel is locked,
+;;;; nothing in this image can intern a new symbol into it. Reloads
+;;;; are safe: sb-ext:lock-package is idempotent in SBCL (re-locking
+;;;; a locked package is a no-op).
+;;;
+;;;; This is a HARD limit — the whole image is affected. T03's tests
+;;;; must not write `'(defun sexpr.kernel:foo () 42)` as a literal
+;;;; (reading it interns FOO into the now-locked :sexpr.kernel and
+;;;; breaks test-file compilation). T03 asserts the lock via direct
+;;;; (intern ...) and via eval-ing a defun that redefines an EXISTING
+;;;; kernel export (e.g. budget).
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (when (find-package :sexpr.kernel)
+    (sb-ext:lock-package :sexpr.kernel)))
