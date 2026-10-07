@@ -10,7 +10,7 @@
   :author "David Li <taweili@gmail.com>"
   :license "GPL-3.0-or-later"
   :description "sexpr — an Agent OS in Common Lisp."
-  :depends-on (:cl-llm-provider)
+  :depends-on (:cl-llm-provider :eclector)
   :components
   ((:module "src"
      :components
@@ -40,7 +40,12 @@
         :components
         ((:file "package")
          (:file "tools" :depends-on ("package"))))
-      (:file "sexpr" :depends-on ("provider" "transcript" "kernel" "cli" "tools")))))
+      (:module "sandbox"
+        :depends-on ("package" "kernel")
+        :components
+        ((:file "package")
+         (:file "sandbox" :depends-on ("package"))))
+      (:file "sexpr" :depends-on ("provider" "transcript" "kernel" "cli" "tools" "sandbox")))))
   ;; test-op is defined as a method in src/sexpr.lisp, not inline here:
   ;; inline :perform bodies are miscompiled by this Quicklisp-bundled
   ;; ASDF when the system has real dependencies (the leading DECLARE is

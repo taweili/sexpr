@@ -7,4 +7,5 @@
 
 (defpackage :sexpr-tests
   (:nicknames :$-tests)
-  (:use :cl :rove :sexpr.transcript :sexpr.kernel :sexpr.cli :sexpr.tools))
+  (:use :cl :rove :sexpr.transcript :sexpr.kernel :sexpr.cli :sexpr.tools
+        :sexpr.sandbox))
