@@ -1,14 +1,113 @@
 # sexpr — an Agent OS in Common Lisp
 
+![sexpr](sexpr.png)
+
 > The agent runtime *is* a living Lisp image. The harness is not scaffolding around
 > intelligence — it is the operating environment in which intelligence is a
 > first-class, inspectable, hot-patchable process.
 
-Modern agent harnesses bolt agency onto the model from the outside: a Python or
-TypeScript process owns the loop, the transcript, the tools, the memory, and the
-model is a stateless oracle called over HTTP. **sexpr inverts this.**
+## Contents
 
-The Lisp machine already solved most of what agent engineering is rediscovering.
+- [Quickstart](#quickstart)
+- [The big idea](#the-big-idea)
+- [The design in five sentences](#the-design-in-five-sentences)
+- [Architecture sketch](#architecture-sketch)
+- [Repository](#repository)
+- [Design documents](#design-documents)
+- [Development setup](#development-setup)
+- [Model provider](#model-provider)
+- [Chat interface](#chat-interface)
+- [Building the binary](#building-the-binary)
+- [Status](#status)
+- [Open questions](#open-questions)
+- [License](#license)
+
+## Quickstart
+
+Get a session running in three steps. For the design thesis, skip to
+[§ The design in five sentences](#the-design-in-five-sentences); for building
+from source, see [§ Development setup](#development-setup).
+
+### 1. Get the binary
+
+Pre-built release? Drop `sexpr` on your `PATH`. Otherwise build once:
+
+```sh
+git clone https://github.com/quasi/sexpr && cd sexpr
+make build          # runs the test suite first; ~64 MB, self-contained
+./sexpr --help      # verify
+```
+
+### 2. Configure a model
+
+Local OpenAI-compatible server (Ollama, llama-server, vLLM, LM Studio, an
+internal gateway):
+
+```sh
+export SEXPR_BASE_URL="http://localhost:6969/v1"
+export SEXPR_MODEL="Qwythos-9B-v2"
+```
+
+Hosted provider:
+
+```sh
+export SEXPR_PROVIDER="openai"   # :anthropic | :openai | :gemini | :openrouter
+                                  # :ollama | :openai-compatible
+export SEXPR_MODEL="gpt-4o-mini" # optional; provider default otherwise
+export OPENAI_API_KEY="sk-..."   # or ANTHROPIC_API_KEY, GEMINI_API_KEY, ...
+```
+
+The wrapper `./sexpr.sh` sets local-dev defaults (OpenAI-compatible server on
+`localhost:6969`, model `Qwythos-9B-v2`, all four capabilities) and execs
+`./sexpr` under `rlwrap`:
+
+```sh
+./sexpr.sh                                        # default goal + all caps
+./sexpr.sh --goal "summarize this repo"           # explicit goal
+SEXPR_CAPABILITIES=fs-read ./sexpr.sh             # read-only session
+SEXPR_MODEL=OtherModel ./sexpr.sh                 # different model
+./sexpr.sh --help                                 # wrapper help + env vars
+```
+
+### 3. Chat
+
+```sh
+./sexpr --goal "You are a terse pair programmer."
+./sexpr --provider anthropic --model claude-3-5-sonnet-latest --goal "..."
+./sexpr --capability fs-read --goal "read-only session"
+```
+
+Slash commands and the full flag list are in
+[§ Chat interface](#chat-interface). To resume a session:
+
+```sh
+./sexpr --goal "pair programmer" --load my-session.sexp
+```
+
+The Listener reads stdin, so piping works for CI or batch runs:
+
+```sh
+printf '/help\n/exit\n' | ./sexpr --goal "verify"
+```
+
+## The big idea
+
+In 1985, Symbolics shipped the Genera operating system on Lisp Machines —
+single-user computers whose entire operating environment (OS kernel, GUI,
+development tools, application runtime) was written in a dialect of Common Lisp.
+The user interacted with the system through a *listener* (an interactive REPL),
+tools were *functions*, the runtime state was the *image* (the heap), and code
+could be redefined live without restarting. By 2025, the AI industry has
+reinvented most of these ideas under new names: agent harnesses (the *listener*
+loop), tool calling (the *functions*), context engineering (the *image* as sole
+state), subagents (lightweight *processes* in one heap), and MCP servers (the
+*services* of Chaosnet).
+
+But the AI industry built all of this in Python and TypeScript, bolted around a
+stateless model called over HTTP. **sexpr inverts this.** Instead of wrapping a
+model in Python, the agent runtime *is* a living Lisp image on SBCL — the modern
+descendant of the Symbolics Lisp Machine's runtime. The Lisp machine already
+solved most of what agent engineering is rediscovering.
 
 | Agent-harness concept (2025)     | Lisp machine concept (1985)                          |
 |----------------------------------|------------------------------------------------------|
@@ -19,7 +118,7 @@ The Lisp machine already solved most of what agent engineering is rediscovering.
 | MCP servers                      | Processes / services in the same address space       |
 | Approvals & permissions          | Condition system + restarts                          |
 | Subagents                        | Lightweight processes sharing one heap               |
-| Agent OS                         | …Genera                                              |
+| Agent OS                         | Genera                                               |
 
 sexpr's job is to close the loop: rebuild these ideas around an LLM as a
 *resident process* of the image, not its master.
@@ -75,8 +174,11 @@ src/
   transcript/          events, print/read round-trip, the GC substrate
   kernel/              the agent: budget, transcript, model-step, run-until-finished
   cli/                 the Listener: chat loop, slash commands, SIGINT, argv/main/build
-qlfile                 Qlot deps (cl-llm-provider, GitHub-pinned)
-Makefile               `make hello`, `make test`, `make build`, `make chat`, `make clean`
+  tools/               the tool registry (register-tool!, derive-schema, dispatch)
+  builtins/            the five registered tools (read-file, write-file, edit-file, shell, lisp)
+  sandbox/             the restricted-read eval sandbox (eclector, locked package, eval timeout)
+qlfile                 Qlot deps (cl-llm-provider, eclector, rove)
+Makefile               `make hello`, `make test`, `make build`, `make chat`, `make verify`, `make clean`
 notes/
   sexpr.md             — thesis, layer-by-layer mapping, open questions
   agent.md             — 2025 harness research (context engineering, skills, MCP)
@@ -85,10 +187,33 @@ notes/
   sbcl-libs.md         — CL library survey mapped to the sexpr design
 ```
 
-`notes/sexpr.md` is the entry point for the design. The others are the research
-base it's synthesized from.
+## Design documents
 
-## Getting started
+`notes/` holds the research and design documents that motivated the project.
+[`notes/sexpr.md`](notes/sexpr.md) is the entry point; the others are the
+research base it's synthesized from.
+
+| File | What it covers |
+|------|---------------|
+| [`notes/sexpr.md`](notes/sexpr.md) | The main design doc. Thesis, layer-by-layer mapping of 2025 agent-harness concepts to 1985 Lisp-machine primitives, module-by-module plan, open questions. **Start here.** |
+| [`notes/symbolics-lisp.md`](notes/symbolics-lisp.md) | History and architecture of Symbolics Lisp Machines (LM-2, 3600 family, XL, MacIvory, Open Genera), the Genera OS, CLIM, Dynamic Windows, Document Examiner, and the patch system. The "what we're modernizing" reference. |
+| [`notes/agent.md`](notes/agent.md) | Survey of 2025–2026 AI agent harness architecture: the agent loop, context engineering (write/select/compress/isolate), tool dispatch, MCP, subagents, skills with progressive disclosure, and sandboxing. The "what we're translating" reference. |
+| [`notes/sbcl.md`](notes/sbcl.md) | SBCL and Quicklisp deep-dive: the live image, hot redefinition, the condition/restart system, `save-lisp-and-die` for whole-image snapshots, and Quicklisp as a dependency/skill distribution mechanism. The "our runtime substrate" reference. |
+| [`notes/sbcl-libs.md`](notes/sbcl-libs.md) | Library survey: maps the sexpr design onto existing Common Lisp libraries (ASDF, UIOP, cl-llm-provider, etc.), noting availability and fit. The "what already exists" reference. |
+
+### How to read them
+
+1. **`sexpr.md`** first — it synthesizes the others and states the thesis. Read
+   its §0 ("Thesis") for the core argument and §11 ("Sources / lineage") for how
+   it draws on the other three docs.
+2. **`symbolics-lisp.md`** if you want the historical/architectural background
+   on what we're modernizing.
+3. **`agent.md`** if you want the 2025 state of the art that we're translating
+   into Lisp.
+4. **`sbcl.md`** and **`sbcl-libs.md`** if you want the implementation substrate
+   and what's already available in the CL ecosystem.
+
+## Development setup
 
 Prerequisites: **SBCL** and **Quicklisp**. One-time bootstrap:
 
@@ -144,8 +269,13 @@ cl-llm-provider):
 
 ```sh
 export OPENAI_API_KEY="sk-..."        # or ANTHROPIC_API_KEY, OPENROUTER_API_KEY, ...
-export SEXPR_PROVIDER="openai"        # :anthropic | :openai | :gemini | :ollama | :openrouter
+export SEXPR_PROVIDER="openai"        # :anthropic | :openai | :gemini | :ollama
+                                       # :openrouter | :openai-compatible
 export SEXPR_MODEL="gpt-4o-mini"      # optional; defaults to the provider's default
+export SEXPR_BASE_URL="http://..."    # OpenAI-compatible endpoint (default:
+                                       # https://api.openai.com/v1)
+export SEXPR_CAPABILITIES="fs-read"   # comma-separated; grants additive with
+                                       # the built-in default :fs-read
 ```
 
 Then from Lisp:
@@ -224,16 +354,18 @@ the transport package (R015).
 
 History, streaming, multiline input, and tool dispatch are **not** in the
 Listener. Line history and editing come from an external tool like
-`rlwrap` — wrap the binary, do not depend on it here:
+`rlwrap` — the wrapper `./sexpr.sh` does this automatically, or wrap the
+binary manually:
 
 ```sh
-rlwrap ./sexpr --goal "..."
+./sexpr.sh --goal "..."         # wrapper: rlwrap + local-dev defaults
+rlwrap ./sexpr --goal "..."     # manual wrap
 ```
 
 No readline, no threading, no streaming — the transcript is the state,
 and each turn is one bounded fold over it.
 
-### Building the binary
+## Building the binary
 
 `make build` produces a self-contained `./sexpr` executable via
 `sb-ext:save-lisp-and-die` — no Quicklisp or SBCL needed at runtime.
