@@ -151,7 +151,41 @@ USAGE_EXAMPLE
 }
 
 # ---------------------------------------------------------------------------
-# dispatch: example subcommand vs chat
+# repl subcommand
+# ---------------------------------------------------------------------------
+
+cmd_repl() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        cat <<'USAGE_REPL'
+usage: sexpr.sh repl
+
+Enter an unrestricted Common Lisp REPL with sexpr loaded. The REPL starts
+in the :sexpr.repl package (aggregating — make-agent, agent-transcript,
+render-events, eval-in-sandbox, define-tool are unqualified). ,exit leaves.
+
+No model endpoint or API key is needed — the REPL never calls the model
+(it's a dev surface). Reach the model by evaluating a provider-call form
+yourself, e.g. (sexpr.provider:provider-call nil '((:role "user"
+:content "hi"))).
+
+environment (read by sexpr via ~/.sbclinit / configure-provider):
+  SEXPR_PROVIDER / SEXPR_MODEL / SEXPR_BASE_URL  see `sexpr.sh --help`
+USAGE_REPL
+        exit 0
+    fi
+
+    # --non-interactive: sbcl runs the --eval forms then exits; the repl
+    # --eval reads stdin (the terminal via rlwrap) until ,exit/EOF, then
+    # returns and sbcl exits. No SEXPR_PROVIDER/MODEL/CAPABILITIES injected —
+    # the REPL never calls the model, so provider config is irrelevant here.
+    exec rlwrap sbcl --noinform --non-interactive \
+        --load "${HOME}/.sbclinit" \
+        --eval "(ql:quickload :sexpr :silent t)" \
+        --eval "(sexpr.repl:repl)"
+}
+
+# ---------------------------------------------------------------------------
+# dispatch: example subcommand vs repl vs chat
 # ---------------------------------------------------------------------------
 
 if [[ "${1:-}" == "example" ]]; then
@@ -160,10 +194,17 @@ if [[ "${1:-}" == "example" ]]; then
     exit $?
 fi
 
+if [[ "${1:-}" == "repl" ]]; then
+    shift
+    cmd_repl "$@"
+    exit $?
+fi
+
 if [[ " $* " == *" --help "* || " $* " == *" -h "* ]]; then
     cat <<'USAGE'
 usage: sexpr.sh [sexpr flags...]
        sexpr.sh example [OPTIONS] [NAME]
+       sexpr.sh repl
 
 Local dev wrapper: sets provider/model/capability defaults and runs
 ./sexpr under rlwrap. Forwarded arguments are passed through verbatim,
@@ -193,6 +234,7 @@ examples:
   SEXPR_CAPABILITIES=fs-read ./sexpr.sh      # read-only, no write
   ./sexpr.sh example                          # run all examples
   ./sexpr.sh example 01                       # run example 01
+  ./sexpr.sh repl                             # standalone dev REPL
 USAGE
     exit 0
 fi
