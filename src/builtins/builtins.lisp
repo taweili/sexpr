@@ -232,3 +232,17 @@ refusal plist on read-refusal / eval-refusal / timeout-refusal."
 ;;;; built-ins either.
 
 (register-default-tools!)
+
+;;; Also register the multi-agent coordination tools (spawn-subagent,
+;;; subagent-summary, etc.) so the frozen image contains all tools.
+(export 'register-all-tools!)
+(defun register-all-tools! ()
+  "Reset and register ALL tools: the five built-ins plus the six
+multi-agent coordination tools."
+  (register-default-tools!)
+  (sexpr.agents:register-multi-agent-tools!))
+
+;;; Register the multi-agent tools at load time too. register-default-tools!
+;;; above reset the registry and registered the five built-ins; this call
+;;; adds the six coordination tools on top.
+(sexpr.agents:register-multi-agent-tools!)

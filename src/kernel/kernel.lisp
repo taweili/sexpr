@@ -20,6 +20,16 @@
 
 (in-package :sexpr.kernel)
 
+;;;; --- current agent context ------------------------------------------
+;;;;
+;;;; Bound during agent-loop so that spawned subagents can inherit from the
+;;;; current agent (capabilities, endpoint, parent).
+
+(defvar *current-agent* nil
+  "The currently running agent, or NIL. Bound during agent-loop so that
+spawned subagents can inherit from the current agent (capabilities,
+endpoint, parent).")
+
 ;;;; --- budget ---------------------------------------------------------
 ;;;;
 ;;;; DESIGN (notes/sexpr.md §2): a budget is a first-class object on an agent.
@@ -92,9 +102,10 @@ means 'no limit yet'. A later milestone turns these numbers into policy."
     :initarg :capabilities
     :accessor agent-capabilities
     :type list
-    :initform '(:fs-read)
+    :initform '(:fs-read :spawn)
     :documentation "Granted capabilities. Advisory only this milestone — §5
-approvals land later and will make these load-bearing.")
+approvals land later and will make these load-bearing. :spawn is in the
+default set so every agent can delegate subtasks (D013).")
    (thread
     :initarg :thread
     :accessor agent-thread
@@ -105,14 +116,29 @@ spawning a thread is deferred, and agent-loop is called directly.")
     :accessor agent-endpoint
     :documentation "This agent's provider endpoint, or NIL. NIL means 'resolve
 *MODEL-ENDPOINT* at call time' (invariant #4); a non-NIL value gives one agent
-a different provider without touching the global."))
+a different provider without touching the global.")
+   (parent
+    :initarg :parent
+    :accessor agent-parent
+    :initform nil
+    :documentation "The parent agent, or NIL for the root agent. Used for
+process tree views and capability inheritance.")
+   (status
+    :accessor agent-status
+    :initform :running
+    :documentation "One of :running, :finished, :failed, :killed.")
+   (children
+    :accessor agent-child-list
+    :initform nil
+    :type list
+    :documentation "List of direct child agent objects spawned by this agent."))
   (:documentation "An agent: a named goal with a transcript, a budget, a
 capability set, and a provider endpoint.
 
 This milestone gives the agent a body (the loop) and no thread."))
 (export 'agent)
 
-(defun make-agent (&key name goal system transcript budget capabilities thread endpoint)
+(defun make-agent (&key name goal system transcript budget capabilities thread endpoint parent)
   "Return a new agent.
 
 Low-level constructor: supplies defaults for everything except GOAL, which is
@@ -126,12 +152,13 @@ case of an agent starting with an empty transcript."
                  :system system
                  :transcript (or transcript (make-transcript))
                  :budget (or budget (make-budget))
-                 :capabilities (or capabilities '(:fs-read))
+                 :capabilities (or capabilities '(:fs-read :spawn))
                  :thread thread
-                 :endpoint endpoint))
+                 :endpoint endpoint
+                 :parent parent))
 (export 'make-agent)
 
-(defun spawn (&key name goal system endpoint capabilities budget)
+(defun spawn (&key name goal system endpoint capabilities budget parent)
   "Create and return a new agent with a fresh, empty transcript.
 
 Does NOT start a thread: this milestone is single-threaded, and agent-loop is
@@ -142,7 +169,8 @@ multi-agent milestone can fill it in without changing the class."
               :system system
               :endpoint endpoint
               :capabilities capabilities
-              :budget budget))
+              :budget budget
+              :parent parent))
 (export 'spawn)
 
 ;;;; --- the loop trio --------------------------------------------------
@@ -294,18 +322,19 @@ tool calls returned (R021). The cap check runs AFTER dispatch and never as an
 stops without a follow-up model call (D005). That ordering is the one place
 the cap's meaning is ambiguous — max-steps counts model turns, and a tool round
 is one of them — so dispatch comes first and the stop comes after."
-  (loop
-     :with step-count = 0
-     :for event = (model-step agent)
-     :do (integrate agent event)
-         (incf step-count)
-         (when (tool-round-p event)
-           (dolist (call (event-tool-calls event))
-             (integrate agent (dispatch-tool-call agent call))))
-         (when (or (finished-p event)
-                   (and max-steps (>= step-count max-steps)))
-           (return)))
-  (agent-transcript agent))
+  (let ((*current-agent* agent))
+    (loop
+       :with step-count = 0
+       :for event = (model-step agent)
+       :do (integrate agent event)
+           (incf step-count)
+           (when (tool-round-p event)
+             (dolist (call (event-tool-calls event))
+               (integrate agent (dispatch-tool-call agent call))))
+           (when (or (finished-p event)
+                     (and max-steps (>= step-count max-steps)))
+             (return)))
+    (agent-transcript agent)))
 (export 'run-until-finished)
 
 (defun agent-loop (agent)

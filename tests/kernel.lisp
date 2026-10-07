@@ -86,7 +86,7 @@
     (ok (string= (agent-goal agent) "fix the bug") "the goal is set")
     (ok (null (agent-thread agent)) "there is no thread in this milestone")
     (ok (null (agent-endpoint agent)) "there is no per-agent endpoint by default")
-    (ok (equal (agent-capabilities agent) '(:fs-read)) "capabilities default to (:fs-read)")
+    (ok (equal (agent-capabilities agent) '(:fs-read :spawn)) "capabilities default to (:fs-read :spawn)")
     (ok (unlimited-p (agent-budget agent) :kind :tokens) "the budget is unlimited by default")))
 
 (rove:deftest spawn-holds-a-per-agent-endpoint

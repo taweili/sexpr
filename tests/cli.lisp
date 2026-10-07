@@ -402,7 +402,7 @@ union. A chat with no :capabilities argument keeps make-agent's default
 
 (rove:deftest chat-defaults-to-fs-read-without-capabilities-arg
   "Omitting :capabilities from chat leaves make-agent's default
-(:fs-read) intact — chat must not clobber it."
+(:fs-read :spawn) intact — chat must not clobber it."
   (let* ((stub (make-instance 'stub-endpoint
                               :responses (list (list :content "r" :finish :stop))))
          (out (make-string-output-stream))
@@ -412,8 +412,8 @@ union. A chat with no :capabilities argument keeps make-agent's default
                         :max-steps 1)))
     (declare (ignore out))
     (ok (equal (agent-capabilities (chat-session-agent session))
-               '(:fs-read))
-        "omitting :capabilities leaves the default (:fs-read)")))
+               '(:fs-read :spawn))
+        "omitting :capabilities leaves the default (:fs-read :spawn)")))
 
 (rove:deftest main-help-prints-usage-and-returns-without-chat
   "main with --help prints usage to the output stream and returns without

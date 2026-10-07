@@ -31,7 +31,7 @@
         ((:file "package")
          (:file "kernel" :depends-on ("package"))))
       (:module "cli"
-        :depends-on ("package" "transcript" "kernel" "repl")
+        :depends-on ("package" "transcript" "kernel" "repl" "agents")
         :components
         ((:file "package")
          (:file "cli" :depends-on ("package"))))
@@ -52,9 +52,16 @@
       ;; This module exists only to give the five built-ins a legal place to
       ;; reference both. Placed after sandbox so the sandbox module is
       ;; already loaded by the time the built-ins file names it.
-      (:module "builtins" :depends-on ("tools" "sandbox")
+      (:module "builtins" :depends-on ("tools" "sandbox" "agents")
         :components
         ((:file "builtins")))
+      ;; agents depends on BOTH kernel (agent class, spawn, *agent*) and tools
+      ;; (register-tool!, derive-schema). Placed after both so those packages
+      ;; exist at read time.
+      (:module "agents" :depends-on ("kernel" "tools")
+        :components
+        ((:file "package")
+         (:file "agents" :depends-on ("package"))))
       ;; :sexpr.repl is an aggregating dev package (:use transcript/kernel/
       ;; tools/sandbox). It loads AFTER those four so defpackage's :use lists
       ;; resolve. :sexpr.cli references sexpr.repl:repl by qualified name
@@ -66,7 +73,7 @@
         :components
         ((:file "package")
          (:file "repl" :depends-on ("package"))))
-      (:file "sexpr" :depends-on ("provider" "transcript" "kernel" "cli" "tools" "sandbox" "builtins" "repl")))))
+      (:file "sexpr" :depends-on ("provider" "transcript" "kernel" "cli" "tools" "sandbox" "builtins" "agents" "repl")))))
   ;; test-op is defined as a method in src/sexpr.lisp, not inline here:
   ;; inline :perform bodies are miscompiled by this Quicklisp-bundled
   ;; ASDF when the system has real dependencies (the leading DECLARE is

@@ -32,10 +32,12 @@ sbcl --non-interactive --load examples/01-transcript.lisp
 | `05-agent-loop.lisp` | Agent loop with a mock provider | No (mock) |
 | `06-capabilities.lisp` | Capability gate: grants and denials | No |
 | `07-hot-redefinition.lisp` | Live image: code persists across turns | No |
+| `08-subagent-sbcl.lisp` | Multi-agent: spawn, collect, tree from SBCL | No (mock) |
+| `09-subagent-chat.lisp` | Multi-agent: tool dispatch through the chat loop | No (mock) |
 
 ## Using a real model
 
-Examples 05 and 07 use a mock provider by default. To use a real model,
+Examples 05, 08, and 09 use mock providers by default. To use a real model,
 set the environment variables and remove the mock:
 
 ```sh

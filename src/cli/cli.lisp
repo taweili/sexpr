@@ -97,6 +97,7 @@ and the cursor advances to the new length."
   (format output "~&  /load FILE         load a session from FILE~%")
   (format output "~&  /retry             re-run the last model turn~%")
   (format output "~&  /repl              escape into a CL dev REPL (,exit to return)~%")
+  (format output "~&  /agents            show the agent process tree~%")
   (finish-output output))
 
 (defun cmd-transcript (session &key output)
@@ -179,6 +180,26 @@ themselves."
   nil)
 (export 'cmd-repl)
 
+(defun cmd-agents (session &key output)
+  "Print the agent process tree rooted at the session's agent."
+  (let ((root (chat-session-agent session)))
+    (labels ((status-icon (a)
+               (case (agent-status a)
+                 (:finished "\u2713")
+                 (:running  "\u21bb")
+                 (:failed   "\u2717")
+                 (:killed   "\u23cf")
+                 (otherwise "?")))
+             (print-tree (a depth)
+               (format output "~&~v,0T~a [~a]~%"
+                       (* depth 2)
+                       (agent-name a)
+                       (status-icon a))
+               (dolist (child (agent-child-list a))
+                 (print-tree child (1+ depth)))))
+      (print-tree root 0))
+    (finish-output output)))
+
 (defun dispatch-slash-command (session command rest &key input output max-steps)
   "Dispatch COMMAND (a string) with REST (the argument text) to the
 per-command function via a case. Returns :EXIT when the chat loop should
@@ -195,6 +216,7 @@ returns here without EOF'ing the shared input)."
     (:load         (cmd-load session rest :output output))
     (:retry        (cmd-retry session :output output :max-steps max-steps))
     (:repl         (cmd-repl session :input input :output output))
+    (:agents       (cmd-agents session :output output))
     (otherwise
      (format output "~&unknown command: ~a~%" command)
      (finish-output output)

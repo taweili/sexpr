@@ -31,6 +31,10 @@
    #:agent-capabilities
    #:agent-thread
    #:agent-endpoint
+   #:agent-parent
+   #:agent-status
+   #:agent-child-list
+   #:*current-agent*
    #:make-agent
    #:spawn
    #:model-step
