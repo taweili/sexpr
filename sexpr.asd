@@ -74,4 +74,5 @@
       (:file "transcript" :depends-on ("package"))
       (:file "kernel" :depends-on ("package"))
       (:file "cli" :depends-on ("package" "kernel"))
-      (:file "tools" :depends-on ("package"))))))
+      (:file "tools" :depends-on ("package"))
+      (:file "sandbox" :depends-on ("package"))))))
