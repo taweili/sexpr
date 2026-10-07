@@ -10,7 +10,7 @@
 #   SEXPR_PROVIDER       provider name         (default: openai-compatible)
 #   SEXPR_BASE_URL       provider base URL     (default: http://localhost:6969/v1)
 #   SEXPR_MODEL          model name            (default: Qwythos-9B-v2)
-#   SEXPR_CAPABILITIES   comma-separated list  (default: fs-read,fs-write)
+#   SEXPR_CAPABILITIES   comma-separated list  (default: all four grants)
 #                        Known names: fs-read, fs-write, process, lisp-eval
 #                        Set to `fs-read` for a read-only session.
 #
@@ -18,10 +18,10 @@
 # and the SEXPR_CAPABILITIES list is forwarded as --capability flags
 # BEFORE the caller's arguments so caller --capability grants add to the
 # set without replacing it:
-#     ./sexpr.sh                                     # default goal + read+write
-#     ./sexpr.sh --goal "Do X" --load foo.lisp      # explicit goal
-#     ./sexpr.sh --capability process              # also allow shell
-#     SEXPR_CAPABILITIES=fs-read ./sexpr.sh        # read-only override
+#     ./sexpr.sh                                  # default goal + all caps
+#     ./sexpr.sh --goal "Do X" --load foo.lisp     # explicit goal
+#     ./sexpr.sh --capability process             # (already granted by default)
+#     SEXPR_CAPABILITIES=fs-read ./sexpr.sh       # read-only override
 #     ./sexpr.sh --help                            # this message
 #
 # The binary's own flag list is `./sexpr --help`.
@@ -41,7 +41,7 @@ environment (override with `VAR=value ./sexpr.sh ...`):
   SEXPR_PROVIDER       provider name         (default: openai-compatible)
   SEXPR_BASE_URL       provider base URL     (default: http://localhost:6969/v1)
   SEXPR_MODEL          model name            (default: Qwythos-9B-v2)
-  SEXPR_CAPABILITIES   comma-separated list  (default: fs-read,fs-write)
+  SEXPR_CAPABILITIES   comma-separated list  (default: all four grants)
                        Known: fs-read, fs-write, process, lisp-eval
 
 sexpr flags (a subset; see `./sexpr --help` for the full list):
@@ -53,8 +53,7 @@ sexpr flags (a subset; see `./sexpr --help` for the full list):
                        SEXPR_CAPABILITIES and the built-in fs-read)
 
 examples:
-  ./sexpr.sh                                  # chat with the default caps
-  ./sexpr.sh --capability process            # also allow the shell tool
+  ./sexpr.sh                                  # chat with all caps
   SEXPR_CAPABILITIES=fs-read ./sexpr.sh      # read-only, no write
 USAGE
     exit 0
@@ -67,7 +66,7 @@ export SEXPR_MODEL="${SEXPR_MODEL:-Qwythos-9B-v2}"
 # SEXPR_CAPABILITIES (comma-separated) is forwarded as repeated --capability
 # flags BEFORE user args so user --capability grants add to the default set.
 caps_arg=()
-IFS=',' read -r -a caps <<< "${SEXPR_CAPABILITIES:-fs-read,fs-write}"
+IFS=',' read -r -a caps <<< "${SEXPR_CAPABILITIES:-fs-read,fs-write,process,lisp-eval}"
 for cap in "${caps[@]}"; do
     # trim whitespace (a common env-var paste artifact)
     cap="$(printf '%s' "$cap" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
