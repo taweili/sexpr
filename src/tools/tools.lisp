@@ -25,7 +25,12 @@
 ;;;;    :schema      (:parameters (...) :required (...)) ; derived plist
 ;;;;    :capability  :fs-read)                      ; default :fs-read
 ;;;;
-;;;; define-tool is the ONLY constructor for tool-records.
+;;;; define-tool is the constructor for USER-DEFINED tools. The built-ins in
+;;;; src/builtins/builtins.lisp register through register-tool! +
+;;;; derive-schema directly (via their own helper) so that
+;;;; register-default-tools! can rebuild the registry after
+;;;; reset-tool-registry! in tests — the define-tool macro's expansion
+;;;; runs once at file-load time and cannot be re-invoked after a reset.
 
 (defparameter *tool-registry* nil
   "The tool registry: an equal-test hash table keyed by lowercase tool-name

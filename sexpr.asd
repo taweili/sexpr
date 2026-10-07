@@ -45,7 +45,17 @@
         :components
         ((:file "package")
          (:file "sandbox" :depends-on ("package"))))
-      (:file "sexpr" :depends-on ("provider" "transcript" "kernel" "cli" "tools" "sandbox")))))
+      ;; builtins depends on BOTH tools (register-tool!, derive-schema)
+      ;; and sandbox (make-sandbox, eval-in-sandbox, condition taxonomy).
+      ;; The tools module is loaded first, so a file in tools/ that named
+      ;; sexpr.sandbox:make-sandbox would fail at read time, not call time.
+      ;; This module exists only to give the five built-ins a legal place to
+      ;; reference both. Placed after sandbox so the sandbox module is
+      ;; already loaded by the time the built-ins file names it.
+      (:module "builtins" :depends-on ("tools" "sandbox")
+        :components
+        ((:file "builtins")))
+      (:file "sexpr" :depends-on ("provider" "transcript" "kernel" "cli" "tools" "sandbox" "builtins")))))
   ;; test-op is defined as a method in src/sexpr.lisp, not inline here:
   ;; inline :perform bodies are miscompiled by this Quicklisp-bundled
   ;; ASDF when the system has real dependencies (the leading DECLARE is

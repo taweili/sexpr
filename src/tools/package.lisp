@@ -29,6 +29,7 @@
    #:apropos-tool
    #:tool-schema-list
    #:reset-tool-registry!
+   #:register-default-tools!
    #:*tool-registry*
    #:tool-error
    #:tool-error-tool
