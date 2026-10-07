@@ -17,6 +17,7 @@
 - [Development setup](#development-setup)
 - [Model provider](#model-provider)
 - [Chat interface](#chat-interface)
+- [REPL](#repl)
 - [Building the binary](#building-the-binary)
 - [Status](#status)
 - [Open questions](#open-questions)
@@ -321,6 +322,7 @@ prompt exits.
 | `/save FILE`   | write the session transcript to FILE                |
 | `/load FILE`   | load a transcript from FILE, replacing the session  |
 | `/retry`       | pop the last model reply and re-run one turn        |
+| `/repl`        | escape into a CL dev REPL (`,exit` to return)      |
 
 `/save` and `/load` round-trip through the transcript's own `print`/`read`
 (`with-standard-io-syntax`, `*read-eval*` nil) — no separate serializer
@@ -364,6 +366,74 @@ rlwrap ./sexpr --goal "..."     # manual wrap
 
 No readline, no threading, no streaming — the transcript is the state,
 and each turn is one bounded fold over it.
+
+## REPL
+
+`sexpr.repl` is an unrestricted Common Lisp REPL that shares the live
+image — the same agent, transcript, tools, and provider state the chat
+loop is mid-conversation with. It is a developer surface, not a
+sandboxed one: everything in `:sexpr` is in scope.
+
+### Escape from chat: `/repl`
+
+From inside a chat session, `/repl` drops into the REPL with `*agent*`
+bound to the live agent. `,exit` returns to the chat loop; the
+conversation resumes with any redefinitions you made now in effect:
+
+```text
+you: make me a todo app
+model: <calls edit-file, error in the result>
+you: /repl
+> (agent-transcript *agent*)           ; inspect the live state
+> (trace sexpr.tools:perform-tool)
+> (defun my-edit-file ...)             ; hot-redefine the buggy tool
+> ,exit
+you: /retry                            ; re-run the last turn with the new def
+model: <now succeeds>
+```
+
+`*agent*` is bound by the REPL around its loop body — reach the
+transcript via `(agent-transcript *agent*)`, the persona via
+`(agent-system *agent*)`. The REPL shares the chat loop's input/output
+streams, so `,exit` (not EOF) is the escape — EOF would also end the
+chat.
+
+### Standalone: `./sexpr.sh repl`
+
+Outside a chat session, `./sexpr.sh repl` enters the REPL with no agent
+(`*agent*` is `NIL`). Useful for loading examples, defining tools from
+scratch, or driving the provider directly:
+
+```sh
+./sexpr.sh repl
+> (load "examples/02-tools.lisp")
+> (sexpr.provider:provider-call nil '((:role "user" :content "hi")))
+> ,exit
+```
+
+The REPL never calls the model on its own — no provider endpoint or API
+key is needed. Reach it by evaluating a `provider-call` form yourself.
+
+### REPL conventions
+
+- **One form per prompt.** `,exit` collides with the CL unquote reader
+  macro, so the line is read whole and string-checked for a leading
+  comma before `read-from-string`. Multiple forms on one line all eval
+  and print; for multi-line forms use `(progn ...)` or `(load "file")`.
+- **`,` meta-commands.** Only `,exit` is defined; an unknown `,foo`
+  prints a notice and continues (never reaches the reader).
+- **Errors never crash the loop** — reader errors, eval errors, and a
+  Ctrl-C mid-form are caught, printed, and re-prompted. Ctrl-C aborts the
+  current form only (no two-press idle-exit dance — `,exit` is the
+  explicit escape).
+- **Package.** The REPL starts in `:sexpr.repl`, an aggregating package
+  that `:use`s `:sexpr.transcript`, `:sexpr.kernel`, `:sexpr.tools`, and
+  `:sexpr.sandbox` — so `make-agent`, `agent-transcript`,
+  `render-events`, `eval-in-sandbox`, `define-tool` are unqualified.
+  Switch with `(in-package :sexpr.kernel)`.
+- **Nil is suppressed.** A form returning a single `NIL` prints nothing
+  (SBCL convention), so side-effecting `(format t ...)` calls don't echo
+  a trailing `NIL`.
 
 ## Building the binary
 
