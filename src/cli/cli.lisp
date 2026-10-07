@@ -255,21 +255,27 @@ the first press prints a notice and re-prompts, the second exits.
 
 ;;; --- the convenience entry point ----------------------------------
 
-(defun chat (&key goal system endpoint input output (max-steps 10) transcript)
+(defun chat (&key goal system endpoint input output (max-steps 10) transcript capabilities)
   "Build an agent and run chat-loop over it.
 
 GOAL is required — an agent without a goal is not an agent; make-agent
 signals if it is NIL. TRANSCRIPT, when supplied, pre-loads history: its
 existing events are not re-printed, because the cursor starts at
-transcript-length. SYSTEM and ENDPOINT pass straight through to make-agent
-(the model is reached only transitively via run-until-finished; this
-module never imports the provider — R015). INPUT and OUTPUT default to the
-standard streams. Returns the chat session."
+transcript-length. CAPABILITIES, when supplied, is the granted capability
+set passed straight to make-agent; when NIL, make-agent falls through to
+its default '(:fs-read) — the caller (see MAIN) is responsible for
+unioning with that default before passing it here, so that a caller
+requesting only :fs-write still gets :fs-read. SYSTEM and ENDPOINT pass
+straight through to make-agent (the model is reached only transitively
+via run-until-finished; this module never imports the provider — R015).
+INPUT and OUTPUT default to the standard streams. Returns the chat
+session."
   (let* ((tr (or transcript (make-transcript)))
          (agent (make-agent :goal     goal
                             :system   system
                             :endpoint endpoint
-                            :transcript tr))
+                            :transcript tr
+                            :capabilities capabilities))
          (session (make-chat-session
                    :agent  agent
                    :cursor (transcript-length tr))))
@@ -286,15 +292,41 @@ standard streams. Returns the chat session."
 ;;; never enters the chat loop. build dumps the image; the actual ./sexpr
 ;;; binary and the Makefile targets are verified in S03.
 
+(defun %split-comma-values (value)
+  "Split VALUE (a comma-separated string) into a list of lowercased, trimmed
+name strings, dropping empty entries. Commas are accepted so the shell
+wrapper's SEXPR_CAPABILITIES env var (e.g. the value fs-read,fs-write)
+can be forwarded as a single --capability flag; a bare --capability
+fs-write is unchanged."
+  (let ((pieces nil)
+        (start 0)
+        (n (length value)))
+    (dotimes (i n)
+      (when (char= (char value i) #\,)
+        (push (subseq value start i) pieces)
+        (setf start (1+ i))))
+    (push (subseq value start) pieces)
+    (let ((cleaned
+            (mapcar (lambda (s) (string-downcase (string-trim '(#\Space #\Tab) s)))
+                    (nreverse pieces))))
+      (remove "" cleaned :test #'string=))))
+(export '%split-comma-values)
+
 (defun parse-args (argv)
   "Parse ARGV (a list of program-argument strings, argv[0] first) into a
 plist of options.
 
 argv[0] (the program name) is skipped. Recognizes --goal VALUE, --load
-FILE, --help / -h, --provider VALUE, and --model VALUE. A flag expecting
-a value that is last (with none following) binds nil. An unrecognized
-token is collected under :rest in argv order so the caller can diagnose
-it. No external dependency (R016: hand-written, not a flag library)."
+FILE, --help / -h, --provider VALUE, --model VALUE, and --capability
+VALUE (repeatable; VALUE may be a single capability name or a comma-
+separated list of names). Each --capability occurrence appends its
+de-lowercased entries to :capabilities in argv order; duplicates across
+occurrences are preserved here and dedup'd later by MAIN's union. A
+--capability that is last with no value following signals an error so a
+truncated argv fails loudly rather than silently granting nothing.
+An unrecognized token is collected under :rest in argv order so the
+caller can diagnose it. No external dependency (R016: hand-written,
+not a flag library)."
   (let ((args (rest argv))            ; skip argv[0] — the program name
         (plist nil)
         (unknown nil))
@@ -311,6 +343,13 @@ it. No external dependency (R016: hand-written, not a flag library)."
                    (setf (getf plist :provider) (pop args)))
                   ((string= arg "--model")
                    (setf (getf plist :model) (pop args)))
+                  ((string= arg "--capability")
+                   (let ((value (pop args)))
+                     (unless value
+                       (error "--capability requires a value (a capability name or comma-separated list)"))
+                     (setf (getf plist :capabilities)
+                           (append (getf plist :capabilities)
+                                   (%split-comma-values value)))))
                   (t
                    (push arg unknown)))))
     ;; unknown accumulated in reverse by push; flip to argv order.
@@ -324,16 +363,22 @@ it. No external dependency (R016: hand-written, not a flag library)."
 
 The flags drive the executable toplevel; the slash commands drive the
 chat loop. --help is the one place a human looks, so both surfaces are
-listed here."
+listed here. The --capability line names the four built-in tools'
+capabilities as the known set; user-defined tools can declare any
+capability and it will be honored here without further wiring."
   (format stream "~&usage: sexpr [--goal TEXT] [--load FILE]~%")
   (format stream "~&                  [--provider NAME] [--model NAME]~%")
-  (format stream "~&                  [--help | -h]~%")
+  (format stream "~&                  [--capability NAME] [--help | -h]~%")
   (format stream "~&~%")
   (format stream "~&flags:~%")
   (format stream "~&  --goal TEXT        the agent's goal (required to enter the loop)~%")
   (format stream "~&  --load FILE        start from a saved transcript~%")
   (format stream "~&  --provider NAME    configure the provider transport~%")
   (format stream "~&  --model NAME       configure the model name~%")
+  (format stream "~&  --capability NAME  grant a capability to the agent (repeatable; a~%")
+  (format stream "~&                     comma-separated list is also accepted). The default~%")
+  (format stream "~&                     is :fs-read. Known: fs-read, fs-write, process,~%")
+  (format stream "~&                     lisp-eval. Grants are additive with the default.~%")
   (format stream "~&  --help, -h         print this usage and exit~%")
   (format stream "~&~%")
   (format stream "~&slash commands (inside the chat loop):~%")
@@ -356,8 +401,11 @@ and dispatch.
 a test or a help-seeking user cannot hang. --provider / --model reach the
 provider transport by the single qualified sexpr.provider:configure-provider
 reference (R015: :sexpr.provider is NOT in :use). --load FILE reads a
-transcript via sexpr.transcript:read-transcript. Then the chat loop runs
-with :endpoint nil — the model is reached only transitively via
+transcript via sexpr.transcript:read-transcript. --capability NAME
+(repeatable, comma-separated values accepted) adds NAME to the granted
+capability set; the CLI always unions with the default '(:fs-read) so
+`--capability fs-write' still reads files. Then the chat loop runs with
+:endpoint nil — the model is reached only transitively via
 run-until-finished. INPUT / OUTPUT pass through to chat for testability; a
 real run leaves them nil so chat defaults to the standard streams.
 
@@ -378,15 +426,38 @@ exits only on /exit, /quit, EOF, or a second idle Ctrl-C)."
                           (list :provider (getf opts :provider)))
                         (when (getf opts :model)
                           (list :model (getf opts :model)))))
-          (let ((transcript nil))
+          (let* ((transcript nil)
+                 ;; CLI grants are additive with the default :fs-read, and
+                 ;; the union dedups so `--capability fs-read --capability fs-read'
+                 ;; stays a single :fs-read. When no --capability flag was
+                 ;; given, :capabilities is NIL and make-agent's own default
+                 ;; (:fs-read) is used — no unnecessary keyword is passed.
+                 (cli-caps (getf opts :capabilities))
+                 ;; :union does not dedup within a single list, so the
+                 ;; mapcar'd capability list is dedup'd with
+                 ;; delete-duplicates before it is unioned with the
+                 ;; default (:fs-read). The union then adds :fs-read
+                 ;; only if it is not already present (test: eq on
+                 ;; keyword symbols is identity, so two :FS-WRITE
+                 ;; symbols from string-upcase interning compare equal).
+                 (all-caps (and cli-caps
+                                (union (delete-duplicates
+                                        (mapcar (lambda (s)
+                                                  (intern (string-upcase s)
+                                                          :keyword))
+                                                  cli-caps)
+                                        :test #'eq)
+                                       '(:fs-read)
+                                       :test #'eq))))
             (when (getf opts :load)
               (with-open-file (stream (getf opts :load) :direction :input)
                 (setf transcript (read-transcript stream))))
-            (chat :goal     (getf opts :goal)
-                  :endpoint nil
-                  :transcript transcript
-                  :input      input
-                  :output     output))))))
+            (chat :goal         (getf opts :goal)
+                  :endpoint     nil
+                  :transcript   transcript
+                  :capabilities all-caps
+                  :input        input
+                  :output       output))))))
 (export 'main)
 
 (defun build (&optional (name "sexpr"))

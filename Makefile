@@ -87,9 +87,11 @@ verify: build
 	@./sexpr --help | grep -q 'usage: sexpr'
 	@echo '[probe 2] scripted session runs and exits 0'
 	@printf '/help\n/exit\n' | ./sexpr --goal "verify" | grep -q 'Commands:'
-	@echo '[probe 3] cross-process --load round-trips'
+	@echo '[probe 3] --capability flag is accepted'
+	@printf '/exit\n' | ./sexpr --goal "verify" --capability fs-write --capability process >/dev/null 2>&1
+	@echo '[probe 4] cross-process --load round-trips'
 	@tmp=$$(mktemp --suffix=.sexp); printf "/save $$tmp\n/exit\n" | ./sexpr --goal "verify"; test -s $$tmp; ./sexpr --goal "verify" --load $$tmp </dev/null; rc=$$?; rm -f $$tmp; exit $$rc
-	@echo '[probe 4] R015 provider seam clean'
+	@echo '[probe 5] R015 provider seam clean'
 	@! rg -q cl-llm-provider src/cli/
 	@echo 'ALL PROBES PASSED'
 
@@ -105,7 +107,8 @@ help:
 	@echo "  load    Load the system interactively"
 	@echo "  build   Produce ./sexpr via save-lisp-and-die (depends on test)"
 	@echo "  chat    Run ./sexpr (override with CHAT_ARGS='--goal \"...\"')"
-	@echo "  verify  Run binary probes: --help, scripted session, cross-process load, R015 seam"
+	@echo "  verify  Run binary probes: --help, scripted session, --capability,
+	         cross-process load, R015 seam"
 	@echo "  diagnostic-tool-call  Probe a live local server for a usable :tool-calls node"
 	@echo "  diagnostic-live-round  In-process live turn: assert the recorded events and the live :value"
 	@echo "  test-live  Run ./sexpr against the live local model and structurally check the saved transcript (requires a running server)"

@@ -199,7 +199,8 @@ prompt exits.
 ### Flags
 
 ```sh
-./sexpr --goal "TEXT" [--load FILE] [--provider NAME] [--model NAME] [--help | -h]
+./sexpr --goal "TEXT" [--load FILE] [--provider NAME] [--model NAME]
+        [--capability NAME] [--help | -h]
 ```
 
 | Flag              | Meaning                                            |
@@ -208,6 +209,11 @@ prompt exits.
 | `--load FILE`     | start from a saved transcript                      |
 | `--provider NAME` | configure the provider transport (qualified call)  |
 | `--model NAME`    | configure the model name                           |
+| `--capability NAME` | grant a capability to the agent (repeatable; a    |
+|                   | comma-separated list is also accepted). Grants are |
+|                   | additive with the built-in default `:fs-read`. The |
+|                   | known set is `fs-read`, `fs-write`, `process`,     |
+|                   | `lisp-eval`.                                        |
 | `--help`, `-h`    | print usage and exit (never enters chat)           |
 
 `--provider`/`--model` reach the transport by the single qualified

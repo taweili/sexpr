@@ -298,6 +298,72 @@ and unknown tokens collect under :rest in argv order (negative path)."
     (ok (equal (getf opts :rest) '("--bogus" "--zzz"))
         "unknown tokens are collected under :rest in argv order")))
 
+(rove:deftest parse-args-capability-flag-adds-to-grants
+  "--capability VALUE appends the value (lowercased) to :capabilities,
+and is repeatable so multiple grants accumulate in argv order."
+  (let ((opts (parse-args (list "sexpr"
+                                "--capability" "fs-write"
+                                "--capability" "process"))))
+    (ok (equal (getf opts :capabilities)
+               '("fs-write" "process"))
+        "two --capability flags produce two entries in argv order")))
+
+(rove:deftest parse-args-capability-accepts-comma-separated-list
+  "A single --capability flag accepts a comma-separated list, so the
+shell wrapper can forward the SEXPR_CAPABILITIES env var (e.g. the
+value fs-read,fs-write) as one flag; entries are lowercased,
+whitespace-trimmed, and empty entries dropped."
+  (let ((opts (parse-args (list "sexpr"
+                                "--capability" "fs-read,FS-WRITE"))))
+    (ok (equal (getf opts :capabilities)
+               '("fs-read" "fs-write"))
+        "comma-separated values are split, lowercased, and both kept"))
+  (let ((opts (parse-args (list "sexpr"
+                                "--capability" " fs-read ,, fs-write "))))
+    (ok (equal (getf opts :capabilities)
+               '("fs-read" "fs-write"))
+        "empty entries and whitespace are dropped")))
+
+(rove:deftest parse-args-capability-without-value-signals
+  "--capability as the last token with no value following signals an
+error — a truncated argv must not silently grant nothing."
+  (ok (not (null (handler-case (parse-args (list "sexpr" "--capability"))
+                                     (error (c) c))))
+      "--capability with no value signals an error"))
+
+(rove:deftest chat-capabilities-keyword-grants-write
+  "chat with :capabilities '(:fs-read :fs-write) gives the agent that
+exact set — the caller supplies the final grant list; chat does not
+union. A chat with no :capabilities argument keeps make-agent's default
+'(:fs-read)."
+  (let* ((stub (make-instance 'stub-endpoint
+                              :responses (list (list :content "r" :finish :stop))))
+         (out (make-string-output-stream))
+         (session (chat :goal "g" :endpoint stub
+                        :capabilities '(:fs-read :fs-write)
+                        :input  (make-string-input-stream "/exit")
+                        :output out
+                        :max-steps 1)))
+    (declare (ignore out))
+    (ok (equal (agent-capabilities (chat-session-agent session))
+               '(:fs-read :fs-write))
+        ":capabilities '(:fs-read :fs-write) reaches the agent")))
+
+(rove:deftest chat-defaults-to-fs-read-without-capabilities-arg
+  "Omitting :capabilities from chat leaves make-agent's default
+(:fs-read) intact — chat must not clobber it."
+  (let* ((stub (make-instance 'stub-endpoint
+                              :responses (list (list :content "r" :finish :stop))))
+         (out (make-string-output-stream))
+         (session (chat :goal "g" :endpoint stub
+                        :input  (make-string-input-stream "/exit")
+                        :output out
+                        :max-steps 1)))
+    (declare (ignore out))
+    (ok (equal (agent-capabilities (chat-session-agent session))
+               '(:fs-read))
+        "omitting :capabilities leaves the default (:fs-read)")))
+
 (rove:deftest main-help-prints-usage-and-returns-without-chat
   "main with --help prints usage to the output stream and returns without
 entering the chat loop — no endpoint, no goal, so make-agent would signal
@@ -307,3 +373,86 @@ if main had called chat."
         "main returns nil for --help without entering chat")
     (ok (search "--goal" (get-output-stream-string out))
         "the usage output mentions the --goal flag")))
+
+(rove:deftest main-help-mentions-capability-flag
+  "print-usage mentions --capability and the four known capability names
+so a help-seeking user can discover the flag without grepping source."
+  (let ((out (make-string-output-stream)))
+    (declare (ignore out))
+    (print-usage out)
+    (let ((text (get-output-stream-string out)))
+      (ok (search "--capability" text)
+          "usage mentions --capability")
+      (ok (search "fs-write" text)
+          "usage names fs-write")
+      (ok (search "process" text)
+          "usage names process")
+      (ok (search "lisp-eval" text)
+          "usage names lisp-eval"))))
+
+(rove:deftest main-capability-flag-grants-are-unioned-with-default
+  "main --capability fs-write passes :fs-read :fs-write (union with the
+default) through to chat → make-agent, and does not clobber it. --capability
+without a companion flag still grants fs-read via the default; fs-read is
+added exactly once, so requesting it explicitly is a no-op that stays
+idempotent."
+  (let* ((stub (make-instance 'stub-endpoint
+                              :responses (list (list :content "r" :finish :stop))))
+         (in (make-string-input-stream "/exit"))
+         (out (make-string-output-stream))
+         (session (main (list "sexpr" "--goal" "g" "--capability" "fs-write")
+                        :input in
+                        :output out)))
+    (declare (ignore out))
+    (let ((caps (agent-capabilities (chat-session-agent session))))
+      (ok (member :fs-write caps :test #'eq)
+          "--capability fs-write grants :fs-write")
+      (ok (member :fs-read caps :test #'eq)
+          "the default :fs-read is still granted alongside")
+      (ok (= (count :fs-read caps :test #'eq) 1)
+          ":fs-read appears exactly once after the union"))))
+
+(rove:deftest main-multiple-capability-grants-accumulate-and-dedup
+  "Multiple --capability occurrences accumulate and duplicates collapse:
+`--capability fs-write --capability fs-write --capability process`
+yields {:fs-read :fs-write :process}, each exactly once."
+  (let* ((stub (make-instance 'stub-endpoint
+                              :responses (list (list :content "r" :finish :stop))))
+         (in (make-string-input-stream "/exit"))
+         (out (make-string-output-stream))
+         (session (main (list "sexpr" "--goal" "g"
+                              "--capability" "fs-write"
+                              "--capability" "fs-write"
+                              "--capability" "process")
+                        :input in
+                        :output out)))
+    (declare (ignore out))
+    (let ((caps (agent-capabilities (chat-session-agent session))))
+      (ok (member :fs-write caps :test #'eq)
+          "--capability fs-write (twice) grants :fs-write once")
+      (ok (member :process caps :test #'eq)
+          "--capability process grants :process")
+      (ok (member :fs-read caps :test #'eq)
+          "the default :fs-read is still granted")
+      (ok (= (length caps) 3)
+          "no duplicates: the union collapses to three distinct capabilities"))))
+
+(rove:deftest main-comma-separated-capability-works-through-chat
+  "A single --capability fs-read,fs-write flag grants both capabilities
+through to the agent."
+  (let* ((stub (make-instance 'stub-endpoint
+                              :responses (list (list :content "r" :finish :stop))))
+         (in (make-string-input-stream "/exit"))
+         (out (make-string-output-stream))
+         (session (main (list "sexpr" "--goal" "g"
+                              "--capability" "fs-read,fs-write")
+                        :input in
+                        :output out)))
+    (declare (ignore out))
+    (let ((caps (agent-capabilities (chat-session-agent session))))
+      (ok (member :fs-write caps :test #'eq)
+          "comma-separated fs-write is granted")
+      (ok (member :fs-read caps :test #'eq)
+          "comma-separated fs-read is granted (via union with default)")
+      (ok (= (length caps) 2)
+          "no duplicates across the union"))))
