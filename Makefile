@@ -72,10 +72,14 @@ test-live: build
 	rc=$$?; \
 	echo "$$(date -u +%H:%M:%S) [2/4] sexpr exited $$rc"; \
 	echo '=== output ==='; cat /tmp/sexpr-live-out.txt; \
-	echo "$$(date -u +%H:%M:%S) [3/4] checking recorded events in transcript"; \
+	echo "$$(date -u +%H:%M:%S) [3/4] structural check of saved transcript"; \
 	if [ $$rc -ne 0 ]; then echo 'FAIL: sexpr exited non-zero'; exit 1; fi; \
-	grep -q ':RESULT' $$tmp || { echo 'FAIL: no :RESULT event — model did not call a tool (or dispatch failed)'; exit 1; }; \
-	grep -q 'hello world from s05' $$tmp || { echo 'FAIL: file contents not in transcript — read-file did not return the file'; exit 1; }; \
+	SEXPR_TRANSCRIPT=$$tmp SEXPR_FIXTURE='hello world from s05' \
+	  $(SBCL) --non-interactive \
+	    --load $(SBCLINIT) \
+	    --eval '(ql:quickload "$(SYSTEM)" :print t)' \
+	    --load tools/check-saved-transcript.lisp \
+	  || { echo 'FAIL: saved-transcript structural check failed'; exit 1; }; \
 	echo "$$(date -u +%H:%M:%S) [4/4] LIVE MODEL ROUND-TRIP PASSED"
 
 verify: build
@@ -104,6 +108,6 @@ help:
 	@echo "  verify  Run binary probes: --help, scripted session, cross-process load, R015 seam"
 	@echo "  diagnostic-tool-call  Probe a live local server for a usable :tool-calls node"
 	@echo "  diagnostic-live-round  In-process live turn: assert the recorded events and the live :value"
-	@echo "  test-live  Run ./sexpr against the live local model (requires a running server)"
+	@echo "  test-live  Run ./sexpr against the live local model and structurally check the saved transcript (requires a running server)"
 	@echo "  clean   Remove build artifacts"
 	@echo "  help    This message"
