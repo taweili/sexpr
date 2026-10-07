@@ -2,136 +2,119 @@
 
 # sexpr — Quickstart
 
-Get from a fresh checkout to a running `./sexpr` binary and your first chat
-in a few minutes. This is the "how" doc; [`../README.md`](../README.md) is
-the "why" doc (the design thesis and layer-by-layer mapping), and
-[`../notes/sexpr.md`](../notes/sexpr.md) is the deepest source. Read the
-README first if you have questions about *what* sexpr is trying to be.
+Get your first chat session running. This guide covers running the
+program with `./sexpr` and the convenience wrapper `./sexpr.sh`. If
+you need to build the binary from source, see
+[`../README.md`](../README.md).
 
 ## Prerequisites
 
-- **SBCL** — the reference implementation of sexpr is Common Lisp on
-  SBCL; other implementations are untested.
-- **Quicklisp** for the dependency bootstrap.
-- **GNU make** for the targets below.
-- A **model API key** for step 5 — Anthropic, OpenAI, OpenRouter, Gemini,
-  or a local OpenAI-compatible endpoint (Ollama, llama-server, vLLM).
+- **SBCL** — the reference implementation is Common Lisp on SBCL.
+- **GNU make** — only needed for the one-time build (below).
+- **rlwrap** (optional) — line editing in the chat loop; the wrapper
+  uses it if present.
+- A **model API key** or a local OpenAI-compatible server.
 
-## 1. Bootstrap Quicklisp (one-time)
+## 1. Get the binary
 
-```sh
-curl -O https://beta.quicklisp.org/quicklisp.lisp
-sbcl --load quicklisp.lisp --eval '(quicklisp-quickstart:install)' \
-     --eval '(ql:add-to-init-file)'
-```
-
-After this, `~/.sbclinit` loads Quicklisp automatically. Verify with
-`sbcl --non-interactive --eval '(ql:quickload :alexandria)'`.
-
-## 2. Register sexpr and its dependency
-
-sexpr depends on **cl-llm-provider**, which is not in the Quicklisp dist
-yet. Vendor it next to sexpr under `local-projects/`:
+If you have a pre-built release, drop the `sexpr` binary into your
+PATH. Otherwise, build it once from the source tree:
 
 ```sh
-# from your sexpr checkout:
-ln -s "$PWD" ~/quicklisp/local-projects/sexpr
-
-git clone https://github.com/quasi/cl-llm-provider \
-  ~/quicklisp/local-projects/cl-llm-provider
-```
-
-If you clone sexpr elsewhere, redo the `ln -s` to point at the new path.
-
-## 3. Smoke test the load
-
-Confirm Quicklisp can resolve the system and the entry point runs:
-
-```sh
-make hello
-```
-
-Expected output:
-
-```
-sexpr 0.0.0
-  An Agent OS in Common Lisp.
-  Hello from sexpr.
-```
-
-Run the test suite:
-
-```sh
-make test
-```
-
-The suite is a rove run through `asdf:test-op`. Anything failing here
-means something is broken before you build; fix that first.
-
-## 4. Build the binary
-
-```sh
+git clone https://github.com/quasi/sexpr && cd sexpr
 make build
 ```
 
-`make build` runs `make test` first, so a broken suite never ships a
-binary. On success you get `./sexpr` at the repo root — a
-self-contained ~64 MB executable produced by `sb-ext:save-lisp-and-die`.
-It needs no SBCL and no Quicklisp at runtime.
+`make build` runs the test suite first, so a broken build never ships.
+The binary is self-contained — it needs no SBCL and no Quicklisp at
+runtime.
 
-## 5. Configure a model provider
-
-sexpr reaches the model through a single generic function,
-`sexpr.provider:provider-call`, implemented over **cl-llm-provider**.
-Configure the transport with environment variables (keys are read
-directly by cl-llm-provider; sexpr never touches them):
+Verify:
 
 ```sh
-export SEXPR_PROVIDER="openai"         # :anthropic | :openai | :gemini
-                                       # :openrouter | :ollama | :openai-compatible
-export SEXPR_MODEL="gpt-4o-mini"       # optional; provider default otherwise
-export OPENAI_API_KEY="sk-..."         # ANTHROPIC_API_KEY, GEMINI_API_KEY, ...
+./sexpr --help
 ```
 
-Then start:
+You should see the usage text and exit 0.
 
-```sh
-make chat                              # default goal: "pair programmer"
-# or explicitly:
-./sexpr --goal "summarize this repo"
-./sexpr --provider anthropic --model claude-3-5-sonnet-latest --goal "..."
-```
+## 2. Configure a model
 
-### Talking to a local OpenAI-compatible server
-
-Point `SEXPR_BASE_URL` at any OpenAI-compatible HTTP endpoint
-(llama-server, vLLM, LM Studio, an internal gateway). When
-`SEXPR_PROVIDER` is unset but `SEXPR_BASE_URL` is set, sexpr
-auto-infers `:openai-compatible`:
+sexpr talks to a model through an environment-variable-configured
+transport. The simplest case is a local OpenAI-compatible server
+(Ollama, llama-server, vLLM, LM Studio, an internal gateway):
 
 ```sh
 export SEXPR_BASE_URL="http://localhost:6969/v1"
 export SEXPR_MODEL="Qwythos-9B-v2"
-export SEXPR_PROVIDER="openai-compatible"   # explicit, or omit for auto-infer
 ```
 
-The `make diagnostic-*` and `make test-live` targets in the Makefile
-exercise this path against a local server — see `make help`.
+For a hosted provider, set the API key and provider name:
 
-## 6. First chat
+```sh
+export SEXPR_PROVIDER="openai"        # :anthropic | :openai | :gemini
+                                       # :openrouter | :ollama | :openai-compatible
+export SEXPR_MODEL="gpt-4o-mini"      # optional; provider default otherwise
+export OPENAI_API_KEY="sk-..."        # ANTHROPIC_API_KEY, GEMINI_API_KEY, ...
+```
+
+The wrapper `./sexpr.sh` sets local-dev defaults (OpenAI-compatible
+server on `localhost:6969`, model `Qwythos-9B-v2`) so you don't need
+to export anything if that matches your setup.
+
+## 3. Your first chat
+
+```sh
+./sexpr.sh
+```
+
+You'll land at the Listener prompt with the default goal and all four
+capabilities (`fs-read`, `fs-write`, `process`, `lisp-eval`). Type a
+line and press Enter; sexpr folds one bounded turn over the transcript
+and prints the new events.
+
+### Directly with `./sexpr`
 
 ```sh
 ./sexpr --goal "You are a terse pair programmer."
+./sexpr --provider anthropic --model claude-3-5-sonnet-latest --goal "..."
+./sexpr --capability fs-read --capability fs-write --goal "read-only session"
 ```
 
-You'll land at the Listener prompt. Type a line and press Enter; sexpr
-folds one bounded turn over the transcript and prints the new events.
-Each line you type becomes a user event; the model's reply is rendered
-as events. Ctrl-C aborts the current turn and returns to the prompt —
-the partial transcript stays readable, no rollback. A second Ctrl-C at
-an idle prompt exits.
+The full flag list is `./sexpr --help`. Highlights:
 
-### Slash commands
+| Flag              | Meaning                                            |
+|-------------------|----------------------------------------------------|
+| `--goal TEXT`     | the agent's goal (required to enter the loop)       |
+| `--load FILE`     | start from a saved transcript                      |
+| `--provider NAME` | configure the provider transport                   |
+| `--model NAME`    | configure the model name                           |
+| `--capability NAME` | grant a capability (repeatable; comma-separated   |
+|                   | values accepted). Known: `fs-read`, `fs-write`,    |
+|                   | `process`, `lisp-eval`. Grants are additive with   |
+|                   | the built-in default `:fs-read`.                   |
+| `--help`, `-h`    | print usage and exit                               |
+
+### Using the wrapper
+
+`./sexpr.sh` is the local-dev convenience wrapper. It sets
+`SEXPR_PROVIDER`, `SEXPR_BASE_URL`, `SEXPR_MODEL`, and
+`SEXPR_CAPABILITIES` to sensible defaults, then execs `./sexpr` under
+`rlwrap`. Any env var can be overridden inline:
+
+```sh
+./sexpr.sh                                          # default goal + all caps
+./sexpr.sh --goal "summarize this repo"             # explicit goal
+SEXPR_CAPABILITIES=fs-read ./sexpr.sh               # read-only session
+SEXPR_MODEL=OtherModel ./sexpr.sh                   # different model
+./sexpr.sh --help                                   # wrapper help
+```
+
+The wrapper's `--help` (`./sexpr.sh --help`) shows all env vars and
+examples.
+
+## 4. Slash commands
+
+Inside the chat loop:
 
 | Command        | Effect                                              |
 |----------------|-----------------------------------------------------|
@@ -144,13 +127,13 @@ an idle prompt exits.
 | `/exit`, `/quit` | quit the session                                 |
 
 `/save` and `/load` round-trip through the transcript's own
-`print`/`read` (`with-standard-io-syntax`, `*read-eval*` nil). There is
-no separate serializer.
+`print`/`read` (`*read-eval*` nil). The `.sexp` file is plain Common
+Lisp data — it opens in any text editor.
 
-## 7. Save and resume sessions
+## 5. Save and resume
 
 ```sh
-./sexpr --goal "pair programmer"
+./sexpr.sh
 ; inside the loop:
 ; /save my-session.sexp
 ; /exit
@@ -158,10 +141,7 @@ no separate serializer.
 ./sexpr --goal "pair programmer" --load my-session.sexp
 ```
 
-The `.sexp` file is plain Common Lisp data — it opens in any text
-editor and reloads with `read`. This is deliberate (R012).
-
-## 8. Scripted, non-interactive runs
+## 6. Scripted runs
 
 The Listener reads stdin, so piping works:
 
@@ -174,69 +154,26 @@ printf 'Summarize the design.\n/save out.sexp\n/exit\n' \
 
 Useful for CI, cron, or a batch run against a corpus.
 
-## 9. Verify your install
+## 7. Granting capabilities
 
-`make verify` runs four binary-level probes: `--help` prints usage and
-exits 0; a scripted `/help` + `/exit` session succeeds; a cross-process
-`/save` + `--load` round-trips a real `.sexp` file; and the R015 seam
-holds (no `cl-llm-provider` reference leaks into `src/cli/`). Run it
-after `make build` if you want a quick health gate:
+By default the wrapper grants all four capabilities. To restrict:
 
 ```sh
-make verify
+SEXPR_CAPABILITIES=fs-read ./sexpr.sh                    # read-only
+SEXPR_CAPABILITIES=fs-read,fs-write ./sexpr.sh           # read + write
+./sexpr --capability fs-read --goal "no shell, no lisp"  # direct binary
 ```
 
-## 10. Work from the source tree
-
-For development, load the system into an interactive SBCL instead of
-running the binary:
-
-```sh
-make load
-# type: (sexpr:hello)
-#       (ql:quickload :sexpr)
-#       (sexpr.provider:configure-provider :provider :openai)
-```
-
-The full target list is `make help`. Highlights:
-
-| Target                | What it does                                           |
-|-----------------------|--------------------------------------------------------|
-| `make hello`          | Run `sexpr:hello` in a one-shot SBCL                   |
-| `make test`           | Run the rove test suite                                |
-| `make load`           | Interactive SBCL with the system loaded                |
-| `make build`          | Rebuild `./sexpr` (runs `make test` first)             |
-| `make chat`           | Sugar for `./sexpr --goal "pair programmer"`           |
-| `make verify`         | Four binary-level probes                               |
-| `make test-live`      | Round-trip against a running local model server        |
-| `make clean`          | Remove `./sexpr`, `.ql`, `.output`, `*.fasl`, `*.fbas`, `*.lib` |
-
-`make chat` accepts `CHAT_ARGS` to override the default goal:
-
-```sh
-make chat CHAT_ARGS='--goal "summarize the design" --provider ollama --model llama3'
-```
-
-For line editing and history in the Listener, wrap with `rlwrap`:
-
-```sh
-rlwrap ./sexpr --goal "pair programmer"
-```
+If a capability is missing, the tool call is refused with a
+`CAPABILITY-DENIED` error and the agent is told what's missing — it
+can adapt or ask the user to grant the capability.
 
 ## Where to go next
 
-- [`../README.md`](../README.md) — the design thesis, the "in five
-  sentences" summary, and the layer-by-layer mapping of 2025 harness
-  concepts to Lisp-machine primitives.
+- [`../README.md`](../README.md) — the design thesis and layer-by-layer
+  mapping.
 - [`../notes/sexpr.md`](../notes/sexpr.md) — the deepest source: the
-  thesis, the module-by-module plan, and open questions.
-- [`../notes/agent.md`](../notes/agent.md) — the 2025 harness research
-  (context engineering, skills, MCP) that the design answers.
-- [`../src/`](../src/) — the code. `src/kernel/kernel.lisp` is the
-  agent loop; `src/transcript/transcript.lisp` is the transcript
-  substrate; `src/cli/cli.lisp` is the Listener; `src/provider/` is
-  the model transport; `src/builtins/builtins.lisp` is the five
-  registered tools (`read-file`, `write-file`, `edit-file`, `shell`,
-  `lisp`).
-- [`../tests/`](../tests/) — the rove suite. `tests/smoke.lisp` is the
-  smallest place to see how a turn is asserted.
+  thesis, module-by-module plan, and open questions.
+- [`../src/`](../src/) — the code.
+- [`./sexpr --help`](#) and [`./sexpr.sh --help`](#) — the full flag
+  lists.
