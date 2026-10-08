@@ -10,7 +10,7 @@
   :author "David Li <taweili@gmail.com>"
   :license "GPL-3.0-or-later"
   :description "sexpr — an Agent OS in Common Lisp."
-  :depends-on (:cl-llm-provider :eclector)
+  :depends-on (:cl-llm-provider :eclector :sb-bsd-sockets)
   :components
   ((:module "src"
      :components
@@ -68,7 +68,8 @@
       (:module "tui" :depends-on ("kernel" "agents")
         :components
         ((:file "package")
-         (:file "tui" :depends-on ("package"))))
+         (:file "tui" :depends-on ("package"))
+         (:file "server" :depends-on ("package" "tui"))))
       ;; :sexpr.repl is an aggregating dev package (:use transcript/kernel/
       ;; tools/sandbox). It loads AFTER those four so defpackage's :use lists
       ;; resolve. :sexpr.cli references sexpr.repl:repl by qualified name

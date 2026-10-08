@@ -32,4 +32,13 @@
    #:transcript-delta
    #:inject-note
    #:kill
-   #:spawn))
+   #:spawn
+   #:push-server
+   #:push-server-port
+   #:push-server-stats
+   #:push-server-diagnostics
+   #:push-server-stopped-p
+   #:start-server
+   #:stop-server
+   #:*push-server*
+   #:*push-server-log*))
