@@ -409,9 +409,10 @@ not a flag library)."
 
 The flags drive the executable toplevel; the slash commands drive the
 chat loop. --help is the one place a human looks, so both surfaces are
-listed here. The --capability line names the four built-in tools'
-capabilities as the known set; user-defined tools can declare any
-capability and it will be honored here without further wiring."
+listed here. The --capability line names the eight known capabilities
+(four built-in tools plus four multi-agent coordination tools);
+user-defined tools can declare any capability and it will be honored
+here without further wiring."
   (format stream "~&usage: sexpr [--goal TEXT] [--load FILE]~%")
   (format stream "~&                  [--provider NAME] [--model NAME]~%")
   (format stream "~&                  [--capability NAME] [--help | -h]~%")
@@ -424,7 +425,9 @@ capability and it will be honored here without further wiring."
   (format stream "~&  --capability NAME  grant a capability to the agent (repeatable; a~%")
   (format stream "~&                     comma-separated list is also accepted). The default~%")
   (format stream "~&                     is :fs-read. Known: fs-read, fs-write, process,~%")
-  (format stream "~&                     lisp-eval. Grants are additive with the default.~%")
+  (format stream "~&                     lisp-eval (built-ins); spawn, collect, manage,~%")
+  (format stream "~&                     inspect (multi-agent coordination). Grants are~%")
+  (format stream "~&                     additive with the default.~%")
   (format stream "~&  --help, -h         print this usage and exit~%")
   (format stream "~&~%")
   (format stream "~&slash commands (inside the chat loop):~%")

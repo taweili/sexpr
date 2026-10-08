@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
-# Regression check: ./sexpr.sh must forward all four built-in capabilities
-# to ./sexpr when SEXPR_CAPABILITIES is unset or empty.
+# Regression check: ./sexpr.sh must forward all eight known capabilities
+# to ./sexpr when SEXPR_CAPABILITIES is unset or empty — the four built-in
+# tool caps (fs-read, fs-write, process, lisp-eval) plus the four multi-agent
+# coordination caps (spawn, collect, manage, inspect).
 #
 # The test does not build or run ./sexpr. It makes a test-only copy of
 # sexpr.sh with the final `exec rlwrap ...` line replaced by a printf of
@@ -60,7 +62,7 @@ echo
 echo "[case 1] no SEXPR_CAPABILITIES in env"
 out="$(env -u SEXPR_CAPABILITIES bash -c "cd '$ROOT' && '$TMPDIR/probe.sh'")"
 echo "$out" | sed 's/^/  argv: /'
-for cap in fs-read fs-write process lisp-eval; do
+for cap in fs-read fs-write process lisp-eval spawn collect manage inspect; do
     if contains "$cap" <<< "$out"; then
         pass "--capability $cap present"
     else
@@ -73,7 +75,7 @@ echo
 echo "[case 2] SEXPR_CAPABILITIES='' (empty)"
 out="$(SEXPR_CAPABILITIES='' bash -c "cd '$ROOT' && '$TMPDIR/probe.sh'")"
 echo "$out" | sed 's/^/  argv: /'
-for cap in fs-read fs-write process lisp-eval; do
+for cap in fs-read fs-write process lisp-eval spawn collect manage inspect; do
     if contains "$cap" <<< "$out"; then
         pass "--capability $cap present"
     else
@@ -91,7 +93,7 @@ if contains fs-read <<< "$out"; then
 else
     fail "fs-read MISSING"
 fi
-for cap in fs-write process lisp-eval; do
+for cap in fs-write process lisp-eval spawn collect manage inspect; do
     if ! contains "$cap" <<< "$out"; then
         pass "$cap correctly absent"
     else
@@ -117,7 +119,7 @@ echo
 echo "[case 5] ./sexpr.sh --capability custom-tool (additive)"
 out="$(bash -c "cd '$ROOT' && '$TMPDIR/probe.sh' --capability custom-tool")"
 echo "$out" | sed 's/^/  argv: /'
-for cap in fs-read fs-write process lisp-eval custom-tool; do
+for cap in fs-read fs-write process lisp-eval spawn collect manage inspect custom-tool; do
     if contains "$cap" <<< "$out"; then
         pass "--capability $cap present"
     else

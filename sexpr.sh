@@ -10,8 +10,9 @@
 #   SEXPR_PROVIDER       provider name         (default: openai-compatible)
 #   SEXPR_BASE_URL       provider base URL     (default: http://localhost:6969/v1)
 #   SEXPR_MODEL          model name            (default: Qwythos-9B-v2)
-#   SEXPR_CAPABILITIES   comma-separated list  (default: all four grants)
-#                        Known names: fs-read, fs-write, process, lisp-eval
+#   SEXPR_CAPABILITIES   comma-separated list  (default: all eight grants)
+#                        Built-in: fs-read, fs-write, process, lisp-eval
+#                        Coordination: spawn, collect, manage, inspect
 #                        Set to `fs-read` for a read-only session.
 #
 # A default --goal is injected only when the caller did not supply one,
@@ -218,8 +219,9 @@ environment (override with `VAR=value ./sexpr.sh ...`):
   SEXPR_PROVIDER       provider name         (default: openai-compatible)
   SEXPR_BASE_URL       provider base URL     (default: http://localhost:6969/v1)
   SEXPR_MODEL          model name            (default: Qwythos-9B-v2)
-  SEXPR_CAPABILITIES   comma-separated list  (default: all four grants)
-                       Known: fs-read, fs-write, process, lisp-eval
+  SEXPR_CAPABILITIES   comma-separated list  (default: all eight grants)
+                       Known: fs-read, fs-write, process, lisp-eval,
+                              spawn, collect, manage, inspect
 
 sexpr flags (a subset; see `./sexpr --help` for the full list):
   --goal TEXT          agent goal (a default is injected when absent)
@@ -246,7 +248,11 @@ export SEXPR_MODEL="${SEXPR_MODEL:-Qwythos-9B-v2}"
 # SEXPR_CAPABILITIES (comma-separated) is forwarded as repeated --capability
 # flags BEFORE user args so user --capability grants add to the default set.
 caps_arg=()
-IFS=',' read -r -a caps <<< "${SEXPR_CAPABILITIES:-fs-read,fs-write,process,lisp-eval}"
+# All eight known capabilities are on by default: the four built-in tool
+# caps (fs-read, fs-write, process, lisp-eval) and the four multi-agent
+# coordination caps (spawn, collect, manage, inspect). Narrow the set
+# (e.g. SEXPR_CAPABILITIES=fs-read) for a restricted session.
+IFS=',' read -r -a caps <<< "${SEXPR_CAPABILITIES:-fs-read,fs-write,process,lisp-eval,spawn,collect,manage,inspect}"
 for cap in "${caps[@]}"; do
     # trim whitespace (a common env-var paste artifact)
     cap="$(printf '%s' "$cap" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
