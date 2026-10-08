@@ -62,6 +62,13 @@
         :components
         ((:file "package")
          (:file "agents" :depends-on ("package"))))
+      ;; tui is the in-image RPC stub layer for the remote TUI client (M004).
+      ;; Depends on kernel (event bus, agent class, model-step-streaming) and
+      ;; agents (spawn/kill/note, *agent-table*). R015: never depends on provider.
+      (:module "tui" :depends-on ("kernel" "agents")
+        :components
+        ((:file "package")
+         (:file "tui" :depends-on ("package"))))
       ;; :sexpr.repl is an aggregating dev package (:use transcript/kernel/
       ;; tools/sandbox). It loads AFTER those four so defpackage's :use lists
       ;; resolve. :sexpr.cli references sexpr.repl:repl by qualified name
@@ -73,7 +80,7 @@
         :components
         ((:file "package")
          (:file "repl" :depends-on ("package"))))
-      (:file "sexpr" :depends-on ("provider" "transcript" "kernel" "cli" "tools" "sandbox" "builtins" "agents" "repl")))))
+      (:file "sexpr" :depends-on ("provider" "transcript" "kernel" "cli" "tools" "sandbox" "builtins" "agents" "repl" "tui")))))
   ;; test-op is defined as a method in src/sexpr.lisp, not inline here:
   ;; inline :perform bodies are miscompiled by this Quicklisp-bundled
   ;; ASDF when the system has real dependencies (the leading DECLARE is
@@ -105,4 +112,5 @@
       (:file "tools" :depends-on ("package"))
       (:file "sandbox" :depends-on ("package"))
       (:file "repl" :depends-on ("package"))
-      (:file "five" :depends-on ("package"))))))
+      (:file "five" :depends-on ("package"))
+      (:file "tui-integration" :depends-on ("package"))))))
