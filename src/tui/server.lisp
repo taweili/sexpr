@@ -21,10 +21,22 @@
 ;;;;
 ;;;; A `push-server` is the handle returned by start-server. It owns the
 ;;;; listening socket, the accept-loop thread, and a mutex-guarded list of
-;;;; connected clients. Client records are minimal in T01 (the protocol
-;;;; arrives in T02): each is a plist with the accepted socket, its handler
-;;;; thread, a mutex (guards the client record itself, not yet the queue —
-;;;; that is T02), and the queue-capacity hint passed to start-server.
+;;;; connected clients. Each client record is a plist with the accepted
+;;;; socket, its handler thread, the protocol state added in T02 (the
+;;;; subscription list, the bounded queue, and the locks guarding them),
+;;;; and the queue-capacity hint passed to start-server.
+;;;;
+;;;; LOCK ORDER (deadlock discipline — SBCL mutexes are not recursive):
+;;;;   clients-lock  >  client subscriptions-lock  >  client queue-lock
+;;;;   clients-lock  >  client queue-lock
+;;;; The clients-lock is the outermost: it is the only lock held while
+;;;; diagnostics walks the client list. No client lock may ever be acquired
+;;;; and then the clients-lock. The event-bus lock is a fourth lock: the
+;;;; listener closure runs with the event-bus lock held (emit-event holds it
+;;;; during the listener call), so inside a listener we may only take the
+;;;; queue-lock — never the event-bus lock, never the clients-lock. The
+;;;; subscribe/unsubscribe handlers therefore call the event-bus OUTSIDE any
+;;;; client lock, then record the pair under the subscriptions-lock.
 ;;;;
 ;;;; OBSERVABILITY (R007 failure-visibility): the accept loop and the client
 ;;;; handler run on their own threads, so a condition there cannot bubble to a
@@ -89,7 +101,14 @@ resync-on-overflow logic; not enforced in T01.")
 :client-exits, and per-outcome counters (:clean-eof / :read-error /
 :write-error / :open-error / :other-error), plus :last-error (the most recent
 condition seen by any server thread). Every error a thread catches lands
-here — no silent swallow."))
+here — no silent swallow.
+
+Protocol counters live in the same plist (T02): :subscribes, :unsubscribes,
+:malformed (a message that could not be dispatched: not a list, an unknown
+operator, or a subscribe/unsubscribe with a missing or non-string :agent),
+and :ignored (a well-formed message this server does not act on yet).
+Every protocol message lands in exactly one of these counters — nothing is
+dropped silently."))
   (:documentation "A running push-channel TCP server."))
 (export 'push-server)
 (export 'push-server-port)
@@ -150,6 +169,19 @@ loopback v1). Errors on malformed input."
         (sb-bsd-sockets:socket-close socket)
       (error () nil))))
 
+(defun %count (server key)
+  "Increment one protocol counter on the server stats plist.
+
+Acquires the clients-lock, so it must NOT be called while holding a client
+lock (see the lock-order note at the top of this file). This is what makes an
+ignored or malformed message observable: the handler does not reply to either,
+so without a counter a dropped message would be indistinguishable from a bug.
+Protocol counters are not exit outcomes — they do not mark the client
+:closed/:exited, so use this rather than %record for them."
+  (sb-thread:with-mutex ((push-server-clients-lock server))
+    (incf (getf (push-server-stats server) key 0)))
+  nil)
+
 (defun %record (server client outcome error)
   "Record one thread-side outcome on the server counters and CLIENT's record.
 OUTCOME is a keyword: :accepted for a new connection, or one of the exit
@@ -203,20 +235,237 @@ loop and the client handlers saw."
                             collect (list :id (getf c :id)
                                           :closed (getf c :closed)
                                           :exited (getf c :exited)
-                                          :error (getf c :error))))))
+                                          :error (getf c :error)
+                                          :subscriptions (snapshot-subscriptions c)
+                                          :queue-length (snapshot-queue-length c)
+                                          :queue-capacity (getf c :queue-capacity)
+                                          :queue (snapshot-queue c)
+                                          :enqueued (getf c :enqueued))))))
 
-;;;; --- per-client thread (T01: minimal handler) --------------------
+;;;; --- per-client protocol state (T02) ------------------------------
+;;;;
+;;;; The client record carries the protocol state added here:
+;;;;   :subscriptions        list of (agent-id . listener) pairs
+;;;;   :subscriptions-lock   guards that list
+;;;;   :queue-head/:queue-tail  FIFO of already-translated wire messages
+;;;;   :queue-length         current depth
+;;;;   :queue-capacity       the bound (start-server's queue-capacity)
+;;;;   :queue-lock           guards the queue
+;;;;   :enqueued             lifetime enqueue count (queue-lock)
+;;;;
+;;;; THE DECOUPLING IS THE POINT (S01/MEM084): emit-event calls listeners
+;;;; synchronously in the emitting thread — the kernel's agent loop. So the
+;;;; listener must be a CHEAP enqueue under the queue-lock and must NEVER touch
+;;;; the socket; blocking there would stall the agent. The writer thread (T03)
+;;;; is what drains the queue and writes to the socket.
+;;;;
+;;;; Capacity is stored per-client but not enforced yet: T04 adds the overflow
+;;;; check and the (resync ...) response. Until then the queue grows, which is
+;;;; exactly why the load-profile test names the queue as the first resource to
+;;;; saturate.
+
+(defun %enqueue (client item)
+  "Append ITEM to CLIENT's FIFO queue under the queue-lock. O(1), no I/O.
+
+Only the queue-lock is taken here (see the lock-order note at the top of this
+file): this runs from a bus listener, which is called with the event-bus lock
+held, so taking any other lock from here could deadlock against a handler that
+holds a client lock and then the event-bus lock. Returns ITEM."
+  (sb-thread:with-mutex ((getf client :queue-lock))
+    (let ((cell (list item)))
+      (if (getf client :queue-tail)
+          (setf (cdr (getf client :queue-tail)) cell)
+          (setf (getf client :queue-head) cell))
+      (setf (getf client :queue-tail) cell)
+      (incf (getf client :queue-length))
+      (incf (getf client :enqueued)))
+    item))
+
+(defun snapshot-queue (client)
+  "The queue contents in FIFO order, under the queue-lock. Safe from any thread
+  as long as the caller does not already hold the queue-lock; the diagnostics
+  path holds the clients-lock first, which is the outer lock."
+  (sb-thread:with-mutex ((getf client :queue-lock))
+    (loop for cell = (getf client :queue-head) then (cdr cell)
+          while cell collect (car cell))))
+
+(defun snapshot-queue-length (client)
+  "Queue depth under the queue-lock."
+  (sb-thread:with-mutex ((getf client :queue-lock))
+    (getf client :queue-length)))
+
+(defun snapshot-subscriptions (client)
+  "The agent-ids CLIENT is subscribed to, under the subscriptions-lock."
+  (sb-thread:with-mutex ((getf client :subscriptions-lock))
+    (loop for pair in (getf client :subscriptions) collect (car pair))))
+
+(defun %delta-listener (client agent-id)
+  "Build the event-bus listener for one (CLIENT, AGENT-ID) subscription.
+
+Translation: a bus event (:type :delta :agent-id A :chunk-delta X) becomes the
+wire item (delta :agent A :content X). Any other :type is ignored — that is
+forward-compatibility, not an error: S04/S05 add finalize/status/tool-start/
+approval-needed and an S02 server should simply not act on them.
+
+CHEAP BY CONTRACT: the body is a translate plus an enqueue under the queue-lock
+only. It never writes to the socket, because emit-event runs listeners
+synchronously in the kernel's agent thread (S01/MEM084). It also never reads
+the transcript, so a delta burst costs one cons per event.
+
+The event-bus lock is held while this runs, so the queue-lock is the only lock
+this closure may take."
+  (lambda (event)
+    (when (consp event)
+      (when (eq (getf event :type) :delta)
+        (%enqueue client (list 'delta
+                               :agent (or (getf event :agent-id) agent-id)
+                               :content (getf event :chunk-delta)))))))
+
+(defun %cursor-for (agent-id)
+  "Resync cursor for AGENT-ID: its current transcript length, or 0 when the
+agent is not registered yet (a client may subscribe to an agent that does not
+exist yet, and the cursor is still a useful baseline for it).
+
+For T04: transcript-length does NOT advance mid-stream (MEM089) — :delta events
+are emitted during model-step-streaming before the final model event is
+integrated into the transcript."
+  (or (let ((a (%lookup-agent agent-id)))
+        (and a (sexpr.transcript:transcript-length (sexpr.kernel:agent-transcript a))))
+      0))
+
+(defun %write-sexpr (stream object)
+  "Serialize one wire message as newline-delimited text.
+
+*print-readably* t so the client's READ reconstructs the structure exactly —
+princ would drop the quotes around a string and the client would read a symbol.
+*print-pretty* nil so nothing is wrapped or paren-tightened. force-output
+guarantees delivery: :buffering :line flushes on newline, but an explicit flush
+is what makes a push channel push."
+  (let ((*print-readably* t) (*print-pretty* nil))
+    (prin1 object stream)
+    (terpri stream)
+    (force-output stream)))
+
+(defun %cleanup-client (server client)
+  "Unsubscribe every listener CLIENT registered. Called on disconnect (EOF or a
+socket error in the handler) and by stop-server.
+
+A leaked listener is the research pitfall: it keeps enqueuing into a dead
+client's queue forever, and the next emit-event for that agent would write to a
+socket that no longer exists. Called OUTSIDE the clients-lock — it takes the
+subscriptions-lock and the event-bus lock. Returns the number removed."
+  (let ((pairs (sb-thread:with-mutex ((getf client :subscriptions-lock))
+                (copy-list (getf client :subscriptions)))))
+    (dolist (pair pairs)
+      (sexpr.kernel:unsubscribe-event-bus (car pair) (cdr pair)))
+    (sb-thread:with-mutex ((getf client :subscriptions-lock))
+      (setf (getf client :subscriptions) nil))
+    (when (plusp (length pairs))
+      (%count server :listeners-removed))
+    (length pairs)))
+
+(defun %op (symbol)
+  "Resolve the wire operator by SYMBOL-NAME, not by EQ.
+
+The reader interns the client's first token in whatever package the handler
+thread happens to be in, so a socket `subscribe` is NOT EQ to sexpr.tui:subscribe
+— the dispatch silently fell through to :ignored until this was fixed. A wire
+protocol cannot depend on interning into its own package: the client has no way
+to name it. Comparing by name is the package-independent contract."
+  (when (symbolp symbol)
+    (let ((name (string-upcase (symbol-name symbol))))
+      (cond
+        ((string= name "SUBSCRIBE") :subscribe)
+        ((string= name "UNSUBSCRIBE") :unsubscribe)
+        (t nil)))))
+
+(defun %handle-message (server client stream message)
+  "Dispatch one client message. Returns T when it produced a reply, NIL when it
+was ignored or malformed — both counted on the server stats, so a dropped
+message is never silent.
+
+S02's vocabulary is subscribe / subscribed / unsubscribe. Unknown operators are
+IGNORED rather than rejected: a newer client (S04/S05) may send finalize or
+approval-needed to an older server, and the server should not tear down the
+connection over a message it does not understand yet. A malformed message is not
+fatal to the connection either — it is counted and logged.
+
+The subscribe reply is written AFTER subscribe-event-bus returns. That ordering
+is the race-closure signal: a client that has read (subscribed ...) knows the
+listener is already registered, so any event it emits afterwards cannot be lost.
+
+No client lock is held while the event-bus is called (lock order), so the
+subscribe/unsubscribe paths take the bus lock, then the subscriptions-lock —
+never the reverse."
+  (unless (consp message)
+    (%count server :malformed)
+    (%log server (format nil "client ~D malformed" (getf client :id))
+          (format nil "not a list: ~S" message))
+    (return-from %handle-message nil))
+  (let ((op (and (consp message) (car message))))
+    (case (%op op)
+      ((:subscribe)
+       (let ((agent-id (getf (cdr message) :agent)))
+         (unless (stringp agent-id)
+           (%count server :malformed)
+           (%log server (format nil "client ~D malformed subscribe" (getf client :id))
+                 (format nil ":agent must be a string: ~S" message))
+           (return-from %handle-message nil))
+         (let ((listener (%delta-listener client agent-id)))
+           ;; subscribe, THEN record, THEN reply — see the docstring. The reply
+           ;; is what tells the client the listener is live.
+           (sexpr.kernel:subscribe-event-bus agent-id listener)
+           (sb-thread:with-mutex ((getf client :subscriptions-lock))
+             (push (cons agent-id listener) (getf client :subscriptions)))
+           (%count server :subscribes)
+           (let ((cursor (%cursor-for agent-id)))
+             (%log server (format nil "client ~D subscribe" (getf client :id))
+                   (format nil ":agent ~S :cursor ~D" agent-id cursor))
+             (%write-sexpr stream (list 'subscribed :agent agent-id :cursor cursor)))
+           t)))
+      ((:unsubscribe)
+       (let ((agent-id (getf (cdr message) :agent)))
+         (unless (stringp agent-id)
+           (%count server :malformed)
+           (%log server (format nil "client ~D malformed unsubscribe" (getf client :id))
+                 (format nil ":agent must be a string: ~S" message))
+           (return-from %handle-message nil))
+         (let ((pair (sb-thread:with-mutex ((getf client :subscriptions-lock))
+                       (find agent-id (getf client :subscriptions)
+                             :key #'car :test #'string=))))
+           (unless pair
+             ;; Unsubscribing something we never subscribed to is not something
+             ;; the client can act on, but it is not silently dropped either.
+             (%count server :unknown-unsubscribe)
+             (%log server (format nil "client ~D unknown unsubscribe" (getf client :id))
+                   (format nil ":agent ~S" agent-id))
+             (return-from %handle-message nil))
+           (sexpr.kernel:unsubscribe-event-bus agent-id (cdr pair))
+           (sb-thread:with-mutex ((getf client :subscriptions-lock))
+             (setf (getf client :subscriptions)
+                   (remove pair (getf client :subscriptions))))
+           (%count server :unsubscribes)
+           (%log server (format nil "client ~D unsubscribe" (getf client :id))
+                 (format nil ":agent ~S" agent-id))
+           nil)))
+      (t
+       (%count server :ignored)
+       (%log server (format nil "client ~D ignored" (getf client :id))
+             (format nil "~S" message))
+       nil))))
+
+;;;; --- per-client thread (T02: the protocol handler) ----------------
 ;;;
-;;;; T01 deliberately does not implement the subscribe/delta/resync
-;;;; protocol — that arrives in T02. The handler here reads newline-
-;;;; delimited sexprs from the client and echoes each one back. The
-;;;; echo is intentional: it proves the full accept-loop -> stream ->
-;;;; read/write -> close path works end-to-end (the T01 test asserts
-;;;; an echo round-trip), while still being a drop-in replacement for
-;;;; the real protocol in T02. On any error (client gone, socket
-;;;; closed by stop-server) we close our end and return; the handler
-;;;; is expected to be joined by stop-server, and if still alive at
-;;;; stop-time we fall back to sb-thread:terminate-thread.
+;;;; Reads newline-delimited sexprs from the client and dispatches them
+;;;; (subscribe / unsubscribe / ignore). The T01 echo is gone: an unknown sexpr
+;;;; is now IGNORED, not echoed, because S02's wire vocabulary is one-way except
+;;;; for the (subscribed ...) reply. The test suite asserts the new contract — no
+;;;; reply for an unknown message, and the connection stays alive.
+;;;
+;;;; On any error (client gone, socket closed by stop-server) we clean up the
+;;;; client's listeners, close our end, and return; the handler is expected to be
+;;;; joined by stop-server, and if still alive at stop-time we fall back to
+;;;; sb-thread:terminate-thread.
 ;;;
 ;;;; FAILURE CLASSIFICATION (Q5): PHASE records where the failure happened —
 ;;;; stream creation (:open-error), the read (:read-error: malformed or
@@ -230,17 +479,19 @@ loop and the client handlers saw."
 ;;;; T02's protocol read; it costs nothing here and the negative tests assert it.
 
 (defun client-handler-loop (server client)
-  "Run the T01 client handler for one accepted connection.
+  "Run the client handler for one accepted connection.
 
-Echoes every sexpr the client sends, until the connection closes.
-This gives us a real read/write round-trip on the socket stream — the
-T01 test writes a sexpr from a client and reads it back — without
-inventing the subscribe/delta/resync protocol that T02 supplies.
+Reads newline-delimited sexprs with *read-eval* NIL until the connection
+closes, dispatching each one through %handle-message.
 
-Always closes the server side of the socket on exit so a client that
-hung up mid-stream does not leak an fd; and marks the client record
-:closed so a concurrent stop-server iteration can skip it. The exit reason
-is recorded on the server stats and logged when *push-server-log* is bound."
+On exit — clean EOF or any socket/stream error — every listener this client
+registered is unsubscribed BEFORE the socket is closed, so a client that hangs
+up without saying (unsubscribe ...) cannot leak a listener that would enqueue
+into a dead client forever. Always closes the server side of the socket so a
+client that hung up mid-stream does not leak an fd, and marks the client record
+:closed so a concurrent stop-server iteration can skip it. The exit reason and
+the cleanup count are recorded on the server stats and logged when
+*push-server-log* is bound."
   (let* ((socket (getf client :socket))
          (stream nil)
          (phase :open)
@@ -259,16 +510,20 @@ is recorded on the server stats and logged when *push-server-log* is bound."
                 (setf outcome :clean-eof)
                 (return))
               (setf phase :write)
-              (format stream "~s~%" obj)
-              (force-output stream))))
+              (%handle-message server client stream obj))))
       (error (e)
         (setf err e)
         (setf outcome (ecase phase
                         ((:open) :open-error)
                         ((:read) :read-error)
                         ((:write) :write-error)))))
-    ;; %record acquires the clients-lock itself, so it is called OUTSIDE any
-    ;; locked section (SBCL mutexes are not recursive).
+    ;; Cleanup runs OUTSIDE any locked section: %cleanup-client takes the
+    ;; subscriptions-lock and the event-bus lock, and %record takes the
+    ;; clients-lock (SBCL mutexes are not recursive).
+    (let ((removed (%cleanup-client server client)))
+      (when (plusp removed)
+        (%log server (format nil "client ~D cleanup" (getf client :id))
+              (format nil "unsubscribed ~D listener(s)" removed))))
     (%record server client outcome err)
     (%log server (format nil "client ~D exit" (getf client :id))
           (if err (format nil "~A (~A)" err outcome) (format nil "~A" outcome)))
@@ -311,7 +566,9 @@ recorded and logged so a failed accept is visible in diagnostics."
               ;; the handler: the handler must mutate the same record the
               ;; server owns (its :closed flag), otherwise stop-server cannot
               ;; see that the client already unwound.
-              (let ((client (make-client :socket client-socket :id (1+ counter))))
+              (let ((client (make-client :socket client-socket :id (1+ counter)
+                                         :queue-capacity
+                                           (push-server-queue-capacity server))))
                 (incf counter)
                 (sb-thread:with-mutex ((push-server-clients-lock server))
                   (setf (push-server-clients server)
@@ -331,17 +588,29 @@ recorded and logged so a failed accept is visible in diagnostics."
           (%log server "accept loop exit" (format nil "~A" e))
           (return))))))
 
-(defun make-client (&key socket thread (id 0))
-  "Allocate a minimal per-client record. The queue slot arrives in T02."
+(defun make-client (&key socket thread (id 0) (queue-capacity 64))
+  "Allocate a per-client record.
+
+T02 adds the protocol state: the subscription list (agent-id . listener pairs),
+the FIFO queue of already-translated wire messages (head/tail so enqueue is O(1)
+under the queue-lock), and the locks guarding each. QUEUE-CAPACITY is copied from
+the server so the per-client bound is visible on the record itself; T04 enforces
+it and emits (resync ...). T03 adds the writer thread that drains the queue —
+until then the queue is filled by listeners and read only by diagnostics."
   (list :id id
         :socket socket
         :thread thread
-        :queue nil
+        :queue-head nil
+        :queue-tail nil
+        :queue-length 0
+        :queue-capacity queue-capacity
         :queue-lock (sb-thread:make-mutex :name "push-server-client-queue")
+        :enqueued 0
+        :subscriptions nil
+        :subscriptions-lock (sb-thread:make-mutex :name "push-server-client-subs")
         :closed nil
         :exited nil
-        :error nil
-        :agent-subscriptions nil))
+        :error nil))
 
 ;;;; --- public API ---------------------------------------------------
 
@@ -393,6 +662,12 @@ valid IPv4 address, or a specific non-zero PORT is already in use)."
                                         :write-error 0
                                         :open-error 0
                                         :other-error 0
+                                        :subscribes 0
+                                        :unsubscribes 0
+                                        :malformed 0
+                                        :ignored 0
+                                        :unknown-unsubscribe 0
+                                        :listeners-removed 0
                                         :last-error nil)))
            (thread
             (sb-thread:make-thread (lambda () (accept-loop server))

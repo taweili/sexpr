@@ -1,13 +1,19 @@
 ;;; SPDX-License-Identifier: GPL-3.0-or-later
 ;;;; tests/test-push-server.lisp — standalone test for the push-channel
-;;;; TCP server (M004/S02/T01).
+;;;; TCP server (M004/S02).
 ;;;;
 ;;;; Run with: sbcl --script tests/test-push-server.lisp
 ;;;;
-;;;; T01 ships start-server (bind + listen + accept loop), stop-server
-;;;; (close clients, close listen socket, join threads), and a minimal
-;;;; per-client handler that echoes. T02 adds the subscribe/delta/resync
-;;;; protocol on top of the same accept loop.
+;;;; T01 shipped start-server (bind + listen + accept loop), stop-server
+;;;; (close clients, close listen socket, join threads), and the per-client
+;;;; handler. T02 adds the subscribe/unsubscribe protocol on top of that accept
+;;;; loop: the handler now dispatches instead of echoing, the bus listener
+;;;; translates a :delta event into a wire item and enqueues it into the
+;;;; per-client queue, and (subscribed ...) is the race-closure signal.
+;;;;
+;;;; The queue is read through push-server-diagnostics because T03 has not added
+;;;; the writer thread yet — in T02 the listener fills the queue and nothing
+;;;; drains it, which is exactly what makes the queue observable from a test.
 
 (unless (find-package :ql)
   (load (merge-pathnames "~/.sbclinit" (user-homedir-pathname))))
@@ -42,12 +48,20 @@
      (error (err)
        (crash ,description err))))
 
+(defun reset-bus! ()
+  "Clear the event bus. A listener left registered by a previous test would fire
+  into the next test's client and make a negative assertion pass for the wrong
+  reason, so every test resets the bus through reset!."
+  (clrhash sexpr.kernel:*event-bus*))
+
 (defun reset! ()
-  "Ensure no push-server is running (idempotent)."
+  "Ensure no push-server is running (idempotent) and no listener survives from
+  the previous test."
   (when sexpr.tui:*push-server*
     (handler-case
         (stop-server sexpr.tui:*push-server*)
-      (error () nil))))
+      (error () nil)))
+  (reset-bus!))
 
 (defun starts-with (string prefix)
   "True when STRING begins with PREFIX (CL has no string-prefixp)."
@@ -83,6 +97,17 @@ Returns the last value of PRED."
   "Read one counter out of a push-server-diagnostics snapshot."
   (getf (getf diag :stats) key))
 
+(defun per-client-rec (diag id)
+  "One client record out of a push-server-diagnostics snapshot, by client id.
+  Diagnostics returns per-client records in reverse accept order, so look up by
+  id rather than assuming the first entry."
+  (find id (getf diag :per-client) :key (lambda (rec) (getf rec :id))))
+
+(defun first-client-rec (diag)
+  "The single client record in a diagnostics snapshot (tests that connect one
+  client at a time)."
+  (car (getf diag :per-client)))
+
 (defun fd-count ()
   "Open file-descriptor count for this process (Linux/proc). Used to prove a
   client that hangs up does not leak an fd on the server side.
@@ -113,7 +138,7 @@ Returns the last value of PRED."
 
 ;;;; --- tests ---------------------------------------------------------
 
-(format t "Push server tests (T01):~%~%")
+(format t "Push server tests (T01 accept loop + T02 subscribe protocol):~%~%")
 
 (reset!)
 
@@ -140,7 +165,16 @@ Returns the last value of PRED."
       (stop-server a)
       (reset!))))
 
-(test "3. a client connects and echoes a sexpr back over the socket"
+;;;; The wire contract changed in T02. T01's handler echoed every sexpr as a
+;;;; placeholder for the real protocol. T02 replaces it: S02's vocabulary is
+;;;; one-way except for the (subscribed ...) reply, so an unknown sexpr gets NO
+;;;; reply. This test asserts the new contract — the message is counted as
+;;;; :ignored, nothing comes back, and the connection stays usable for a real
+;;;; subscribe afterwards. A malformed or unknown message must not tear down the
+;;;; connection (a newer client may send finalize/approval-needed to an S02
+;;;; server).
+
+(test "3. an unknown sexpr is ignored (no reply) and the connection stays alive"
   (let ((server (start-server :port 0)))
     (unwind-protect
          (let* ((port (push-server-port server))
@@ -152,15 +186,20 @@ Returns the last value of PRED."
                                                             :input t
                                                             :output t)))
              (unwind-protect
-                  (progn
-                    (format stream "(hello world)")
-                    (terpri stream)
-                    (force-output stream)
-                    (let ((back (read stream nil 'eof)))
-                      (equal back '(hello world))))
-               (safe-close-socket c))))
+                  (and (progn
+                         (send-sexpr stream '(hello world))
+                         ;; no reply: the read times out rather than returning anything
+                         (eq (read-or-eof stream 0.5) 'timeout)
+                         (plusp (stats-value (push-server-diagnostics server) :ignored)))
+                     ;; still alive — a real protocol message on the same
+                     ;; connection gets its reply
+                     (progn
+                       (send-sexpr stream '(subscribe :agent "probe-alive"))
+                       (equal (read-or-eof stream 3.0)
+                              '(subscribed :agent "probe-alive" :cursor 0))))
+               (safe-close-socket c)))
       (stop-server server)
-      (reset!))))
+      (reset!)))))
 
 (test "4. stop-server cleans up all push-server threads; second stop-server is a no-op"
   (let ((server (start-server :port 0)))
@@ -197,8 +236,8 @@ Returns the last value of PRED."
              ;; Clean up the client side.
              (safe-close-socket c)
              (and (push-server-stopped-p server)
-                  (null (threads-named "push-server")))))
-      (reset!))))
+                  (null (threads-named "push-server"))))
+      (reset!)))))
 
 (test "6. start-server signals on an invalid host address"
   (handler-case
@@ -232,38 +271,40 @@ Returns the last value of PRED."
                                                             :input t
                                                             :output t)))
              (unwind-protect
-                  (progn
-                    ;; '#Z would be read by THIS file at load time, so send the
-                    ;; malformed text as raw characters to the socket.
-                    (format stream "#Zgarbage")
-                    (terpri stream)
-                    (force-output stream)
-                    ;; the handler records the reader error and hangs up on us
-                    (wait-for (lambda ()
-                                (plusp (stats-value (push-server-diagnostics server) :read-error)))
-                              3.0)
-                    (let ((diag (push-server-diagnostics server)))
-                      (and (plusp (stats-value diag :read-error))
-                           (typep (getf diag :stats) 'list)
-                           (typep (getf (getf diag :stats) :last-error) 'reader-error)
-                           ;; the connection was closed by the server
-                           (member (read-or-eof stream) '(closed eof))
-                           ;; and the server still serves a fresh client
-                           (let ((c2 (make-instance 'sb-bsd-sockets:inet-socket
-                                                      :type :stream :protocol :tcp)))
-                             (sb-bsd-sockets:socket-connect c2 #(127 0 0 1) port)
-                             (let ((s2 (sb-bsd-sockets:socket-make-stream c2
-                                                          :buffering :line
-                                                          :input t
-                                                          :output t)))
-                               (unwind-protect
-                                    (progn
-                                      (send-sexpr s2 '(still alive))
-                                      (equal (read-or-eof s2) '(still alive)))
-                                 (safe-close-socket c2)))))))
-               (safe-close-socket c))))
+                  (and (progn
+                         ;; '#Z would be read by THIS file at load time, so send the
+                         ;; malformed text as raw characters to the socket.
+                         (format stream "#Zgarbage")
+                         (terpri stream)
+                         (force-output stream)
+                         ;; the handler records the reader error and hangs up on us
+                         (wait-for (lambda ()
+                                     (plusp (stats-value (push-server-diagnostics server) :read-error)))
+                                   3.0)
+                         (let ((diag (push-server-diagnostics server)))
+                           (and (plusp (stats-value diag :read-error))
+                                (typep (getf diag :stats) 'list)
+                                (typep (getf (getf diag :stats) :last-error) 'reader-error))))
+                     ;; the connection was closed by the server
+                     (member (read-or-eof stream) '(closed eof))
+                     ;; and the server still serves a fresh client
+                     (let ((c2 (make-instance 'sb-bsd-sockets:inet-socket
+                                                :type :stream :protocol :tcp)))
+                       (sb-bsd-sockets:socket-connect c2 #(127 0 0 1) port)
+                       (let ((s2 (sb-bsd-sockets:socket-make-stream c2
+                                                    :buffering :line
+                                                    :input t
+                                                    :output t)))
+                         (unwind-protect
+                              (progn
+                                ;; the protocol contract: a subscribe gets a reply
+                                (send-sexpr s2 '(subscribe :agent "probe-8"))
+                                (equal (read-or-eof s2)
+                                       '(subscribed :agent "probe-8" :cursor 0)))
+                           (safe-close-socket c2))))
+               (safe-close-socket c)))
       (stop-server server)
-      (reset!))))
+      (reset!))))))
 
 (test "9. *read-eval* is NIL on the client read: #. is rejected and does not evaluate"
   (let ((server (start-server :port 0)))
@@ -290,9 +331,9 @@ Returns the last value of PRED."
                       (and (null *evil-evaluated*)
                            (plusp (stats-value diag :read-error))))
                     )
-               (safe-close-socket c))))
+               (safe-close-socket c)))
       (stop-server server)
-      (reset!))))
+      (reset!)))))
 
 (test "10. abrupt client hang-up mid-stream: handler exits, is recorded, leaks no fd"
   (let ((server (start-server :port 0))
@@ -330,11 +371,14 @@ Returns the last value of PRED."
                                                  :output t)))
                       (unwind-protect
                            (progn
-                             (send-sexpr s '(after churn))
-                             (equal (read-or-eof s) '(after churn)))
-                        (safe-close-socket c)))))))
+                             ;; protocol contract (T02): subscribe gets the
+                             ;; (subscribed ...) reply; a bare sexpr gets nothing
+                             (send-sexpr s '(subscribe :agent "probe-10"))
+                             (equal (read-or-eof s)
+                                    '(subscribed :agent "probe-10" :cursor 0)))
+                        (safe-close-socket c)))))
       (stop-server server)
-      (reset!))))
+      (reset!))))))
 
 (test "11. a client that vanishes after sending data is recorded on its client record"
   (let ((server (start-server :port 0)))
@@ -349,8 +393,8 @@ Returns the last value of PRED."
                                                             :output t)))
              (unwind-protect
                   (progn
-                    (send-sexpr stream '(vanish))
-                    (safe-close-socket c)   ; gone before the echo is read
+                    (send-sexpr stream '(subscribe :agent "probe-11"))
+                    (safe-close-socket c)   ; gone before the reply is read
                     (wait-for (lambda ()
                                 (plusp (stats-value (push-server-diagnostics server) :client-exits)))
                               3.0)
@@ -358,10 +402,11 @@ Returns the last value of PRED."
                       (and (plusp (stats-value diag :client-exits))
                            (= (getf diag :clients) 1)
                            (every (lambda (rec) (getf rec :exited))
-                                  (getf diag :per-client)))))
-               (safe-close-socket c))))
+                                  (getf diag :per-client))))
+                    )
+               (safe-close-socket c)))
       (stop-server server)
-      (reset!))))
+      (reset!)))))
 
 (test "12. *push-server-log* captures accept / exit / error lines (nothing is silent)"
   (let ((server nil)
@@ -395,11 +440,11 @@ Returns the last value of PRED."
                                (search "accept client" log)
                                (search "exit" log)
                                (search "read-error" log)))
-                     (safe-close-socket c))))
+                     (safe-close-socket c)))
                (stop-server server)
                (drain)
                (and (search "stop" log) t))
-          (reset!))))))
+          (reset!)))))))
 
 ;;;; --- load profile (Q6): the first resource to saturate is one thread +
 ;;;; one fd per connection. Expected v1 load is a handful of clients
@@ -418,42 +463,421 @@ Returns the last value of PRED."
         (streams '())
         (result nil))
     (unwind-protect
-      (progn
-        (loop for i from 1 to n
-              do (let ((c (make-instance 'sb-bsd-sockets:inet-socket
-                                         :type :stream :protocol :tcp)))
-                   (sb-bsd-sockets:socket-connect c #(127 0 0 1) (push-server-port server))
-                   (push c sockets)
-                   (push (sb-bsd-sockets:socket-make-stream c :buffering :line :input t :output t)
-                         streams)))
-        ;; the accept loop must have registered every connection
-        (wait-for (lambda ()
-                    (>= (stats-value (push-server-diagnostics server) :accepted) n))
-                  5.0)
-        (loop for s in streams for i from 1 do (send-sexpr s (list 'load-test i)))
-        (let ((replies (loop for s in streams collect (read-or-eof s)))
-              (live-threads (length (threads-named "push-server-client")))
-              (fds-at-load (fd-count)))
-          (setf result
-                (and (= (stats-value (push-server-diagnostics server) :accepted) n)
-                     (= (getf (push-server-diagnostics server) :clients) n)
-                     (= (length replies) n)
-                     (every (lambda (r) (and (consp r) (eq (car r) 'load-test))) replies)
-                     ;; 1:1 scaling: one handler thread per connection
-                     (= live-threads n)
-                     ;; client-side + server-side fds bounded by connection count
-                     (<= fds-at-load (+ baseline (* 2 n) 2))))
-          ;; teardown under load: stop-server must unwind all n handler threads
-          (loop for s in streams do (close s))
-          (stop-server server)
-          (sleep 0.2)
-          (setf result (and result
-                            (null (threads-named "push-server"))
-                            (<= (fd-count) (+ baseline 2)))))
-      (loop for s in streams do (close s))
-      (loop for c in sockets do (safe-close-socket c))
-      (stop-server server))
+        (progn
+          (loop for i from 1 to n
+                do (let ((c (make-instance 'sb-bsd-sockets:inet-socket
+                                           :type :stream :protocol :tcp)))
+                     (sb-bsd-sockets:socket-connect c #(127 0 0 1) (push-server-port server))
+                     (push c sockets)
+                     (push (sb-bsd-sockets:socket-make-stream c :buffering :line :input t :output t)
+                           streams)))
+          ;; the accept loop must have registered every connection
+          (wait-for (lambda ()
+                      (>= (stats-value (push-server-diagnostics server) :accepted) n))
+                    5.0)
+          (loop for s in streams for i from 1 do (send-sexpr s (list 'subscribe :agent "load-A")))
+          (let ((replies (loop for s in streams collect (read-or-eof s)))
+                (live-threads (length (threads-named "push-server-client")))
+                (fds-at-load (fd-count)))
+            (setf result
+                  (and (= (stats-value (push-server-diagnostics server) :accepted) n)
+                       (= (getf (push-server-diagnostics server) :clients) n)
+                       (= (length replies) n)
+                       ;; every client got its (subscribed ...) race-closure reply
+                       (every (lambda (r) (and (consp r) (eq (car r) 'subscribed))) replies)
+                       ;; 1:1 scaling: one handler thread per connection
+                       (= live-threads n)
+                       ;; client-side + server-side fds bounded by connection count
+                       (<= fds-at-load (+ baseline (* 2 n) 2))))
+            ;; teardown under load: stop-server must unwind all n handler threads
+            (loop for s in streams do (close s))
+            (stop-server server)
+            (sleep 0.2)
+            (setf result (and result
+                              (null (threads-named "push-server"))
+                              (<= (fd-count) (+ baseline 2)))))
+        (loop for s in streams do (close s))
+        (loop for c in sockets do (safe-close-socket c))
+        (stop-server server))
     result)))
+
+;;;; --- subscribe protocol (plan tests 4 and 5, plus the negative surface) --
+;;
+;;;; Two things are proven here: the (subscribed ...) reply carries the correct
+;;;; resync cursor, and the bus listener is live — an emit-event after the reply
+;;;; reaches the client's queue.
+
+(test "14. subscribe replies (subscribed :agent A :cursor N) with cursor 0 for an unregistered agent"
+  (let ((server (start-server :port 0)))
+    (unwind-protect
+        (let* ((port (push-server-port server))
+               (c (make-instance 'sb-bsd-sockets:inet-socket
+                                  :type :stream :protocol :tcp)))
+          (sb-bsd-sockets:socket-connect c #(127 0 0 1) port)
+          (let ((stream (sb-bsd-sockets:socket-make-stream c
+                                                           :buffering :line
+                                                           :input t
+                                                           :output t)))
+            (unwind-protect
+                (progn
+                  (send-sexpr stream '(subscribe :agent "probe-A"))
+                  (let ((reply (read-or-eof stream 3.0)))
+                    (and (equal reply '(subscribed :agent "probe-A" :cursor 0))
+                         (plusp (stats-value (push-server-diagnostics server) :subscribes))
+                         (equal (getf (first-client-rec (push-server-diagnostics server))
+                                      :subscriptions)
+                                '("probe-A"))))
+                  )
+              (safe-close-socket c)))
+      (stop-server server)
+      (reset!)))))
+
+(test "15. the bus listener is live: emit-event after the (subscribed ...) reply enqueues the translated item"
+  (let ((server (start-server :port 0)))
+    (unwind-protect
+        (let* ((port (push-server-port server))
+               (c (make-instance 'sb-bsd-sockets:inet-socket
+                                  :type :stream :protocol :tcp)))
+          (sb-bsd-sockets:socket-connect c #(127 0 0 1) port)
+          (let ((stream (sb-bsd-sockets:socket-make-stream c
+                                                           :buffering :line
+                                                           :input t
+                                                           :output t)))
+            (unwind-protect
+                (progn
+                  (send-sexpr stream '(subscribe :agent "probe-A"))
+                  ;; the reply IS the race-closure signal: emitting before reading
+                  ;; it could lose the event, so the test must read first
+                  (let ((reply (read-or-eof stream 3.0)))
+                    (sexpr.kernel:emit-event "probe-A"
+                      (list :type :delta :agent-id "probe-A" :chunk-delta "hi"))
+                    (let ((rec (first-client-rec (push-server-diagnostics server))))
+                      (and (equal reply '(subscribed :agent "probe-A" :cursor 0))
+                           (= (getf rec :queue-length) 1)
+                           (= (getf rec :enqueued) 1)
+                           ;; the translation is exactly the wire item T03 will serialize
+                           (equal (getf rec :queue)
+                                  (list (list 'delta :agent "probe-A" :content "hi"))))))
+                  )
+              (safe-close-socket c)))
+      (stop-server server)
+      (reset!)))))
+
+(test "16. cursor is the transcript length of a REGISTERED agent (the resync cursor the client refetches from)"
+  (let ((server (start-server :port 0))
+        (agent (sexpr.kernel:make-agent :name "cursor-A" :goal "probe")))
+    (sexpr.transcript:append-event (sexpr.kernel:agent-transcript agent)
+                                   (sexpr.transcript:make-user-event "hello"))
+    (sexpr.transcript:append-event (sexpr.kernel:agent-transcript agent)
+                                   (sexpr.transcript:make-model-event "world"))
+    (sexpr.agents:register-agent! agent)
+    (unwind-protect
+        (let* ((port (push-server-port server))
+               (c (make-instance 'sb-bsd-sockets:inet-socket
+                                  :type :stream :protocol :tcp)))
+          (sb-bsd-sockets:socket-connect c #(127 0 0 1) port)
+          (let ((stream (sb-bsd-sockets:socket-make-stream c
+                                                           :buffering :line
+                                                           :input t
+                                                           :output t)))
+            (unwind-protect
+                (progn
+                  (send-sexpr stream '(subscribe :agent "cursor-A"))
+                  (equal (read-or-eof stream 3.0)
+                         '(subscribed :agent "cursor-A" :cursor 2)))
+              (safe-close-socket c)))
+      (sexpr.agents:deregister-agent! agent)
+      (stop-server server)
+      (reset!)))))
+
+(test "17. unsubscribe removes the listener — a later emit-event enqueues nothing"
+  (let ((server (start-server :port 0)))
+    (unwind-protect
+        (let* ((port (push-server-port server))
+               (c (make-instance 'sb-bsd-sockets:inet-socket
+                                  :type :stream :protocol :tcp)))
+          (sb-bsd-sockets:socket-connect c #(127 0 0 1) port)
+          (let ((stream (sb-bsd-sockets:socket-make-stream c
+                                                           :buffering :line
+                                                           :input t
+                                                           :output t)))
+            (unwind-protect
+                (progn
+                  (send-sexpr stream '(subscribe :agent "unsub-A"))
+                  (read-or-eof stream 3.0)
+                  (sexpr.kernel:emit-event "unsub-A"
+                    (list :type :delta :agent-id "unsub-A" :chunk-delta "one"))
+                  (send-sexpr stream '(unsubscribe :agent "unsub-A"))
+                  ;; the handler is on its own thread: wait for the subscription
+                  ;; list to drain before asserting the negative
+                  (wait-for (lambda ()
+                              (null (getf (first-client-rec (push-server-diagnostics server))
+                                          :subscriptions)))
+                            3.0)
+                  (let ((rec (first-client-rec (push-server-diagnostics server))))
+                    (and (= (getf rec :queue-length) 1)      ; the pre-unsubscribe event landed
+                         (null (getf rec :subscriptions))
+                         (plusp (stats-value (push-server-diagnostics server) :unsubscribes))
+                         (sexpr.kernel:emit-event "unsub-A"
+                           (list :type :delta :agent-id "unsub-A" :chunk-delta "two"))
+                         (= (getf (first-client-rec (push-server-diagnostics server))
+                                  :queue-length) 1)))
+                  )
+              (safe-close-socket c)))
+      (stop-server server)
+      (reset!)))))
+
+(test "18. a non-:delta event type is ignored, not enqueued (forward-compatible with S04/S05)"
+  (let ((server (start-server :port 0)))
+    (unwind-protect
+        (let* ((port (push-server-port server))
+               (c (make-instance 'sb-bsd-sockets:inet-socket
+                                  :type :stream :protocol :tcp)))
+          (sb-bsd-sockets:socket-connect c #(127 0 0 1) port)
+          (let ((stream (sb-bsd-sockets:socket-make-stream c
+                                                           :buffering :line
+                                                           :input t
+                                                           :output t)))
+            (unwind-protect
+                (progn
+                  (send-sexpr stream '(subscribe :agent "type-A"))
+                  (read-or-eof stream 3.0)
+                  (sexpr.kernel:emit-event "type-A"
+                    (list :type :finalize :agent-id "type-A" :content "done"))
+                  (let ((rec (first-client-rec (push-server-diagnostics server))))
+                    (and (zerop (getf rec :queue-length))
+                         (zerop (getf rec :enqueued))
+                         ;; the subscription itself is still live
+                         (equal (getf rec :subscriptions) '("type-A")))))
+              (safe-close-socket c)))
+      (stop-server server)
+      (reset!)))))
+
+;;;; --- negative tests for the protocol (Q7) --------------------------
+
+(test "19. malformed subscribe (missing or non-string :agent) is counted, not replied, and does not kill the connection"
+  (let ((server (start-server :port 0)))
+    (unwind-protect
+        (let* ((port (push-server-port server))
+               (c (make-instance 'sb-bsd-sockets:inet-socket
+                                  :type :stream :protocol :tcp)))
+          (sb-bsd-sockets:socket-connect c #(127 0 0 1) port)
+          (let ((stream (sb-bsd-sockets:socket-make-stream c
+                                                           :buffering :line
+                                                           :input t
+                                                           :output t)))
+            (unwind-protect
+                (progn
+                  (send-sexpr stream '(subscribe))            ; no :agent
+                  (send-sexpr stream '(subscribe :agent 42))  ; wrong type
+                  (send-sexpr stream '(unsubscribe))          ; no :agent
+                  (send-sexpr stream 42)                      ; not a list at all
+                  (wait-for (lambda ()
+                              (>= (stats-value (push-server-diagnostics server) :malformed) 4))
+                            3.0)
+                  (and (= (stats-value (push-server-diagnostics server) :malformed) 4)
+                       ;; nothing was replied to any of them
+                       (eq (read-or-eof stream 0.5) 'timeout)
+                       ;; and the connection is still usable
+                       (progn
+                         (send-sexpr stream '(subscribe :agent "probe-19"))
+                         (equal (read-or-eof stream 3.0)
+                                '(subscribed :agent "probe-19" :cursor 0))))
+                  )
+              (safe-close-socket c)))
+      (stop-server server)
+      (reset!)))))
+
+(test "20. unsubscribing something never subscribed is counted as :unknown-unsubscribe, not silently dropped"
+  (let ((server (start-server :port 0)))
+    (unwind-protect
+        (let* ((port (push-server-port server))
+               (c (make-instance 'sb-bsd-sockets:inet-socket
+                                  :type :stream :protocol :tcp)))
+          (sb-bsd-sockets:socket-connect c #(127 0 0 1) port)
+          (let ((stream (sb-bsd-sockets:socket-make-stream c
+                                                           :buffering :line
+                                                           :input t
+                                                           :output t)))
+            (unwind-protect
+                (progn
+                  (send-sexpr stream '(unsubscribe :agent "never-subscribed"))
+                  (wait-for (lambda ()
+                              (plusp (stats-value (push-server-diagnostics server) :unknown-unsubscribe)))
+                            3.0)
+                  (and (plusp (stats-value (push-server-diagnostics server) :unknown-unsubscribe))
+                       (eq (read-or-eof stream 0.5) 'timeout)
+                       (progn
+                         (send-sexpr stream '(subscribe :agent "probe-20"))
+                         (equal (read-or-eof stream 3.0)
+                                '(subscribed :agent "probe-20" :cursor 0))))
+                  )
+              (safe-close-socket c)))
+      (stop-server server)
+      (reset!)))))
+
+(test "21. hang up WITHOUT unsubscribe: the client's listeners are removed, not leaked into the bus"
+  (let ((server (start-server :port 0)))
+    (unwind-protect
+        (let* ((port (push-server-port server))
+               (c (make-instance 'sb-bsd-sockets:inet-socket
+                                  :type :stream :protocol :tcp)))
+          (sb-bsd-sockets:socket-connect c #(127 0 0 1) port)
+          (let ((stream (sb-bsd-sockets:socket-make-stream c
+                                                           :buffering :line
+                                                           :input t
+                                                           :output t)))
+            (unwind-protect
+                (progn
+                  (send-sexpr stream '(subscribe :agent "leak-A"))
+                  (read-or-eof stream 3.0)
+                  (sexpr.kernel:emit-event "leak-A"
+                    (list :type :delta :agent-id "leak-A" :chunk-delta "one"))
+                  (let ((before (getf (first-client-rec (push-server-diagnostics server))
+                                      :queue-length)))
+                    (safe-close-socket c)   ; gone, no (unsubscribe ...)
+                    (wait-for (lambda ()
+                                (plusp (stats-value (push-server-diagnostics server) :client-exits)))
+                              3.0)
+                    (let ((rec (first-client-rec (push-server-diagnostics server))))
+                      (and (= before 1)
+                           (plusp (stats-value (push-server-diagnostics server) :listeners-removed))
+                           (null (getf rec :subscriptions))
+                           ;; the listener is really gone from the bus: a later
+                           ;; emit must not enqueue into the dead client
+                           (sexpr.kernel:emit-event "leak-A"
+                             (list :type :delta :agent-id "leak-A" :chunk-delta "two"))
+                           (= (getf (first-client-rec (push-server-diagnostics server))
+                                    :queue-length) 1))))
+                  )
+              (safe-close-socket c)))
+      (stop-server server)
+      (reset!)))))
+
+(test "22. stop-server unsubscribes every listener: emit-event after stop is a no-op"
+  (let ((server (start-server :port 0)))
+    (unwind-protect
+        (let* ((port (push-server-port server))
+               (c (make-instance 'sb-bsd-sockets:inet-socket
+                                  :type :stream :protocol :tcp)))
+          (sb-bsd-sockets:socket-connect c #(127 0 0 1) port)
+          (let ((stream (sb-bsd-sockets:socket-make-stream c
+                                                           :buffering :line
+                                                           :input t
+                                                           :output t)))
+            (unwind-protect
+                (progn
+                  (send-sexpr stream '(subscribe :agent "stop-A"))
+                  (read-or-eof stream 3.0)
+                  (sexpr.kernel:emit-event "stop-A"
+                    (list :type :delta :agent-id "stop-A" :chunk-delta "one"))
+                  (stop-server server)
+                  (sleep 0.2)
+                  (and (null (gethash "stop-A" sexpr.kernel:*event-bus*))
+                       (sexpr.kernel:emit-event "stop-A"
+                         (list :type :delta :agent-id "stop-A" :chunk-delta "two"))
+                       (null (gethash "stop-A" sexpr.kernel:*event-bus*))
+                       (null (threads-named "push-server"))))
+              (safe-close-socket c)))
+      (reset!)))))
+
+;;;; --- load profile (Q6) at 10x, on the subscription path ------------
+;;
+;;;; The resource that saturates first at 10x is the PER-CLIENT QUEUE, not the
+;;;; socket or the thread count: a client that subscribes and never reads grows
+;;;; its queue with every delta. Expected v1 load is one subscribed client
+;;;; (single-operator loopback, MEM082); 10x is 10 concurrent subscribers, each
+;;;; fed 1000 deltas.
+;;
+;;;; Two things are asserted. First, the listener stays CHEAP: if it wrote to the
+;;;; socket directly (which S01/MEM084 forbids), 10 clients that never read would
+;;;; fill their socket buffers and emit-event would block forever. 10,000 enqueues
+;;;; completing in well under a second is the proof that the listener only touches
+;;;; the queue. Second, the queue is unbounded until T04 enforces the capacity —
+;;;; the breakpoint is documented and the capacity is visible per client in
+;;;; diagnostics so the protection T04 applies is observable now.
+
+(test "23. 10x subscription load: listener stays a cheap enqueue (never blocks), queue is the first resource to saturate"
+  (let ((server (start-server :port 0 :queue-capacity 64))
+        (n 10)
+        (events 1000)
+        (sockets '())
+        (streams '())
+        (elapsed 0.0)
+        (result nil))
+    (unwind-protect
+        (progn
+          (let ((port (push-server-port server)))
+            (loop for i from 1 to n
+                  do (let ((c (make-instance 'sb-bsd-sockets:inet-socket
+                                              :type :stream :protocol :tcp)))
+                       (sb-bsd-sockets:socket-connect c #(127 0 0 1) port)
+                       (push c sockets)
+                       (let ((s (sb-bsd-sockets:socket-make-stream c
+                                                    :buffering :line
+                                                    :input t
+                                                    :output t)))
+                         (push s streams)
+                         (send-sexpr s (list 'subscribe :agent "load-B"))
+                         ;; every subscriber must get its race-closure reply
+                         (unless (consp (read-or-eof s 3.0)) (return)))))
+            ;; 10 subscribers x 1000 events = 10,000 listener calls. A listener that
+            ;; touched the socket would block here on the full buffers.
+            (let ((start (get-internal-real-time)))
+              (loop for i from 1 to events
+                    do (sexpr.kernel:emit-event "load-B"
+                         (list :type :delta :agent-id "load-B" :chunk-delta (format nil "~A" i))))
+              (setf elapsed (/ (- (get-internal-real-time) start)
+                               internal-time-units-per-second)))
+            (let* ((diag (push-server-diagnostics server))
+                   (recs (getf diag :per-client)))
+              (setf result
+                    (and (= (length recs) n)
+                         ;; every client received every event: no loss, no blocking
+                         (every (lambda (rec) (= (getf rec :queue-length) events)) recs)
+                         (= (stats-value diag :subscribes) n)
+                         ;; the queue is the saturating resource, and its bound is visible
+                         (every (lambda (rec) (= (getf rec :queue-capacity) 64)) recs)
+                         ;; cheap-enqueue proof: 10k enqueues, no socket I/O, well under a second
+                         (< elapsed 1.0)
+                         ;; 1:1 thread scaling still holds
+                         (= (length (threads-named "push-server-client")) n))))))
+        (loop for s in streams do (close s))
+        (loop for c in sockets do (safe-close-socket c))
+        (stop-server server)
+        (reset!))
+    result))
+
+(test "24. the listener does not block the emitter: a slow subscriber cannot stall the kernel's emit path"
+  (let ((server (start-server :port 0 :queue-capacity 64))
+        (elapsed 0.0))
+    (unwind-protect
+        (let* ((port (push-server-port server))
+               (c (make-instance 'sb-bsd-sockets:inet-socket
+                                  :type :stream :protocol :tcp)))
+          (sb-bsd-sockets:socket-connect c #(127 0 0 1) port)
+          (let ((stream (sb-bsd-sockets:socket-make-stream c
+                                                           :buffering :line
+                                                           :input t
+                                                           :output t)))
+            (unwind-protect
+                (progn
+                  (send-sexpr stream '(subscribe :agent "slow-A"))
+                  (read-or-eof stream 3.0)
+                  ;; the client never reads a single byte from the socket
+                  (let ((start (get-internal-real-time)))
+                    (loop for i from 1 to 2000
+                          do (sexpr.kernel:emit-event "slow-A"
+                               (list :type :delta :agent-id "slow-A" :chunk-delta "x")))
+                    (setf elapsed (/ (- (get-internal-real-time) start)
+                                     internal-time-units-per-second)))
+                  (and (< elapsed 1.0)
+                       (= (getf (first-client-rec (push-server-diagnostics server))
+                                :queue-length) 2000)))
+              (safe-close-socket c))))
+      (stop-server server)
+      (reset!))))
+
 ;;;; --- summary -------------------------------------------------------
 
 (format t "~%~D tests, ~D passed, ~D failed~%"
