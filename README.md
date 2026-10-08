@@ -186,6 +186,7 @@ notes/
   symbolics-lisp.md    — Symbolics / Genera / Dynamic Windows lineage
   sbcl.md              — SBCL, Quicklisp, hot-patching, condition system, save-lisp-and-die
   sbcl-libs.md         — CL library survey mapped to the sexpr design
+  tui.md               — the remote TUI: cl-tuition client over Swank
 ```
 
 ## Design documents
@@ -201,6 +202,7 @@ research base it's synthesized from.
 | [`notes/agent.md`](notes/agent.md) | Survey of 2025–2026 AI agent harness architecture: the agent loop, context engineering (write/select/compress/isolate), tool dispatch, MCP, subagents, skills with progressive disclosure, and sandboxing. The "what we're translating" reference. |
 | [`notes/sbcl.md`](notes/sbcl.md) | SBCL and Quicklisp deep-dive: the live image, hot redefinition, the condition/restart system, `save-lisp-and-die` for whole-image snapshots, and Quicklisp as a dependency/skill distribution mechanism. The "our runtime substrate" reference. |
 | [`notes/sbcl-libs.md`](notes/sbcl-libs.md) | Library survey: maps the sexpr design onto existing Common Lisp libraries (ASDF, UIOP, cl-llm-provider, etc.), noting availability and fit. The "what already exists" reference. |
+| [`notes/tui.md`](notes/tui.md) | The remote TUI design: a cl-tuition client over a Swank wire, with a chat pane (Converse), an agent-management console (Peek), and a REPL pane (Listener) sharing a focused agent. Where `sexpr.tui` lives, what `:view :tui` projects, and the open tensions. Forward-looking — not the research base the others are. |
 
 ### How to read them
 
@@ -213,6 +215,9 @@ research base it's synthesized from.
    into Lisp.
 4. **`sbcl.md`** and **`sbcl-libs.md`** if you want the implementation substrate
    and what's already available in the CL ecosystem.
+5. **`tui.md`** for the remote interface design — where it lands in the image
+   (`sexpr.tui`), what the client holds (projections, never live objects), and
+   how the three panes map onto Genera's Converse / Peek / Listener.
 
 ## Development setup
 

@@ -30,6 +30,43 @@
 spawned subagents can inherit from the current agent (capabilities,
 endpoint, parent).")
 
+;;;; --- event bus ------------------------------------------------------
+;;;;
+;;;; A thread-safe hash table mapping agent-id strings to listener function
+;;;; lists. Agents run in threads, so the lock is essential: a listener may
+;;;; subscribe or unsubscribe while another thread is emitting.
+
+(defvar *event-bus* (make-hash-table :test 'equal)
+  "Hash table: agent-id string → list of listener functions.")
+(defvar *event-bus-lock* (sb-thread:make-mutex :name "event-bus")
+  "Lock protecting *event-bus* against concurrent access.")
+
+(defun emit-event (agent-id event)
+  "Call every listener registered under AGENT-ID with EVENT. Listeners are
+invoked in registration order. The lock is held only during the snapshot of
+the listener list, not during each call, so a listener that signals does not
+starve other listeners." (sb-thread:with-mutex (*event-bus-lock*)
+    (let ((listeners (gethash agent-id *event-bus*)))
+      (dolist (listener listeners)
+        (funcall listener event)))))
+(export 'emit-event)
+
+(defun subscribe-event-bus (agent-id listener)
+  "Register LISTENER (a function of one argument) under AGENT-ID. Subsequent
+calls to emit-event on that id will invoke LISTENER. Returns LISTENER for
+convenience. Thread-safe." (sb-thread:with-mutex (*event-bus-lock*)
+    (setf (gethash agent-id *event-bus*)
+          (cons listener (gethash agent-id *event-bus*)))
+    listener))
+(export 'subscribe-event-bus)
+
+(defun unsubscribe-event-bus (agent-id listener)
+  "Remove LISTENER from the listener list under AGENT-ID. If LISTENER is not
+registered, this is a no-op. Thread-safe." (sb-thread:with-mutex (*event-bus-lock*)
+    (setf (gethash agent-id *event-bus*)
+          (remove listener (gethash agent-id *event-bus*)))))
+(export 'unsubscribe-event-bus)
+
 ;;;; --- budget ---------------------------------------------------------
 ;;;;
 ;;;; DESIGN (notes/sexpr.md §2): a budget is a first-class object on an agent.

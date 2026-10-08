@@ -17,6 +17,11 @@
   (:nicknames :$.kernel)
   (:use :cl :sexpr.transcript)
   (:export
+   #:*event-bus*
+   #:*event-bus-lock*
+   #:emit-event
+   #:subscribe-event-bus
+   #:unsubscribe-event-bus
    #:budget
    #:make-budget
    #:budget-tokens

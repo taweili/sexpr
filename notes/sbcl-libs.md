@@ -101,7 +101,8 @@ Design note: **rove** is the chosen framework (wired as `:sexpr-tests` in `sexpr
 | Library | Role |
 |---|---|
 | **McCLIM** | The real prize: presentation types, output records, command tables, incremental redisplay — Genera's Dynamic Windows ideas, portable. Steep curve, but it *is* sexpr §4. Listener and inspector already exist in McCLIM |
-| **cl-charms** / **croatoan** (ncurses) | Terminal UI v1: budget meters, agent list, approval prompts |
+| **cl-tuition** | Terminal UI v1 (supersedes cl-charms/croatoan): pure-CL, TEA + CLOS, async commands, ships chat/tree/table/viewport/textarea/list + mouse zones — the sexpr remote TUI client (`notes/tui.md`). MIT |
+| **cl-charms** / **croatoan** (ncurses) | Fallback if cl-tuition's deps are unwanted; ncurses binding only |
 | **sb-aclrepl** / **linedit** | Decent native REPL quickly (line editing, history) |
 | **Sly/SLIME + slynk** | Day-one interface — presentations degrade to inspectable objects in the inspector; do not underestimate this as "v1 UI" |
 | **Spinneret / cl-who + hunchentoot** | Optional web dashboard (agent transcripts rendered as hypertext — Document Examiner-lite) |
@@ -149,7 +150,7 @@ cl-prevalence postmodern trivial-garbage fset
 ;; code tools
 cl-concrete-syntax-tree rove sb-cover
 ;; interface (v1)
-slynk cl-charms  ; McCLIM when ready for v2
+slynk cl-tuition  ; cl-charms/croatoan as fallback ; McCLIM when ready for v2
 ```
 
 ## 13. Sources
