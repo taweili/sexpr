@@ -31,6 +31,13 @@
    #:subagent-kill
    #:subagent-note
    #:agent-children
+   #:register-agent!
+   #:deregister-agent!
    #:register-multi-agent-tools!
    #:clear-subagent-registry!
-   #:find-handle))
+   #:find-handle
+   ;; *agent-table* is exported (M004/T03) so the sexpr.tui RPC layer can
+   ;; walk the society read-only (maphash/gethash) for agent-snapshot and
+   ;; transcript-delta. It is still maintained by register-agent!/deregister-,
+   ;; agent!; external packages should treat it as read-only.
+   #:*agent-table*))
