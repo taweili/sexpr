@@ -11,7 +11,7 @@ SBCLINIT  ?= $(HOME)/.sbclinit
 SYSTEM    := sexpr
 CHAT_ARGS ?= --goal "pair programmer"
 
-.PHONY: hello test load build chat verify diagnostic-tool-call diagnostic-live-round test-live clean help
+.PHONY: hello test load build chat verify verify-wrapper diagnostic-tool-call diagnostic-live-round test-live clean help
 
 hello:
 	$(SBCL) --non-interactive \
@@ -94,6 +94,13 @@ verify: build
 	@echo '[probe 5] R015 provider seam clean'
 	@! rg -q cl-llm-provider src/cli/
 	@echo 'ALL PROBES PASSED'
+
+# Wrapper-only checks: no SBCL, no ./sexpr build needed. Verifies that
+# ./sexpr.sh forwards all four built-in capabilities by default and that
+# the SEXPR_CAPABILITIES env override narrows the set. See
+# tools/check-default-capabilities.sh for the probe matrix.
+verify-wrapper:
+	@./tools/check-default-capabilities.sh
 
 clean:
 	rm -f ./sexpr
