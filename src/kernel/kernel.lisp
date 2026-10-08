@@ -277,6 +277,73 @@ calls the model returns is run-until-finished's job, not this one's."
                       :finish (getf node :finish))))
 (export 'model-step)
 
+;;;; --- streaming model step (D017) -----------------------------------
+;;;;
+;;;; D017 places the streaming loop in the KERNEL, not at the provider seam:
+;;;; the kernel is the only package that calls cl-llm-provider:complete-stream,
+;;;; and provider-call stays the only NON-streaming entry point. The loop
+;;;; pulls chunks via cl-llm-provider:read-stream-chunk and emits each
+;;;; chunk-delta to the event bus under the agent's name, so the push channel
+;;;; (S02) can forward fragments to the TUI without polling the transcript
+;;;; (D015). The final event is built from
+;;;; cl-llm-provider:stream-accumulated-content and
+;;;; cl-llm-provider:stream-tool-calls — the same plist shape model-step
+;;;; returns. Tool schemas are translated through
+;;;; sexpr.provider:translate-tool-schemas (the same construction site
+;;;; provider-call uses) so the transport's tool-definition type stays behind
+;;;; the provider seam; the endpoint resolves through
+;;;; sexpr.provider:*model-endpoint* exactly as provider-call resolves it.
+;;;; :model is NIL here because the transport's stream-model reader is not
+;;;; exported; :finish and :usage come from the final chunk.
+
+(defun model-step-streaming (agent)
+  "Streaming variant of model-step (D017): call the transport's streaming
+endpoint, emit each chunk to the event bus as a :delta event, and return a
+model event with the same shape as model-step.
+
+The kernel is the only package that calls cl-llm-provider:complete-stream
+(D017); provider-call stays the only NON-streaming entry point. Each chunk's
+delta is emitted to the event bus under (agent-name agent) so the push
+channel can forward fragments without polling (D015). The final event is
+built from stream-accumulated-content and stream-tool-calls — the same
+plist shape (:content / :tool-calls / :model / :usage / :finish) model-step
+returns. Tool schemas are translated through sexpr.provider:translate-tool-
+schemas; the endpoint resolves through sexpr.provider:*model-endpoint*,
+both by qualified call so the transport's types stay behind the provider
+seam. :model is NIL (the transport's stream-model reader is not exported);
+:finish and :usage come from the final chunk."
+  (let* ((endpoint (or (agent-endpoint agent)
+                       sexpr.provider:*model-endpoint*
+                       (setf sexpr.provider:*model-endpoint*
+                             (sexpr.provider:make-default-provider))))
+         (tools (sexpr.provider:translate-tool-schemas
+                 (sexpr.tools:tool-schema-list)))
+         (agent-id (agent-name agent))
+         (stream (cl-llm-provider:complete-stream
+                   (transcript-to-messages (agent-transcript agent))
+                   :provider endpoint
+                   :system (or (agent-system agent) (agent-goal agent))
+                   :tools tools))
+         (last-chunk nil))
+    (loop :for chunk = (cl-llm-provider:read-stream-chunk stream)
+          :while chunk
+          :do (setf last-chunk chunk)
+              (emit-event agent-id
+                          (list :type :delta
+                                :agent-id agent-id
+                                :chunk-delta (cl-llm-provider:chunk-delta chunk))))
+    (make-model-event
+     (cl-llm-provider:stream-accumulated-content stream)
+     :tool-calls (mapcar (lambda (tc)
+                           (list :id (cl-llm-provider:tool-call-id tc)
+                                 :name (cl-llm-provider:tool-call-name tc)
+                                 :arguments (cl-llm-provider:tool-call-arguments tc)))
+                         (cl-llm-provider:stream-tool-calls stream))
+     :model nil
+     :usage (when last-chunk (cl-llm-provider:chunk-usage last-chunk))
+     :finish (when last-chunk (cl-llm-provider:chunk-finish-reason last-chunk)))))
+(export 'model-step-streaming)
+
 (defun integrate (agent event)
   "Append EVENT to AGENT's transcript and return AGENT.
 

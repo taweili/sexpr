@@ -43,6 +43,7 @@
    #:make-agent
    #:spawn
    #:model-step
+   #:model-step-streaming
    #:integrate
    #:tool-round-p
    #:dispatch-tool-call
