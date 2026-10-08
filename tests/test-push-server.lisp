@@ -218,7 +218,8 @@ Returns the last value of PRED."
            (stop-server server)
            (stop-server server)
            (sleep 0.1)
-           (null (threads-named "push-server")))
+           (and (null (threads-named "push-server"))
+                (null (threads-named "push-writer"))))
       (reset!))))
 
 (test "5. stop-server does not hang when a client is still connected"
@@ -236,7 +237,8 @@ Returns the last value of PRED."
              ;; Clean up the client side.
              (safe-close-socket c)
              (and (push-server-stopped-p server)
-                  (null (threads-named "push-server"))))
+                  (null (threads-named "push-server"))
+                  (null (threads-named "push-writer"))))
       (reset!)))))
 
 (test "6. start-server signals on an invalid host address"
@@ -478,6 +480,7 @@ Returns the last value of PRED."
           (loop for s in streams for i from 1 do (send-sexpr s (list 'subscribe :agent "load-A")))
           (let ((replies (loop for s in streams collect (read-or-eof s)))
                 (live-threads (length (threads-named "push-server-client")))
+                (live-writers (length (threads-named "push-writer")))
                 (fds-at-load (fd-count)))
             (setf result
                   (and (= (stats-value (push-server-diagnostics server) :accepted) n)
@@ -487,6 +490,7 @@ Returns the last value of PRED."
                        (every (lambda (r) (and (consp r) (eq (car r) 'subscribed))) replies)
                        ;; 1:1 scaling: one handler thread per connection
                        (= live-threads n)
+                       (= live-writers n)
                        ;; client-side + server-side fds bounded by connection count
                        (<= fds-at-load (+ baseline (* 2 n) 2))))
             ;; teardown under load: stop-server must unwind all n handler threads
@@ -495,6 +499,7 @@ Returns the last value of PRED."
             (sleep 0.2)
             (setf result (and result
                               (null (threads-named "push-server"))
+                              (null (threads-named "push-writer"))
                               (<= (fd-count) (+ baseline 2)))))
         (loop for s in streams do (close s))
         (loop for c in sockets do (safe-close-socket c))
@@ -551,13 +556,14 @@ Returns the last value of PRED."
                   (let ((reply (read-or-eof stream 3.0)))
                     (sexpr.kernel:emit-event "probe-A"
                       (list :type :delta :agent-id "probe-A" :chunk-delta "hi"))
-                    (let ((rec (first-client-rec (push-server-diagnostics server))))
+                    (let ((item (read-or-eof stream 2.0))
+                          (rec (first-client-rec (push-server-diagnostics server))))
                       (and (equal reply '(subscribed :agent "probe-A" :cursor 0))
-                           (= (getf rec :queue-length) 1)
                            (= (getf rec :enqueued) 1)
-                           ;; the translation is exactly the wire item T03 will serialize
-                           (equal (getf rec :queue)
-                                  (list (list 'delta :agent "probe-A" :content "hi"))))))
+                           (equal item (list 'delta :agent "probe-A" :content "hi"))
+                           ;; drain invariant: delivered + queue-length - replies == enqueued
+                           (= (+ (getf rec :delivered) (getf rec :queue-length) -1)
+                              (getf rec :enqueued)))))
                   )
               (safe-close-socket c)))
       (stop-server server)
@@ -615,13 +621,13 @@ Returns the last value of PRED."
                                           :subscriptions)))
                             3.0)
                   (let ((rec (first-client-rec (push-server-diagnostics server))))
-                    (and (= (getf rec :queue-length) 1)      ; the pre-unsubscribe event landed
+                    (and (= (getf rec :enqueued) 1)          ; the pre-unsubscribe event landed
                          (null (getf rec :subscriptions))
                          (plusp (stats-value (push-server-diagnostics server) :unsubscribes))
                          (sexpr.kernel:emit-event "unsub-A"
                            (list :type :delta :agent-id "unsub-A" :chunk-delta "two"))
                          (= (getf (first-client-rec (push-server-diagnostics server))
-                                  :queue-length) 1)))
+                                  :enqueued) 1)))
                   )
               (safe-close-socket c)))
       (stop-server server)
@@ -734,7 +740,7 @@ Returns the last value of PRED."
                   (sexpr.kernel:emit-event "leak-A"
                     (list :type :delta :agent-id "leak-A" :chunk-delta "one"))
                   (let ((before (getf (first-client-rec (push-server-diagnostics server))
-                                      :queue-length)))
+                                      :enqueued)))
                     (safe-close-socket c)   ; gone, no (unsubscribe ...)
                     (wait-for (lambda ()
                                 (plusp (stats-value (push-server-diagnostics server) :client-exits)))
@@ -748,7 +754,7 @@ Returns the last value of PRED."
                            (sexpr.kernel:emit-event "leak-A"
                              (list :type :delta :agent-id "leak-A" :chunk-delta "two"))
                            (= (getf (first-client-rec (push-server-diagnostics server))
-                                    :queue-length) 1))))
+                                    :enqueued) 1))))
                   )
               (safe-close-socket c)))
       (stop-server server)
@@ -833,15 +839,19 @@ Returns the last value of PRED."
                    (recs (getf diag :per-client)))
               (setf result
                     (and (= (length recs) n)
-                         ;; every client received every event: no loss, no blocking
-                         (every (lambda (rec) (= (getf rec :queue-length) events)) recs)
+                         ;; every listener call enqueued: no loss, no blocking
+                         (every (lambda (rec) (= (getf rec :enqueued) events)) recs)
+                         ;; nothing lost between queue and socket (1 = the reply)
+                         (every (lambda (rec) (>= (+ (getf rec :delivered) (getf rec :queue-length) -1)
+                                                   (1- (getf rec :enqueued)))) recs)
                          (= (stats-value diag :subscribes) n)
                          ;; the queue is the saturating resource, and its bound is visible
                          (every (lambda (rec) (= (getf rec :queue-capacity) 64)) recs)
                          ;; cheap-enqueue proof: 10k enqueues, no socket I/O, well under a second
                          (< elapsed 1.0)
-                         ;; 1:1 thread scaling still holds
-                         (= (length (threads-named "push-server-client")) n))))))
+                         ;; 1:1 thread scaling still holds, now two threads per client
+                         (= (length (threads-named "push-server-client")) n)
+                         (= (length (threads-named "push-writer")) n))))))
         (loop for s in streams do (close s))
         (loop for c in sockets do (safe-close-socket c))
         (stop-server server)
@@ -872,11 +882,49 @@ Returns the last value of PRED."
                     (setf elapsed (/ (- (get-internal-real-time) start)
                                      internal-time-units-per-second)))
                   (and (< elapsed 1.0)
+                       ;; drain-aware: the writer may have drained part of the queue
                        (= (getf (first-client-rec (push-server-diagnostics server))
-                                :queue-length) 2000)))
+                                :enqueued) 2000)
+                       (>= (+ (getf (first-client-rec (push-server-diagnostics server))
+                                    :delivered)
+                              (getf (first-client-rec (push-server-diagnostics server))
+                                    :queue-length) -1)
+                           1999)))
               (safe-close-socket c))))
       (stop-server server)
       (reset!))))
+
+
+(test "25. end-to-end: a :delta emit-event reaches the client socket as a readable (delta ...) sexpr"
+  (let ((server (start-server :port 0))
+        (got nil))
+    (unwind-protect
+        (let* ((port (push-server-port server))
+               (c (make-instance 'sb-bsd-sockets:inet-socket
+                                  :type :stream :protocol :tcp)))
+          (sb-bsd-sockets:socket-connect c #(127 0 0 1) port)
+          (let ((stream (sb-bsd-sockets:socket-make-stream c
+                                                           :buffering :line
+                                                           :input t
+                                                           :output t)))
+            (unwind-protect
+                (progn
+                  (send-sexpr stream '(subscribe :agent "probe-A"))
+                  (let ((reply (read-or-eof stream 3.0)))
+                    (sexpr.kernel:emit-event "probe-A"
+                      (list :type :delta :agent-id "probe-A" :chunk-delta "hello"))
+                    ;; the writer drains on its own thread: bounded read, not an
+                    ;; assumption that the item is already on the wire
+                    (setf got (read-or-eof stream 2.0))
+                    (and (equal reply '(subscribed :agent "probe-A" :cursor 0))
+                         (equal got (list 'delta :agent "probe-A" :content "hello"))
+                         (getf (first-client-rec (push-server-diagnostics server))
+                               :writer-alive))))
+                  )
+              (safe-close-socket c)))
+      (stop-server server)
+      (reset!))
+    got))
 
 ;;;; --- summary -------------------------------------------------------
 

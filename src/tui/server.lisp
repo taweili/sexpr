@@ -2,8 +2,8 @@
 ;;;; src/tui/server.lisp — Push-channel TCP server for the remote TUI (M004/S02).
 ;;;;
 ;;;; BOUNDARY: this file is the in-image half of the push channel. It accepts
-;;;; TCP clients on a socket SEPARATE from Swank, and (in later tasks) pushes
-;;;; newline-delimited sexprs (`(delta …)` / `(resync …)`) to each subscribed
+;;;; TCP clients on a socket SEPARATE from Swank, and pushes
+;;;; newline-delimited sexprs (`(delta ...)` / `(resync ...)`) to each subscribed
 ;;;; client. The kernel's event bus is reached by QUALIFIED name
 ;;;; (sexpr.kernel:emit-event / subscribe-event-bus / unsubscribe-event-bus)
 ;;;; so the seam to the model layer stays single (R015). This file never
@@ -24,7 +24,9 @@
 ;;;; connected clients. Each client record is a plist with the accepted
 ;;;; socket, its handler thread, the protocol state added in T02 (the
 ;;;; subscription list, the bounded queue, and the locks guarding them),
-;;;; and the queue-capacity hint passed to start-server.
+;;;; and the queue-capacity hint passed to start-server. T03 adds a
+;;;; per-client writer thread that drains the queue and serializes items
+;;;; to the socket.
 ;;;;
 ;;;; LOCK ORDER (deadlock discipline — SBCL mutexes are not recursive):
 ;;;;   clients-lock  >  client subscriptions-lock  >  client queue-lock
@@ -37,6 +39,14 @@
 ;;;; queue-lock — never the event-bus lock, never the clients-lock. The
 ;;;; subscribe/unsubscribe handlers therefore call the event-bus OUTSIDE any
 ;;;; client lock, then record the pair under the subscriptions-lock.
+;;;;
+;;;; The write-lock (T03) serializes socket writes from the handler (subscribed
+;;;; reply) and the writer (delta items). Writer and handler never hold it while
+;;;; acquiring any other lock. The one nesting that exists is diagnostics:
+;;;;   clients-lock > write-lock   (push-server-diagnostics -> snapshot-delivered)
+;;;; which is safe because no thread ever holds the write-lock and then takes the
+;;;; clients-lock — the writer releases the queue-lock before taking the write-lock,
+;;;; and neither writer nor handler acquires the clients-lock at all.
 ;;;;
 ;;;; OBSERVABILITY (R007 failure-visibility): the accept loop and the client
 ;;;; handler run on their own threads, so a condition there cannot bubble to a
@@ -107,6 +117,7 @@ Protocol counters live in the same plist (T02): :subscribes, :unsubscribes,
 :malformed (a message that could not be dispatched: not a list, an unknown
 operator, or a subscribe/unsubscribe with a missing or non-string :agent),
 and :ignored (a well-formed message this server does not act on yet).
+:writer-errors (T03) counts writer-thread exits due to a socket/stream error.
 Every protocol message lands in exactly one of these counters — nothing is
 dropped silently."))
   (:documentation "A running push-channel TCP server."))
@@ -193,17 +204,26 @@ An exit outcome also bumps :client-exits and marks CLIENT :closed/:exited;
 NOT be called while already holding it (SBCL mutexes are not recursive). This
 is the failure-visibility path: a condition caught on a server thread cannot
 bubble to a caller, so it is counted here and readable through
-push-server-diagnostics."
+push-server-diagnostics.
+
+IDEMPOTENT for exit outcomes (T03): a client has two threads — the handler and
+the writer — and when one exits and closes the socket the other soon follows.
+Both call %record, but :client-exits and :exited are set only once (the first
+caller). The outcome counter (:write-error / :read-error / :clean-eof ...) is
+always incremented, so both outcomes are visible in the stats — a client whose
+writer detected the hang-up shows :write-error, and the handler's subsequent
+:read-error or :clean-eof is also counted, giving a fuller failure picture."
   (sb-thread:with-mutex ((push-server-clients-lock server))
     (let ((stats (push-server-stats server)))
       (incf (getf stats outcome 0))
       (unless (eq outcome :accepted)
         (when error (setf (getf stats :last-error) error))
         (when client
-          (setf (getf client :closed) t
-                (getf client :exited) t)
-          (incf (getf stats :client-exits 0))
-          (when error (setf (getf client :error) error))))))
+          (setf (getf client :closed) t)
+          (unless (getf client :exited)
+            (setf (getf client :exited) t)
+            (incf (getf stats :client-exits 0))
+            (when error (setf (getf client :error) error)))))))
   nil)
 
 (defun %log (server event detail)
@@ -240,9 +260,13 @@ loop and the client handlers saw."
                                           :queue-length (snapshot-queue-length c)
                                           :queue-capacity (getf c :queue-capacity)
                                           :queue (snapshot-queue c)
-                                          :enqueued (getf c :enqueued))))))
+                                          :enqueued (getf c :enqueued)
+                                          :delivered (snapshot-delivered c)
+                                          :writer-alive
+                                            (let ((wt (getf c :writer-thread)))
+                                              (and wt (sb-thread:thread-alive-p wt))))))))
 
-;;;; --- per-client protocol state (T02) ------------------------------
+;;;; --- per-client protocol state (T02 + T03) ------------------------
 ;;;;
 ;;;; The client record carries the protocol state added here:
 ;;;;   :subscriptions        list of (agent-id . listener) pairs
@@ -252,17 +276,24 @@ loop and the client handlers saw."
 ;;;;   :queue-capacity       the bound (start-server's queue-capacity)
 ;;;;   :queue-lock           guards the queue
 ;;;;   :enqueued             lifetime enqueue count (queue-lock)
+;;;;   :writer-thread        the sb-thread for push-writer-<n> (T03, set by handler)
+;;;;   :writer-stop          flag the handler/stop-server sets to ask writer to exit
+;;;;   :write-lock           serializes handler (subscribed) and writer (delta) writes
+;;;;   :stream               the socket-make-stream result (for diagnostics/cleanup)
+;;;;   :delivered            lifetime messages written to the socket (write-lock);
+;;;;                         enqueued == delivered + queue-length is the drain invariant
 ;;;;
 ;;;; THE DECOUPLING IS THE POINT (S01/MEM084): emit-event calls listeners
 ;;;; synchronously in the emitting thread — the kernel's agent loop. So the
 ;;;; listener must be a CHEAP enqueue under the queue-lock and must NEVER touch
 ;;;; the socket; blocking there would stall the agent. The writer thread (T03)
-;;;; is what drains the queue and writes to the socket.
+;;;; drains the queue and writes to the socket — that is the decoupling that
+;;;; protects the kernel.
 ;;;;
 ;;;; Capacity is stored per-client but not enforced yet: T04 adds the overflow
-;;;; check and the (resync ...) response. Until then the queue grows, which is
-;;;; exactly why the load-profile test names the queue as the first resource to
-;;;; saturate.
+;;;; check and the (resync ...) response. Until then the queue grows unbounded,
+;;;; which is exactly why the load-profile test names the queue as the first
+;;;; resource to saturate.
 
 (defun %enqueue (client item)
   "Append ITEM to CLIENT's FIFO queue under the queue-lock. O(1), no I/O.
@@ -281,6 +312,22 @@ holds a client lock and then the event-bus lock. Returns ITEM."
       (incf (getf client :enqueued)))
     item))
 
+(defun %dequeue (client)
+  "Remove and return the head item from CLIENT's FIFO queue under the
+queue-lock. O(1), no I/O. Returns NIL when the queue is empty.
+
+Only the queue-lock is taken (same constraint as %enqueue). The writer thread
+calls this in its drain loop; it never holds the write-lock while dequeuing."
+  (sb-thread:with-mutex ((getf client :queue-lock))
+    (let ((head (getf client :queue-head)))
+      (when head
+        (let ((item (car head)))
+          (setf (getf client :queue-head) (cdr head))
+          (when (null (getf client :queue-head))
+            (setf (getf client :queue-tail) nil))
+          (decf (getf client :queue-length))
+          item)))))
+
 (defun snapshot-queue (client)
   "The queue contents in FIFO order, under the queue-lock. Safe from any thread
   as long as the caller does not already hold the queue-lock; the diagnostics
@@ -293,6 +340,12 @@ holds a client lock and then the event-bus lock. Returns ITEM."
   "Queue depth under the queue-lock."
   (sb-thread:with-mutex ((getf client :queue-lock))
     (getf client :queue-length)))
+
+(defun snapshot-delivered (client)
+  "Lifetime count of messages written to this client's socket, under the
+  write-lock. enqueued == delivered + queue-length is the drain invariant."
+  (sb-thread:with-mutex ((getf client :write-lock))
+    (getf client :delivered)))
 
 (defun snapshot-subscriptions (client)
   "The agent-ids CLIENT is subscribed to, under the subscriptions-lock."
@@ -345,6 +398,28 @@ is what makes a push channel push."
     (prin1 object stream)
     (terpri stream)
     (force-output stream)))
+
+(defun %write-to-client (client stream object)
+  "Serialize one wire message to the client stream under the write-lock.
+
+Both the handler (for the (subscribed ...) reply) and the writer thread (for
+(delta ...) items from the queue) write to the same two-way socket stream. The
+write-lock serializes their output so two concurrent prin1+terpri+force-output
+calls never interleave a message. The lock is held only for the duration of one
+prin1/terpri/force-output — a few microseconds — so it never blocks the kernel's
+emit-event path (the handler and writer are server-side threads, not the kernel's
+agent thread).
+
+The write-lock is INDEPENDENT of the lock-order chain (clients-lock >
+subscriptions-lock > queue-lock): it is never held while acquiring any of those,
+and none of those are held while acquiring it."
+  (sb-thread:with-mutex ((getf client :write-lock))
+    (%write-sexpr stream object)
+    ;; T03: count what actually left the process. enqueued == delivered + queue-length
+    ;; is the no-loss invariant of the drain path — a test can tell "the writer drained
+    ;; it" from "the listener dropped it". Guarded by the write-lock (both the handler
+    ;; and the writer write), read via snapshot-delivered.
+    (incf (getf client :delivered))))
 
 (defun %cleanup-client (server client)
   "Unsubscribe every listener CLIENT registered. Called on disconnect (EOF or a
@@ -421,7 +496,8 @@ never the reverse."
            (let ((cursor (%cursor-for agent-id)))
              (%log server (format nil "client ~D subscribe" (getf client :id))
                    (format nil ":agent ~S :cursor ~D" agent-id cursor))
-             (%write-sexpr stream (list 'subscribed :agent agent-id :cursor cursor)))
+             (%write-to-client client stream
+               (list 'subscribed :agent agent-id :cursor cursor)))
            t)))
       ((:unsubscribe)
        (let ((agent-id (getf (cdr message) :agent)))
@@ -454,13 +530,15 @@ never the reverse."
              (format nil "~S" message))
        nil))))
 
-;;;; --- per-client thread (T02: the protocol handler) ----------------
+;;;; --- per-client threads (T02: protocol handler + T03: writer thread) -
 ;;;
-;;;; Reads newline-delimited sexprs from the client and dispatches them
-;;;; (subscribe / unsubscribe / ignore). The T01 echo is gone: an unknown sexpr
-;;;; is now IGNORED, not echoed, because S02's wire vocabulary is one-way except
-;;;; for the (subscribed ...) reply. The test suite asserts the new contract — no
-;;;; reply for an unknown message, and the connection stays alive.
+;;;; Two threads per client:
+;;;;   - the HANDLER (client-handler-loop) reads newline-delimited sexprs and
+;;;;     dispatches them (subscribe / unsubscribe / ignore). It writes the
+;;;;     (subscribed ...) reply directly under the write-lock.
+;;;;   - the WRITER (writer-loop, T03) drains the per-client queue and writes
+;;;;     (delta ...) items to the socket under the write-lock.
+;;;; Both use %write-to-client so their output never interleaves.
 ;;;
 ;;;; On any error (client gone, socket closed by stop-server) we clean up the
 ;;;; client's listeners, close our end, and return; the handler is expected to be
@@ -478,6 +556,67 @@ never the reverse."
 ;;;; `#.` must not evaluate code inside the image. The plan specified this for
 ;;;; T02's protocol read; it costs nothing here and the negative tests assert it.
 
+(defun writer-loop (server client stream)
+  "The writer thread body for one client (T03).
+
+Drains CLIENT's queue and serializes each item to STREAM as newline-delimited
+text. This is the decoupling point: the bus listener enqueues cheaply under the
+queue-lock (never touching the socket), and this thread is the sole writer of
+(delta ...) items to the socket. The handler thread writes (subscribed ...)
+replies directly under the write-lock; the writer uses the same lock so the two
+writers never interleave a message.
+
+Exit conditions:
+  - :writer-stop is set (by the handler on its own exit, or by stop-server).
+    The writer returns cleanly — the handler does the %record and socket close.
+  - A socket/stream error on write (the client hung up, or stop-server closed
+    the socket). The writer calls %cleanup-client (idempotent — if the handler
+    already cleaned up, this is a no-op), records a :write-error outcome via
+    %record (idempotent — only the first exit bumps :client-exits), and closes
+    the socket so the handler's blocked read unblocks next.
+
+The writer polls with a 5ms sleep when the queue is empty rather than blocking:
+a short poll is simpler and 5ms is well under the latency a human-perceptible
+delta stream needs. The poll is also what makes :writer-stop observable without
+a condition.
+
+The writer never takes the clients-lock or the subscriptions-lock. It takes the
+queue-lock (in %dequeue) and the write-lock (in %write-to-client), never nested."
+  (let ((err nil)
+        (errored nil))
+    (handler-case
+        (loop
+          (when (getf client :writer-stop)
+            (return))
+          (let ((item (%dequeue client)))
+            (cond
+              (item
+               (%write-to-client client stream item))
+              (t
+               ;; Queue empty: poll. 5ms is short enough that a delta reaches
+               ;; the client within one writer tick, long enough that an idle
+               ;; writer does not spin.
+               (sleep 0.005)))))
+      (error (e)
+        (setf err e
+              errored t)))
+    (when errored
+      ;; The writer hit a socket/stream error. Clean up listeners (idempotent)
+      ;; and record the outcome. The handler will also call %record, but
+      ;; %record is idempotent for :client-exits — only the first exit outcome
+      ;; increments it. Closing the socket unblocks the handler's read next.
+      (%count server :writer-errors)
+      (let ((removed (%cleanup-client server client)))
+        (when (plusp removed)
+          (%log server (format nil "writer ~D cleanup" (getf client :id))
+                (format nil "unsubscribed ~D listener(s)" removed))))
+      (%record server client :write-error err)
+      (%log server (format nil "writer ~D exit" (getf client :id))
+            (if err (format nil "~A (~A)" err :write-error)
+                (format nil "~A" :write-error)))
+      (close-socket-safe (getf client :socket)))
+    nil))
+
 (defun client-handler-loop (server client)
   "Run the client handler for one accepted connection.
 
@@ -491,7 +630,12 @@ into a dead client forever. Always closes the server side of the socket so a
 client that hung up mid-stream does not leak an fd, and marks the client record
 :closed so a concurrent stop-server iteration can skip it. The exit reason and
 the cleanup count are recorded on the server stats and logged when
-*push-server-log* is bound."
+*push-server-log* is bound.
+
+T03: after creating the stream, the handler stores it on the client record and
+spawns a per-client writer thread (push-writer-<n>) that drains the queue. On
+exit the handler sets :writer-stop and joins/terminates the writer before
+running its own cleanup."
   (let* ((socket (getf client :socket))
          (stream nil)
          (phase :open)
@@ -503,6 +647,15 @@ the cleanup count are recorded on the server stats and logged when
                                                           :buffering :line
                                                           :input t
                                                           :output t))
+          ;; Store the stream on the client record for diagnostics/cleanup, and
+          ;; spawn the writer thread (T03). The writer is the sole drainer of the
+          ;; queue and the sole writer of (delta ...) to the socket; the handler
+          ;; writes (subscribed ...) under the same write-lock.
+          (setf (getf client :stream) stream)
+          (setf (getf client :writer-thread)
+                (sb-thread:make-thread
+                  (lambda () (writer-loop server client stream))
+                  :name (format nil "push-writer-~D" (getf client :id))))
           (loop
             (setf phase :read)
             (let ((obj (read stream nil 'eof)))
@@ -517,6 +670,17 @@ the cleanup count are recorded on the server stats and logged when
                         ((:open) :open-error)
                         ((:read) :read-error)
                         ((:write) :write-error)))))
+    ;; Signal the writer to stop, then join it with a brief grace period.
+    ;; If the writer already exited (socket error), the join returns immediately.
+    ;; If it is blocked in a write to a dead socket, terminate-thread is the
+    ;; fallback (same pattern as the accept thread — see the shutdown comment).
+    (setf (getf client :writer-stop) t)
+    (let ((wt (getf client :writer-thread)))
+      (when (and wt (sb-thread:thread-alive-p wt))
+        (handler-case (sb-thread:join-thread wt :timeout 0.5) (error () nil)))
+      (when (and wt (sb-thread:thread-alive-p wt))
+        (handler-case (sb-thread:terminate-thread wt) (error () nil))
+        (handler-case (sb-thread:join-thread wt :timeout 0.5) (error () nil))))
     ;; Cleanup runs OUTSIDE any locked section: %cleanup-client takes the
     ;; subscriptions-lock and the event-bus lock, and %record takes the
     ;; clients-lock (SBCL mutexes are not recursive).
@@ -595,8 +759,13 @@ T02 adds the protocol state: the subscription list (agent-id . listener pairs),
 the FIFO queue of already-translated wire messages (head/tail so enqueue is O(1)
 under the queue-lock), and the locks guarding each. QUEUE-CAPACITY is copied from
 the server so the per-client bound is visible on the record itself; T04 enforces
-it and emits (resync ...). T03 adds the writer thread that drains the queue —
-until then the queue is filled by listeners and read only by diagnostics."
+it and emits (resync ...).
+
+T03 adds the writer thread and its lifecycle state:
+  :writer-thread   the sb-thread for push-writer-<n> (set by the handler)
+  :writer-stop     a flag the handler/stop-server sets to ask the writer to exit
+  :write-lock      serializes handler (subscribed) and writer (delta) writes
+  :stream          the socket-make-stream result (for diagnostics/cleanup)"
   (list :id id
         :socket socket
         :thread thread
@@ -606,8 +775,13 @@ until then the queue is filled by listeners and read only by diagnostics."
         :queue-capacity queue-capacity
         :queue-lock (sb-thread:make-mutex :name "push-server-client-queue")
         :enqueued 0
+        :delivered 0
         :subscriptions nil
         :subscriptions-lock (sb-thread:make-mutex :name "push-server-client-subs")
+        :writer-thread nil
+        :writer-stop nil
+        :write-lock (sb-thread:make-mutex :name "push-server-client-write")
+        :stream nil
         :closed nil
         :exited nil
         :error nil))
@@ -660,6 +834,7 @@ valid IPv4 address, or a specific non-zero PORT is already in use)."
                                         :clean-eof 0
                                         :read-error 0
                                         :write-error 0
+                                        :writer-errors 0
                                         :open-error 0
                                         :other-error 0
                                         :subscribes 0
@@ -694,6 +869,9 @@ does NOT reliably wake socket-accept in this SBCL):
   3. Unwind every thread via terminate-thread, then join with a
      short grace period. Terminate is the PRIMARY path here, not the
      last resort, because socket-close alone leaves accept blocked.
+     Each client has two threads (T03): the handler (:thread) and the
+     writer (:writer-thread). The writer is signaled to stop first,
+     then both are terminated/joined.
   4. Set `:stopped` so a second stop-server call is a no-op.
   5. If SERVER was *push-server*, clear the global, and log the shutdown when
      *push-server-log* is bound."
@@ -711,7 +889,12 @@ does NOT reliably wake socket-accept in this SBCL):
   ;; Step 3: unwind every thread. terminate-thread is the primary path
   ;; (see shutdown-order comment). Give each thread a brief grace period
   ;; to exit on its own via its own error handler; terminate if not.
+  ;; Each client has two threads: the handler (:thread) and the writer
+  ;; (:writer-thread, T03). Signal the writer to stop first so it can
+  ;; exit cleanly if it is polling; the socket close in step 1 will have
+  ;; already unblocked any blocked write.
   (dolist (client (push-server-clients server))
+    (setf (getf client :writer-stop) t)
     (let ((thread (getf client :thread)))
       (when (and thread (sb-thread:thread-alive-p thread))
         (handler-case
@@ -720,6 +903,15 @@ does NOT reliably wake socket-accept in this SBCL):
       (when thread
         (handler-case
             (sb-thread:join-thread thread :timeout 0.5)
+          (error () nil))))
+    (let ((wt (getf client :writer-thread)))
+      (when (and wt (sb-thread:thread-alive-p wt))
+        (handler-case
+            (sb-thread:terminate-thread wt)
+          (error () nil)))
+      (when wt
+        (handler-case
+            (sb-thread:join-thread wt :timeout 0.5)
           (error () nil)))))
   (let ((accept-thread (push-server-accept-thread server)))
     (when (and accept-thread (sb-thread:thread-alive-p accept-thread))
