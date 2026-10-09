@@ -77,6 +77,17 @@
 
 (sb-ext:unlock-package (find-package :sexpr.kernel))
 
+(defmacro with-stubbed-agent-loop (&body body)
+  "Run BODY with sexpr.kernel:agent-loop replaced by a no-op, so tests that
+  call spawn do not start real worker threads. Same trick tests 13/15/17 use
+  inline; :sexpr.kernel is unlocked above so fdefinition redefinition is legal."
+  `(let ((real-agent-loop (fdefinition 'sexpr.kernel:agent-loop)))
+     (setf (fdefinition 'sexpr.kernel:agent-loop)
+           (lambda (agent) (declare (ignore agent))))
+     (unwind-protect
+         (progn ,@body)
+       (setf (fdefinition 'sexpr.kernel:agent-loop) real-agent-loop))))
+
 ;;; --- helpers ---------------------------------------------------------
 
 (defun make-agent! (name &key goal (capabilities '(:fs-read :spawn))
@@ -99,6 +110,12 @@ a non-NIL endpoint."
   "Return the agent-snapshot entry with :name == NAME, or NIL."
   (find name (agent-snapshot)
         :key (lambda (e) (getf e :name))
+        :test #'string=))
+
+(defun snapshot-of-handle (handle-id)
+  "Return the agent-snapshot entry with :handle == HANDLE-ID, or NIL."
+  (find handle-id (agent-snapshot)
+        :key (lambda (e) (getf e :handle))
         :test #'string=))
 
 (defun serialize-round-trip (obj)
@@ -308,6 +325,95 @@ object isn't data-only the round-trip raises."
     (let ((pair (transcript-delta "root-1" 0))
           (copy (serialize-round-trip (transcript-delta "root-1" 0))))
       (equal pair copy))))
+
+;;;; --- T03: the :handle field ---------------------------------------
+
+(test "20. agent-snapshot includes :handle as a string for an agent registered through sexpr.tui:spawn"
+  (with-stubbed-agent-loop
+    (let* ((id (spawn "test goal"))
+           (entry (snapshot-of-handle id)))
+      (and (stringp id)
+           entry
+           (stringp (getf entry :handle))
+           (string= (getf entry :handle) id)
+           (string= id "subagent-1")))))
+
+(test "21. agent-snapshot :handle is NIL for an agent created directly in *agent-table* with no handle"
+  (make-agent! "root-1")
+  (let ((entry (snapshot-of "root-1")))
+    (and entry
+         (consp entry)
+         (null (getf entry :handle)))))
+
+(test "22. mixed society: the spawned agent has a handle string, the table-only agent has NIL"
+  (with-stubbed-agent-loop
+    (let* ((id (spawn "worker"))
+           (spawned (snapshot-of-handle id)))
+      (make-agent! "root-1")
+      (let ((plain (snapshot-of "root-1")))
+        (and (= (length (agent-snapshot)) 2)
+             (string= (getf spawned :handle) id)
+             (null (getf plain :handle)))))))
+
+(test "23. negative: :handle is resolved by agent identity, not by name — an agent NAMED like a handle ID still reads NIL"
+  (with-stubbed-agent-loop
+    (make-agent! "subagent-1")
+    (let* ((id (spawn "worker"))
+           (named (snapshot-of "subagent-1"))
+           (spawned (snapshot-of-handle id)))
+      (and (string= id "subagent-1")
+           named
+           (null (getf named :handle))
+           (string= (getf spawned :handle) id)))))
+
+(test "24. negative: a handle whose agent is not in the table adds no snapshot row and no false :handle"
+  (with-stubbed-agent-loop
+    (let* ((id (spawn "worker"))
+           (handle (sexpr.agents:find-handle id))
+           (agent (sexpr.agents:handle-agent handle)))
+      (sexpr.agents:deregister-agent! agent)
+      (and (= (length (agent-snapshot)) 0)
+           (= (hash-table-count (sexpr.tui::%agent-handle-index)) 1)))))
+
+(test "25. negative: an agent with no handle is absent from the index, so a non-empty registry does not leak a handle into its snapshot row"
+  (let ((registry (make-hash-table :test #'equal)))
+    (setf (gethash "ghost-1" registry)
+          (make-instance 'sexpr.agents:subagent-handle
+                         :id "ghost-1"
+                         :agent (sexpr.kernel:spawn :goal "real")))
+    (let ((index (sexpr.tui::%agent-handle-index registry)))
+      (and (= (hash-table-count index) 1)
+           ;; The table agent is not the ghost handle's agent, so it is absent
+           ;; from the index and the snapshot field reads NIL.
+           (null (gethash (make-agent! "root-1") index))))))
+
+(test "26. boundary: the snapshot stays data-only with :handle present — print/read round-trip preserves the string"
+  (with-stubbed-agent-loop
+    (let* ((id (spawn "worker"))
+           (snap (agent-snapshot))
+           (copy (serialize-round-trip snap)))
+      (and (equal snap copy)
+           (= (length snap) 1)
+           (stringp (getf (first snap) :handle))
+           (string= (getf (first snap) :handle) id)))))
+
+(test "27. 10x load: the index is built once per snapshot call and resolves all 10 handles by identity"
+  (with-stubbed-agent-loop
+    (let ((ids (loop for i from 1 to 10 collect (spawn (format nil "goal-~d" i)))))
+      (and (= (length ids) 10)
+           (= (hash-table-count sexpr.agents:*subagent-registry*) 10)
+           ;; One pass: the index has exactly one entry per handle.
+           (= (hash-table-count (sexpr.tui::%agent-handle-index)) 10)
+           ;; Every index entry is the same agent object find-handle returns —
+           ;; identity, not a name match.
+           (every (lambda (id)
+                    (let ((handle (sexpr.agents:find-handle id)))
+                      (eq (gethash (sexpr.agents:handle-agent handle)
+                                   (sexpr.tui::%agent-handle-index))
+                          (sexpr.agents:handle-id handle))))
+                  ids)
+           ;; Every snapshot row that exists carries a string handle.
+           (every (lambda (row) (stringp (getf row :handle))) (agent-snapshot))))))
 
 ;;; --- Summary --------------------------------------------------------
 

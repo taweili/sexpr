@@ -1,5 +1,5 @@
 ;;; SPDX-License-Identifier: GPL-3.0-or-later
-;;;; :sexpr.agents — multi-agent coordination primitives.
+;;;; :sexpr.agents - multi-agent coordination primitives.
 ;;;;
 ;;;; DESIGN (notes/sexpr.md §2): agents are lightweight processes sharing one
 ;;;; heap. The kernel provides the process model; this package adds the
@@ -11,7 +11,7 @@
 ;;;; are registered in :sexpr.tools' registry, but the package itself stays
 ;;;; free of transport types.
 ;;;;
-;;;; NOTE: :sexpr.transcript is NOT :use'd — reached by qualified name
+;;;; NOTE: :sexpr.transcript is NOT :use'd - reached by qualified name
 ;;;; (append-event, make-user-event, events-list, event-type, event-content)
 ;;;; so the package dependency stays minimal.
 
@@ -38,6 +38,11 @@
    #:find-handle
    ;; *agent-table* is exported (M004/T03) so the sexpr.tui RPC layer can
    ;; walk the society read-only (maphash/gethash) for agent-snapshot and
-   ;; transcript-delta. It is still maintained by register-agent!/deregister-,
+   ;; transcript-delta. It is still maintained by register-agent!/deregister-, 
    ;; agent!; external packages should treat it as read-only.
-   #:*agent-table*))
+   #:*agent-table*
+   ;; *subagent-registry* is exported for the same read-only reason (M004/T03):
+   ;; agent-snapshot needs the handle ID for each agent, and the only mapping
+   ;; from an agent object to its handle ID is this table. Callers must not
+   ;; write to it — use register-handle!/clear-subagent-registry!.
+   #:*subagent-registry*))
