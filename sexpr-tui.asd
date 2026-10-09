@@ -11,7 +11,7 @@
 ;;;; tests/test-tui-client.lisp, not by prose.
 ;;;;
 ;;;; Components are listed in load order and only files that exist are listed:
-;;;; T01 ships package, messages, wire. Later S03 tasks append swank-rpc, model,
+;;;; T01 ships package, messages, wire; T02 appends swank-rpc. Later S03 tasks add model,
 ;;;; view and main as their files land.
 
 (defsystem "sexpr-tui"
@@ -28,7 +28,8 @@
         :components
         ((:file "package")
          (:file "messages" :depends-on ("package"))
-         (:file "wire" :depends-on ("package" "messages"))))))))
+         (:file "wire" :depends-on ("package" "messages"))
+         (:file "swank-rpc" :depends-on ("package" "messages" "wire"))))))))
   ;; sb-bsd-sockets and sb-thread are SBCL built-ins reached by (require) inside
   ;; wire.lisp, exactly as src/tui/server.lisp does. They are deliberately NOT
   ;; in :depends-on so the system stays SBCL-internal rather than a Quicklisp

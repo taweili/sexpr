@@ -74,6 +74,44 @@
    #:rpc-result-msg-value
    #:rpc-result-msg-error
 
+   ;; --- swank RPC client (swank-rpc.lisp, T02) ---
+   #:swank-connection
+   #:make-swank-connection
+   #:new-swank-connection
+   #:swank-connection-host
+   #:swank-connection-port
+   #:swank-connection-socket
+   #:swank-connection-stream
+   #:swank-connection-next-id
+   #:swank-connection-stats
+   #:swank-connection-stats-lock
+   #:swank-connect
+   #:close-swank-connection
+   #:swank-eval
+   #:swank-read-reply
+   #:swank-value
+   #:swank-next-id
+   #:swank-packet-text
+   #:packet-header
+   #:write-packet
+   #:read-packet
+   #:parse-packet
+   #:classify-packet
+   #:byte-stream-p
+   #:utf8-bytes
+   #:utf8-to-string
+   #:swank-diagnostics
+   ;; stats access shared by tui-connection and swank-connection (T04's status bar
+   ;; reads either without knowing which struct it holds)
+   #:client-stats
+   #:client-stats-lock
+   #:client-port
+   #:client-label
+   #:client-stats-get
+   #:client-count!
+   #:client-note-error!
+   #:client-log!
+
    ;; --- model and entry point (added by later S03 tasks) ---
    #:tui-model
    #:main))
