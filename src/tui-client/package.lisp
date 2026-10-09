@@ -34,6 +34,7 @@
    #:tui-connection-stats-lock
    #:tui-connection-reader-thread
    #:tui-connection-on-message
+   #:make-client-connection
    #:connect-push
    #:write-wire
    #:read-wire
@@ -42,7 +43,10 @@
    #:close-connection
    #:tui-client-diagnostics
    #:stats-get
+   #:wire-operator
    #:*tui-client-log*
+   #:*client-stats-keys*
+   #:*wire-reader-thread-name*
 
    ;; --- message classes (messages.lisp) ---
    #:delta-msg

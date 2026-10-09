@@ -10,3 +10,8 @@
 cl-llm-provider
 eclector
 rove
+;; M004/S03: the client half of the TUI (system :sexpr-tui, ASDF name :tuition)
+;; is the only part of the project that depends on the TUI library. Keeping it here
+;; rather than in sexpr.asd is what keeps `ql:quickload :sexpr` free of a TUI
+;; dependency — see the system-boundary note in sexpr-tui.asd.
+cl-tuition

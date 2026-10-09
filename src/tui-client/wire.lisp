@@ -25,9 +25,11 @@
 ;;;;     inspect before this client understands them.
 ;;;;
 ;;;; SBCL-only: sb-bsd-sockets and sb-thread. Never :use :sb-bsd-sockets (the
-;;;; package is huge) — always reference by qualified name. Use
-;;;; make-instance 'sb-bsd-sockets:inet-socket, never the deprecated
-;;;; make-inet-socket (project deprecation invariant, asserted by the test suite).
+;;;; package is huge) — always reference by qualified name. Sockets are built with
+;;;; make-instance 'sb-bsd-sockets:inet-socket; the deprecated single-letter
+;;;; constructor form is not used anywhere in this package (project deprecation
+;;;; invariant, asserted by the test suite — which greps this package for that name,
+;;;; so this comment must not spell it out).
 ;;;;
 ;;;; FAILURE VISIBILITY (R007): the reader runs on its own thread, so a condition
 ;;;; there cannot bubble to a caller. Every condition is counted on the connection
@@ -172,7 +174,9 @@ path for a typo'd host."
 (defun connect-push (host port &key program on-message)
   "Open the push-channel connection to HOST:PORT.
 Uses make-instance 'sb-bsd-sockets:inet-socket + socket-connect +
-socket-make-stream :buffering :line — never the deprecated make-inet-socket.
+socket-make-stream :buffering :line — not the deprecated single-letter constructor
+form (the project deprecation invariant; the test suite greps this package for it,
+so this docstring does not spell it out).
 Line buffering is what makes the newline-delimited wire work: a payload is flushed
 on the newline, so the server sees one message per write.
 Failure path: connection refused, an unresolvable host, or a stream-open failure
@@ -243,7 +247,7 @@ Returns the form on success and counts :packets-read."
   (let ((stream (tui-connection-stream connection)))
     (handler-case
       (let ((form (let ((*read-eval* nil))
-                    (read stream nil nil)))
+                    (read stream nil nil))))
         (if (null form)
             (progn (%count! connection :connection-closed) nil)
             (progn (%count! connection :packets-read) form)))
@@ -362,7 +366,7 @@ appearing as a silent freeze."
 connection. Returns the thread. Starting the reader from init (not before run) is
 the rule: send drops messages until program-running is T (MEM103)."
   (let ((thread (sb-thread:make-thread (lambda () (%wire-reader-loop connection))
-                                       :name *wire-reader-thread-name)))
+                                       :name *wire-reader-thread-name*)))
     (setf (tui-connection-reader-thread connection) thread)
     (%log connection "reader started")
     thread))

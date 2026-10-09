@@ -28,7 +28,7 @@
         :components
         ((:file "package")
          (:file "messages" :depends-on ("package"))
-         (:file "wire" :depends-on ("package" "messages")))))))
+         (:file "wire" :depends-on ("package" "messages"))))))))
   ;; sb-bsd-sockets and sb-thread are SBCL built-ins reached by (require) inside
   ;; wire.lisp, exactly as src/tui/server.lisp does. They are deliberately NOT
   ;; in :depends-on so the system stays SBCL-internal rather than a Quicklisp
