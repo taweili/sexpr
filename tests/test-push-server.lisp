@@ -1252,6 +1252,259 @@ Returns the last value of PRED."
       (stop-server server)
       (reset!))))
 
+;;;; --- cleanup hardening (T05; plan tests 8, 9, 10) ----------------
+;;
+;;;; THE LEAK THIS SECTION PROTECTS: terminate-thread UNWINDS a thread, it does not
+;;;; let it finish. A handler blocked in `read` that is force-terminated never reaches
+;;;; its own cleanup, so every listener it registered survives the shutdown and the
+;;;; next emit-event for that agent enqueues into a dead client and writes to a closed
+;;;; socket (the S01 research pitfall). stop-server now unsubscribes every listener for
+;;;; every client itself, before unwinding the thread, so the guarantee holds whichever
+;;;; path wins — the handler exiting on its own is no longer load-bearing.
+;;
+;;;; EVERY NEGATIVE ASSERTION HERE HAS A POSITIVE CONTROL IN THE SAME TEST. A client
+;;;; that receives nothing is only proof of isolation if the same client still receives
+;;;; something when it should; otherwise the test passes trivially because the
+;;;; connection is broken. The controls are marked.
+
+(defun connect-and-subscribe (server agent-id)
+  "Connect a client, subscribe to AGENT-ID, and return (list socket stream reply).
+  The (subscribed ...) reply is the race-closure signal: reading it proves the listener
+  is already registered, so any emit-event after this point cannot be missed."
+  (let ((c (make-instance 'sb-bsd-sockets:inet-socket
+                          :type :stream :protocol :tcp)))
+    (sb-bsd-sockets:socket-connect c #(127 0 0 1) (push-server-port server))
+    (let ((s (sb-bsd-sockets:socket-make-stream c :buffering :line :input t :output t)))
+      (send-sexpr s (list 'subscribe :agent agent-id))
+      (list c s (read-or-eof s 3.0)))))
+
+(test "34. agent isolation (plan test 8): a client subscribed to iso-A receives nothing for iso-B"
+  (let ((server (start-server :port 0)))
+    (let* ((conn (connect-and-subscribe server "iso-A"))
+           (c (first conn)) (s (second conn)) (reply (third conn)))
+      (unwind-protect
+          (and
+           (wire-equal reply '(subscribed :agent "iso-A" :cursor 0))
+           ;; the client is subscribed to exactly one agent
+           (equal (getf (first-client-rec (push-server-diagnostics server))
+                        :subscriptions) '("iso-A"))
+           ;; emit to a DIFFERENT agent: nothing must come back
+           (progn
+            (sexpr.kernel:emit-event "iso-B"
+              (list :type :delta :agent-id "iso-B" :chunk-delta "not-for-you"))
+            (eq (read-or-eof s 0.5) 'timeout))
+           ;; POSITIVE CONTROL: the same client still receives its own agent's delta,
+           ;; so the isolation assertion is not passing because the connection is
+           ;; broken. The iso-B event also never touched this client's queue.
+           (progn
+            (sexpr.kernel:emit-event "iso-A"
+              (list :type :delta :agent-id "iso-A" :chunk-delta "hello"))
+            (let ((rec (first-client-rec (push-server-diagnostics server))))
+              (and (wire-equal (read-or-eof s 3.0)
+                               '(delta :agent "iso-A" :content "hello"))
+                   ;; only the iso-A delta was ever enqueued for this client
+                   (= (getf rec :enqueued) 1)
+                   (= (getf rec :dropped) 0)
+                   (>= (getf rec :delivered) 1)))))
+        (safe-close-socket c)))
+    (stop-server server)
+    (reset!)))
+
+(test "35. unsubscribe (plan test 9): a :delta emitted after (unsubscribe ...) reaches nothing"
+  (let ((server (start-server :port 0)))
+    (let* ((conn (connect-and-subscribe server "unsub-A"))
+           (c (first conn)) (s (second conn)) (reply (third conn)))
+      (unwind-protect
+          (and
+           (wire-equal reply '(subscribed :agent "unsub-A" :cursor 0))
+           (progn
+            (send-sexpr s (list 'unsubscribe :agent "unsub-A"))
+            ;; unsubscribe produces NO reply (S02's vocabulary is one-way except for
+            ;; (subscribed ...)), so the bus is the observable signal — wait for the
+            ;; handler to process it rather than assuming it already has.
+            (and (wait-for (lambda () (null (gethash "unsub-A" sexpr.kernel:*event-bus*)))
+                           3.0)
+                 (null (getf (first-client-rec (push-server-diagnostics server))
+                             :subscriptions))
+                 (plusp (stats-value (push-server-diagnostics server) :unsubscribes))))
+           ;; nothing arrives for a delta emitted after the unsubscribe
+           (progn
+            (sexpr.kernel:emit-event "unsub-A"
+              (list :type :delta :agent-id "unsub-A" :chunk-delta "after"))
+            (eq (read-or-eof s 0.5) 'timeout))
+           ;; POSITIVE CONTROL: re-subscribe and the delta arrives again, proving the
+           ;; connection and the writer are still alive.
+           (progn
+            (send-sexpr s (list 'subscribe :agent "unsub-A"))
+            (and (wire-equal (read-or-eof s 3.0)
+                             '(subscribed :agent "unsub-A" :cursor 0))
+                 (progn
+                  (sexpr.kernel:emit-event "unsub-A"
+                    (list :type :delta :agent-id "unsub-A" :chunk-delta "again"))
+                  (wire-equal (read-or-eof s 3.0)
+                              '(delta :agent "unsub-A" :content "again"))))))
+        (safe-close-socket c)))
+    (stop-server server)
+    (reset!)))
+
+(test "36. cleanup-leak (plan test 10): stop-server with a still-subscribed client leaves no listener and no thread"
+  (let ((server (start-server :port 0))
+        (sentinel nil)
+        (sentinel-fired '()))
+    (let* ((conn (connect-and-subscribe server "leak-A"))
+           (c (first conn)) (s (second conn)) (reply (third conn)))
+      (unwind-protect
+          (and
+           (wire-equal reply '(subscribed :agent "leak-A" :cursor 0))
+           (progn
+            ;; The sentinel is registered by the TEST, so it is still on the bus after
+            ;; stop-server. It proves emit-event still runs listeners: the assertion is
+            ;; that ONLY the sentinel fires, i.e. the server's listener is gone. Had
+            ;; stop-server only unwound the thread, the handler would have been
+            ;; terminated before its own cleanup ran and this listener would have been
+            ;; joined by the server's, writing to a socket that no longer exists.
+            (setf sentinel (lambda (e) (push e sentinel-fired)))
+            (sexpr.kernel:subscribe-event-bus "leak-A" sentinel)
+            ;; the client never unsubscribed and its socket is still open
+            (stop-server server)
+            (sexpr.kernel:emit-event "leak-A"
+              (list :type :delta :agent-id "leak-A" :chunk-delta "x"))
+            (and (= (length sentinel-fired) 1)
+                 ;; the bus holds ONLY the sentinel — no server listener survived
+                 (equal (gethash "leak-A" sexpr.kernel:*event-bus*) (list sentinel))
+                 (null (threads-named "push-server"))
+                 (null (threads-named "push-writer"))
+                 ;; the removal is counted, not merely observable through the hash
+                 (plusp (stats-value (push-server-diagnostics server)
+                                     :listeners-removed)))))
+        (safe-close-socket c)))
+    (reset!)))
+
+(test "37. hardening proof: a client whose handler cannot run its own cleanup still loses its listeners at stop-server"
+  ;; The deterministic form of the force-termination path: a client record registered on
+  ;; the server with NO handler thread at all, so nothing can run the disconnect cleanup.
+  ;; Before T05, stop-server only closed sockets and unwound threads, so this listener
+  ;; would have survived. Now stop-server's own per-client unsubscribe loop is the only
+  ;; thing that can remove it, so the test fails if that loop is removed.
+  (let ((server (start-server :port 0)))
+    (let ((client (sexpr.tui::make-client :id (+ 4 *synthetic-client-id*)))
+           (listener (lambda (e) (declare (ignore e)) nil)))
+      (sexpr.kernel:subscribe-event-bus "term-A" listener)
+      (push (cons "term-A" listener) (getf client :subscriptions))
+      (sb-thread:with-mutex ((sexpr.tui::push-server-clients-lock server))
+        (setf (sexpr.tui::push-server-clients server)
+              (cons client (sexpr.tui::push-server-clients server))))
+      (unwind-protect
+          (progn
+            (stop-server server)
+            (and (= (stats-value (push-server-diagnostics server) :listeners-removed) 1)
+                 (null (gethash "term-A" sexpr.kernel:*event-bus*))
+                 ;; the teardown is recorded even though no thread ever exited on its own
+                 (= (stats-value (push-server-diagnostics server) :stopped) 1)
+                 (push-server-stopped-p server)))
+        (reset!)))))
+
+(test "38. negative: stop-server is idempotent with listeners registered — no double removal, and a NIL server is a no-op"
+  (let ((server (start-server :port 0)))
+    (let* ((conn (connect-and-subscribe server "idem-A"))
+           (c (first conn)) (s (second conn)) (reply (third conn)))
+      (unwind-protect
+          (and
+           (wire-equal reply '(subscribed :agent "idem-A" :cursor 0))
+           (progn
+            (stop-server server)
+            (let ((first-count (stats-value (push-server-diagnostics server)
+                                            :listeners-removed)))
+              (and (= first-count 1)
+                   ;; second call is a no-op: same counters, same server handle back
+                   (eq server (stop-server server))
+                   (= (stats-value (push-server-diagnostics server) :listeners-removed)
+                      first-count)
+                   (null (gethash "idem-A" sexpr.kernel:*event-bus*))
+                   ;; a NIL server is a safe no-op too
+                   (null (stop-server nil))))))
+        (safe-close-socket c)))
+    (reset!)))
+
+(test "39. negative: a disconnect with several subscriptions removes ALL of them, not just the first"
+  (let ((server (start-server :port 0)))
+    (let ((c (make-instance 'sb-bsd-sockets:inet-socket
+                            :type :stream :protocol :tcp)))
+      (sb-bsd-sockets:socket-connect c #(127 0 0 1) (push-server-port server))
+      (let ((s (sb-bsd-sockets:socket-make-stream c :buffering :line :input t :output t)))
+        (unwind-protect
+            (progn
+              (loop for a in '("multi-1" "multi-2" "multi-3")
+                    do (progn
+                      (send-sexpr s (list 'subscribe :agent a))
+                      (read-or-eof s 3.0)))
+              ;; hang up without saying unsubscribe
+              (safe-close-socket c)
+              (and (wait-for (lambda ()
+                               (plusp (stats-value (push-server-diagnostics server)
+                                                   :listeners-removed)))
+                             5.0)
+                   ;; every subscription is gone from the bus
+                   (every (lambda (a) (null (gethash a sexpr.kernel:*event-bus*)))
+                          '("multi-1" "multi-2" "multi-3"))
+                   (= (stats-value (push-server-diagnostics server) :listeners-removed) 3)
+                   (null (threads-named "push-server"))
+                   (null (threads-named "push-writer"))))
+          (safe-close-socket c)))
+      (stop-server server)
+      (reset!))))
+
+(test "40. load profile (Q6) at 10x on the cleanup path: 10 clients x 2 subscriptions unwind in one bounded stop"
+  ;; The resource that saturates first at 10x on this path is THREADS, not memory: 10
+  ;; clients means 10 handlers + 10 writers + 1 accept = 21 threads, each of which has to
+  ;; be unwound. The protection is join-with-a-short-timeout plus terminate-thread as the
+  ;; fallback, which bounds the shutdown no matter how many clients are stuck: a client
+  ;; that never exits costs one grace period, not an unbounded wait. 10x is 10 concurrent
+  ;; clients (the expected v1 load is one, per MEM082).
+  (let ((server (start-server :port 0))
+        (n 10)
+        (sockets '())
+        (streams '())
+        (result nil))
+    (unwind-protect
+        (progn
+          (loop for i from 1 to n
+                do (let ((c (make-instance 'sb-bsd-sockets:inet-socket
+                                            :type :stream :protocol :tcp)))
+                     (sb-bsd-sockets:socket-connect c #(127 0 0 1) (push-server-port server))
+                     (push c sockets)
+                     (let ((s (sb-bsd-sockets:socket-make-stream c
+                                                  :buffering :line :input t :output t)))
+                       (push s streams)
+                       (loop for a in (list (format nil "load-E-~D" i) "load-E-shared")
+                             do (progn
+                               (send-sexpr s (list 'subscribe :agent a))
+                               (read-or-eof s 3.0))))))
+          (let ((start (get-internal-real-time)))
+            (stop-server server)
+            (setf result
+                  (and (= (stats-value (push-server-diagnostics server)
+                                      :listeners-removed) (* n 2))
+                       ;; bounded: 10 clients x 2 threads + accept, each with a 0.25s
+                       ;; grace period, is the worst case. Measured: 2.6s — the handlers
+                       ;; are blocked in read and a socket close does not wake a blocked
+                       ;; read syscall, so each one burns its full grace period. That is
+                       ;; the bounded cost of the guarantee, not a hang.
+                       (< (/ (- (get-internal-real-time) start)
+                             internal-time-units-per-second) 4.0)
+                       (null (threads-named "push-server"))
+                       (null (threads-named "push-writer"))
+                       (every (lambda (a) (null (gethash a sexpr.kernel:*event-bus*)))
+                              (append (loop for i from 1 to n
+                                            collect (format nil "load-E-~D" i))
+                                      '("load-E-shared")))
+                       ;; every client was accounted for in the shutdown counters
+                       (= (stats-value (push-server-diagnostics server) :client-exits) n))))
+          (loop for s in streams do (close s))
+          (loop for c in sockets do (safe-close-socket c)))
+      (reset!))
+    result))
+
 ;;;; --- summary -------------------------------------------------------
 
 (format t "~%~D tests, ~D passed, ~D failed~%"

@@ -64,6 +64,17 @@
 ;;;; terminate-thread every thread. This is not the ideal shutdown
 ;;;; (research preferred close-listen-first), but it is the ONLY reliable
 ;;;; one under this SBCL.
+;;;;
+;;;; T05 HARDENING — the leak this closes: terminate-thread UNWINDS a thread, it
+;;;; does not let it finish. A handler blocked in `read` that is force-terminated
+;;;; never reaches its own cleanup, so every listener it registered survives
+;;;; stop-server, and the next emit-event for that agent enqueues into a dead
+;;;; client and writes to a closed socket (the S01 research pitfall). The old
+;;;; stop-server relied on the handler exiting on its own after the socket close —
+;;;; that is a race, not a guarantee. stop-server now unsubscribes every listener
+;;;; for every client ITSELF, before unwinding the thread, so the guarantee holds
+;;;; whichever path wins. %cleanup-client is idempotent, so the handler's own
+;;;; cleanup and stop-server's cleanup can never double-remove.
 
 (defclass push-server ()
   ((listen-socket
@@ -119,7 +130,15 @@ operator, or a subscribe/unsubscribe with a missing or non-string :agent),
 and :ignored (a well-formed message this server does not act on yet).
 :writer-errors (T03) counts writer-thread exits due to a socket/stream error.
 Every protocol message lands in exactly one of these counters — nothing is
-dropped silently."))
+dropped silently.
+
+T05 shutdown counters live in the same plist. :listeners-removed counts listeners
+unsubscribed by a disconnect path OR by stop-server (a listener that is gone is
+gone once, so this is the total, not a per-path count). :stopped counts clients
+stop-server tore down without ever recording its own exit — a force-terminated
+thread never runs its own %record, so without this the shutdown would be
+invisible. :terminated counts threads stop-server had to force-terminate rather
+than join cleanly: the difference between a clean unwind and a forced one."))
   (:documentation "A running push-channel TCP server."))
 (export 'push-server)
 (export 'push-server-port)
@@ -180,7 +199,7 @@ loopback v1). Errors on malformed input."
         (sb-bsd-sockets:socket-close socket)
       (error () nil))))
 
-(defun %count (server key)
+(defun %count (server key &optional (amount 1))
   "Increment one protocol counter on the server stats plist.
 
 Acquires the clients-lock, so it must NOT be called while holding a client
@@ -188,9 +207,14 @@ lock (see the lock-order note at the top of this file). This is what makes an
 ignored or malformed message observable: the handler does not reply to either,
 so without a counter a dropped message would be indistinguishable from a bug.
 Protocol counters are not exit outcomes — they do not mark the client
-:closed/:exited, so use this rather than %record for them."
+:closed/:exited, so use this rather than %record for them.
+
+AMOUNT defaults to 1. %cleanup-client passes the number of listeners it removed so
+:listeners-removed counts LISTENERS, not clients: a client with three subscriptions
+must show three, otherwise a partial leak on a cleaned client would be invisible in
+the counter that exists precisely to make leaks visible."
   (sb-thread:with-mutex ((push-server-clients-lock server))
-    (incf (getf (push-server-stats server) key 0)))
+    (incf (getf (push-server-stats server) key 0) amount))
   nil)
 
 (defun %record (server client outcome error)
@@ -505,7 +529,8 @@ subscriptions-lock and the event-bus lock. Returns the number removed."
     (sb-thread:with-mutex ((getf client :subscriptions-lock))
       (setf (getf client :subscriptions) nil))
     (when (plusp (length pairs))
-      (%count server :listeners-removed))
+      ;; count LISTENERS removed, not clients cleaned — see %count
+      (%count server :listeners-removed (length pairs)))
     (length pairs)))
 
 (defun %op (symbol)
@@ -860,6 +885,33 @@ T03 adds the writer thread and its lifecycle state:
         :exited nil
         :error nil))
 
+;;;; --- shutdown (T05 hardening) ------------------------------------
+
+(defun %unwind-thread (thread grace)
+  "Unwind THREAD: join with a GRACE-second timeout, and if it is still alive
+  afterwards terminate-thread it and join again. Returns T when the thread had to
+  be FORCE-TERMINATED (it never ran its own cleanup), NIL when it exited on its own
+  or was already dead. Never signals.
+
+  Join-first is what gives a client thread the chance to run its own cleanup: the
+  caller has already closed the client socket, so a blocked read returns EOF or an
+  error and the handler can unsubscribe its listeners before returning. For the
+  accept thread join-first is a formality — in this SBCL closing the listen socket
+  does not reliably wake a blocked accept (see the shutdown note at the top of this
+  file), so the grace period expires and terminate-thread is what actually unwinds
+  it. Counting force-terminations is what makes that distinction observable: an
+  operator can tell a clean unwind from a forced one through
+  push-server-diagnostics."
+  (unless thread
+    (return-from %unwind-thread nil))
+  (when (sb-thread:thread-alive-p thread)
+    (handler-case (sb-thread:join-thread thread :timeout grace) (error () nil)))
+  (when (sb-thread:thread-alive-p thread)
+    (handler-case (sb-thread:terminate-thread thread) (error () nil))
+    (handler-case (sb-thread:join-thread thread :timeout grace) (error () nil))
+    (return-from %unwind-thread t))
+  nil)
+
 ;;;; --- public API ---------------------------------------------------
 
 (defun start-server (&key (port 0) (host "127.0.0.1")
@@ -917,6 +969,9 @@ valid IPv4 address, or a specific non-zero PORT is already in use)."
                                         :ignored 0
                                         :unknown-unsubscribe 0
                                         :listeners-removed 0
+                                        ;; T05 shutdown counters
+                                        :stopped 0
+                                        :terminated 0
                                         :last-error nil)))
            (thread
             (sb-thread:make-thread (lambda () (accept-loop server))
@@ -932,75 +987,85 @@ valid IPv4 address, or a specific non-zero PORT is already in use)."
 the threads. Idempotent — a second call on an already-stopped server
 is a safe no-op.
 
-Shutdown order (verified in probe3.lisp — closing the listen socket
-does NOT reliably wake socket-accept in this SBCL):
-  1. For each connected client, close the client socket. This lets the
-     client-handler thread's read return EOF (or error) so its
-     `unwind-protect` cleans up.
-  2. Close the LISTEN socket. This releases the fd; it does not
-     reliably unblock a thread in the accept syscall in this SBCL,
-     so step 3 does the actual unwinding.
-  3. Unwind every thread via terminate-thread, then join with a
-     short grace period. Terminate is the PRIMARY path here, not the
-     last resort, because socket-close alone leaves accept blocked.
-     Each client has two threads (T03): the handler (:thread) and the
-     writer (:writer-thread). The writer is signaled to stop first,
-     then both are terminated/joined.
-  4. Set `:stopped` so a second stop-server call is a no-op.
-  5. If SERVER was *push-server*, clear the global, and log the shutdown when
-     *push-server-log* is bound."
+Shutdown order (T05 hardening; probe3.lisp showed closing the listen socket
+alone does NOT reliably wake socket-accept in this SBCL):
+  1. Close the LISTEN socket first — releases the fd and stops new accepts, but
+     still does not reliably unblock a thread already in the accept syscall, so
+     step 4 has to unwind the accept thread.
+  2. Snapshot the client list under the clients-lock and RELEASE it. Per-client
+     cleanup takes the subscriptions-lock and the event-bus lock, and %count and
+     %record take the clients-lock — SBCL mutexes are not recursive, so the
+     clients-lock must not be held while cleaning up one client.
+  3. For EACH client, in order: unsubscribe every registered listener, signal the
+     writer to exit, close the client socket, then join each thread with a short
+     grace period (terminate-thread as the fallback). Unsubscribing BEFORE the
+     thread is unwound is the whole point of the hardening: a force-terminated
+     handler never runs its own cleanup, so a listener would survive the shutdown
+     and the next emit-event would write to a dead socket. %cleanup-client is
+     idempotent, so it is safe when the handler already cleaned up on its own.
+  4. Unwind the accept thread.
+  5. Record a :stopped outcome for any client that never recorded its own exit, and
+     count force-terminations in :terminated, so the shutdown is observable rather
+     than silent.
+  6. Set `:stopped` so a second stop-server call is a no-op, clear the client list,
+     clear *push-server* if this was the default server, and log the shutdown when
+     *push-server-log* is bound.
+
+Grace periods: 0.25s per client thread, 0.1s for the accept thread. A client whose
+socket close unblocks its read exits well inside the grace period; the accept thread
+usually does not (see above), so stop-server costs roughly 0.1s per call plus one
+grace period per thread that cannot be unwound cleanly. That is the price of a
+guaranteed no-leak shutdown rather than a racy one."
   (unless server
     (return-from stop-server nil))
   (when (push-server-stopped-p server)
     (return-from stop-server server))
-  ;; Step 1: close every client socket. The handler thread will unwind
-  ;; its handler-case with an EOF or socket error on the next read.
-  (sb-thread:with-mutex ((push-server-clients-lock server))
-    (dolist (client (push-server-clients server))
-      (close-socket-safe (getf client :socket))))
-  ;; Step 2: close the listen socket.
+  ;; Step 1: close the listen socket first — releases the fd and stops new accepts.
   (close-socket-safe (push-server-listen-socket server))
-  ;; Step 3: unwind every thread. terminate-thread is the primary path
-  ;; (see shutdown-order comment). Give each thread a brief grace period
-  ;; to exit on its own via its own error handler; terminate if not.
-  ;; Each client has two threads: the handler (:thread) and the writer
-  ;; (:writer-thread, T03). Signal the writer to stop first so it can
-  ;; exit cleanly if it is polling; the socket close in step 1 will have
-  ;; already unblocked any blocked write.
-  (dolist (client (push-server-clients server))
-    (setf (getf client :writer-stop) t)
-    (let ((thread (getf client :thread)))
-      (when (and thread (sb-thread:thread-alive-p thread))
-        (handler-case
-            (sb-thread:terminate-thread thread)
-          (error () nil)))
-      (when thread
-        (handler-case
-            (sb-thread:join-thread thread :timeout 0.5)
-          (error () nil))))
-    (let ((wt (getf client :writer-thread)))
-      (when (and wt (sb-thread:thread-alive-p wt))
-        (handler-case
-            (sb-thread:terminate-thread wt)
-          (error () nil)))
-      (when wt
-        (handler-case
-            (sb-thread:join-thread wt :timeout 0.5)
-          (error () nil)))))
-  (let ((accept-thread (push-server-accept-thread server)))
-    (when (and accept-thread (sb-thread:thread-alive-p accept-thread))
-      (handler-case
-          (sb-thread:terminate-thread accept-thread)
-        (error () nil)))
-    (when accept-thread
-      (handler-case
-          (sb-thread:join-thread accept-thread :timeout 0.5)
-        (error () nil))))
-  (setf (push-server-clients server) nil)
-  (setf (push-server-stopped-p server) t)
-  (setf (push-server-accept-thread server) nil)
-  (when (eq server *push-server*)
-    (setf *push-server* nil))
-  (%log server "stop" (format nil "clients closed: ~D" (getf (push-server-stats server) :client-exits 0)))
+  ;; Step 2: snapshot the client list, then RELEASE the clients-lock. %cleanup-client
+  ;; and %record take it (directly or through %count), so it must not be held here.
+  (let ((clients (sb-thread:with-mutex ((push-server-clients-lock server))
+                   (copy-list (push-server-clients server))))
+        (unwound 0)
+        (forced 0))
+    (dolist (client clients)
+      ;; Step 3a: unsubscribe every listener this client registered, BEFORE the
+      ;; thread is unwound. Idempotent — safe when the handler already cleaned up.
+      (let ((removed (%cleanup-client server client))
+            (already-exited (getf client :exited)))
+        (when (plusp removed)
+          (%log server (format nil "stop client ~D" (getf client :id))
+                (format nil "unsubscribed ~D listener(s)" removed)))
+        ;; Step 3b: signal the writer, close the socket (this is what unblocks a
+        ;; blocked read or write so the thread can exit on its own), then unwind.
+        (setf (getf client :writer-stop) t)
+        (close-socket-safe (getf client :socket))
+        (incf unwound)
+        (when (%unwind-thread (getf client :writer-thread) 0.25)
+          (incf forced)
+          (%count server :terminated))
+        (when (%unwind-thread (getf client :thread) 0.25)
+          (incf forced)
+          (%count server :terminated))
+        ;; Step 5: a force-terminated thread never ran its own %record, so without
+        ;; this the shutdown would be invisible. %record is idempotent for
+        ;; :client-exits, so a client that exited cleanly is not double counted.
+        (unless already-exited
+          (%record server client :stopped nil))))
+    ;; Step 4: unwind the accept thread. Join-first is a formality here — closing
+    ;; the listen socket does not reliably wake a blocked accept in this SBCL.
+    (when (%unwind-thread (push-server-accept-thread server) 0.1)
+      (incf forced)
+      (%count server :terminated))
+    (setf (push-server-clients server) nil)
+    (setf (push-server-stopped-p server) t)
+    (setf (push-server-accept-thread server) nil)
+    (when (eq server *push-server*)
+      (setf *push-server* nil))
+    (%log server "stop"
+          (format nil "clients: ~D, listeners removed: ~D, force-terminated: ~D"
+                  unwound
+                  (getf (push-server-stats server) :listeners-removed 0)
+                  forced)))
   server)
 (export 'stop-server)
