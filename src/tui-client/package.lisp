@@ -1,0 +1,75 @@
+;;; SPDX-License-Identifier: GPL-3.0-or-later
+;;;; :sexpr-tui — the remote TUI client process (M004/S03).
+;;;;
+;;;; BOUNDARY: this package lives in the CLIENT process. That process does not
+;;;; quickload :sexpr, so no sexpr.* package exists here — :use is exactly
+;;;; (:cl :tuition) and must stay that way. The client reaches the image only
+;;;; through the wire (the push channel) and through swank packet TEXT that
+;;;; names sexpr.tui RPCs; it never calls a sexpr function directly.
+;;;;
+;;;; Everything the client holds is DATA: names, cursors, plists, strings and
+;;;; message objects (R023). A picked agent is a string, not an agent object.
+;;;;
+;;;; R015 invariant: the provider transport is never named here, and the client
+;;;; never reaches kernel internals — it names sexpr.tui RPCs by qualified name
+;;;; inside the packet text it builds.
+
+(defpackage :sexpr-tui
+  (:use :cl :tuition)
+  ;; :tuition exports #:quit (the TEA quit message sender) and CL exports #:quit.
+  ;; A package that :use's both sees QUIT as AMBIGUOUS, so the client package
+  ;; shadows it: unqualified `quit` is the client's own symbol, and both meanings
+  ;; are reachable by qualified name. Without this the client cannot call either.
+  (:shadow #:quit)
+  (:export
+   ;; --- connection (wire.lisp) ---
+   #:tui-connection
+   #:make-tui-connection
+   #:tui-connection-host
+   #:tui-connection-port
+   #:tui-connection-socket
+   #:tui-connection-stream
+   #:tui-connection-program
+   #:tui-connection-stats
+   #:tui-connection-stats-lock
+   #:tui-connection-reader-thread
+   #:tui-connection-on-message
+   #:connect-push
+   #:write-wire
+   #:read-wire
+   #:decode-wire
+   #:start-wire-reader
+   #:close-connection
+   #:tui-client-diagnostics
+   #:stats-get
+   #:*tui-client-log*
+
+   ;; --- message classes (messages.lisp) ---
+   #:delta-msg
+   #:make-delta-msg
+   #:delta-msg-agent
+   #:delta-msg-content
+   #:resync-msg
+   #:make-resync-msg
+   #:resync-msg-agent
+   #:resync-msg-cursor
+   #:subscribed-msg
+   #:make-subscribed-msg
+   #:subscribed-msg-agent
+   #:subscribed-msg-cursor
+   #:wire-ignored-msg
+   #:make-wire-ignored-msg
+   #:wire-ignored-msg-op
+   #:wire-ignored-msg-form
+   #:connection-closed-msg
+   #:make-connection-closed-msg
+   #:connection-closed-msg-reason
+   #:rpc-result-msg
+   #:make-rpc-result-msg
+   #:rpc-result-msg-form
+   #:rpc-result-msg-value
+   #:rpc-result-msg-error
+
+   ;; --- model and entry point (added by later S03 tasks) ---
+   #:tui-model
+   #:main))
