@@ -15,6 +15,10 @@
 ;;;; the writer thread yet — in T02 the listener fills the queue and nothing
 ;;;; drains it, which is exactly what makes the queue observable from a test.
 
+;;;; T04 adds the bounded-queue backpressure: a client that stops reading gets a
+;;;; single (resync :agent A :cursor N) per overflow burst instead of an unbounded
+;;;; queue, and the pending fragments are dropped. Tests 26-31 below prove it.
+
 (unless (find-package :ql)
   (load (merge-pathnames "~/.sbclinit" (user-homedir-pathname))))
 (ql:quickload "sexpr")
@@ -839,8 +843,18 @@ Returns the last value of PRED."
                    (recs (getf diag :per-client)))
               (setf result
                     (and (= (length recs) n)
-                         ;; every listener call enqueued: no loss, no blocking
-                         (every (lambda (rec) (= (getf rec :enqueued) events)) recs)
+                         ;; T04: a stalled client is BOUNDED, not lossless. Every event
+                         ;; is accounted for as enqueued or dropped — never silently lost. Note
+                         ;; :enqueued counts the marker too, so the accounting is
+                         ;; (deltas enqueued) + dropped == events.
+                         (every (lambda (rec) (= (+ (getf rec :enqueued) (getf rec :dropped)
+                                    (- (getf rec :resyncs)))
+                              events))
+                         recs)
+                         ;; the queue is still the first resource to saturate, and now it
+                         ;; saturates at capacity + the single resync marker
+                         (every (lambda (rec) (<= (getf rec :queue-length) (1+ (getf rec :queue-capacity)))) recs)
+                         (every (lambda (rec) (> (getf rec :dropped) 0)) recs)
                          ;; nothing lost between queue and socket (1 = the reply)
                          (every (lambda (rec) (>= (+ (getf rec :delivered) (getf rec :queue-length) -1)
                                                    (1- (getf rec :enqueued)))) recs)
@@ -881,15 +895,19 @@ Returns the last value of PRED."
                                (list :type :delta :agent-id "slow-A" :chunk-delta "x")))
                     (setf elapsed (/ (- (get-internal-real-time) start)
                                      internal-time-units-per-second)))
-                  (and (< elapsed 1.0)
-                       ;; drain-aware: the writer may have drained part of the queue
-                       (= (getf (first-client-rec (push-server-diagnostics server))
-                                :enqueued) 2000)
-                       (>= (+ (getf (first-client-rec (push-server-diagnostics server))
-                                    :delivered)
-                              (getf (first-client-rec (push-server-diagnostics server))
-                                    :queue-length) -1)
-                           1999)))
+                  (let ((rec (first-client-rec (push-server-diagnostics server))))
+                    (and (< elapsed 1.0)
+                         ;; T04: the stalled client is bounded, not lossless — the
+                         ;; emitter still saw all 2000 events, they just landed in
+                         ;; the queue or the dropped counter
+                         (= (+ (getf rec :enqueued) (getf rec :dropped) (- (getf rec :resyncs)))
+                            2000)
+                         (> (getf rec :dropped) 0)
+                         (<= (getf rec :queue-length) (1+ (getf rec :queue-capacity)))
+                         ;; drain-aware: the writer may have drained part of the queue
+                         ;; (1 = the (subscribed ...) reply, 1 = an item in flight)
+                         (>= (+ (getf rec :delivered) (getf rec :queue-length) -1)
+                             (1- (getf rec :enqueued))))))
               (safe-close-socket c))))
       (stop-server server)
       (reset!))))
@@ -925,6 +943,314 @@ Returns the last value of PRED."
       (stop-server server)
       (reset!))
     got))
+
+(defun read-until-quiet (stream &key (timeout-seconds 1.5) (max 64))
+  "Collect messages from STREAM until a read times out (the writer has drained
+  everything it can) or MAX messages are read. Returns the list in arrival order.
+  Used by the resync tests: a stalled client reads its whole burst at once, so the
+  received set is what the writer actually delivered."
+  (let ((out nil))
+    (loop
+      (when (>= (length out) max) (return))
+      (let ((obj (read-or-eof stream timeout-seconds)))
+        (when (or (eq obj 'eof) (eq obj 'timeout) (eq obj 'closed)) (return))
+        (push obj out)))
+    (nreverse out)))
+
+(defun wire-equal (a b)
+  "Compare two wire messages by SYMBOL-NAME rather than EQ.
+  The server's listener interns its operator symbols in :sexpr.tui while this test
+  package interns them locally, so plain EQUAL on a message read from the socket can
+  fail for the wrong reason. Comparing names is the package-independent contract —
+  the same reason %op dispatches by name."
+  (cond
+    ((and (symbolp a) (symbolp b)) (string= (symbol-name a) (symbol-name b)))
+    ((and (consp a) (consp b)) (and (wire-equal (car a) (car b))
+                                    (wire-equal (cdr a) (cdr b))))
+    (t (equal a b))))
+
+(defparameter *synthetic-client-id* 900
+  "Ids for client records built with make-client outside the accept loop. Tests
+  27-29 drive %enqueue-backpressured directly so the capacity decision is
+  deterministic: no writer thread is draining these queues concurrently, which is
+  the only way to assert the exact boundary (the Nth vs N+1th item). The wire path
+  itself is proven by test 26 through the real accept loop.")
+
+;;;; --- resync / bounded-queue backpressure (T04, plan test 7) ---------
+
+(test "26. resync proof (plan test 7): a stalled client gets one (resync ...) and dropped deltas, not an unbounded queue"
+  (let ((server (start-server :port 0 :queue-capacity 4))
+        (emitted 40)
+        (received nil))
+    (unwind-protect
+        (let* ((port (push-server-port server))
+               (c (make-instance 'sb-bsd-sockets:inet-socket
+                                  :type :stream :protocol :tcp)))
+          (sb-bsd-sockets:socket-connect c #(127 0 0 1) port)
+          (let ((stream (sb-bsd-sockets:socket-make-stream c
+                                                           :buffering :line
+                                                           :input t
+                                                           :output t)))
+            (unwind-protect
+                (progn
+                  (send-sexpr stream '(subscribe :agent "probe-R"))
+                  (let ((reply (read-or-eof stream 3.0)))
+                    ;; the client reads nothing after the reply: the queue fills to
+                    ;; capacity and the overflow path is what runs
+                    (loop for i from 1 to emitted
+                          do (sexpr.kernel:emit-event "probe-R"
+                               (list :type :delta :agent-id "probe-R"
+                                     :chunk-delta (format nil "d~A" i))))
+                    (setf received (read-until-quiet stream))
+                    (let ((rec (first-client-rec (push-server-diagnostics server)))
+                          (deltas (count-if (lambda (m) (equal (symbol-name (car m)) "DELTA"))
+                                            received))
+                          (resyncs (count-if (lambda (m) (equal (symbol-name (car m)) "RESYNC"))
+                                             received)))
+                      (and (wire-equal reply '(subscribed :agent "probe-R" :cursor 0))
+                           ;; the plan asserts resync is SENT, not that the cursor jumped
+                           (>= resyncs 1)
+                           ;; fragments were dropped: fewer arrived than were emitted
+                           (< deltas emitted)
+                           (> (getf rec :dropped) 0)
+                           ;; the bound: capacity fragments + the single marker
+                           (<= (getf rec :queue-length) (1+ (getf rec :queue-capacity)))
+                           (= (getf rec :queue-capacity) 4)
+                           ;; every arrived message is a well-formed wire message for probe-R
+                           (every (lambda (m) (and (consp m)
+                                                   (member (symbol-name (car m)) '("DELTA" "RESYNC")
+                                                       :test #'string=)
+                                                   (string= (getf (cdr m) :agent) "probe-R")))
+                                  received))))))
+              (safe-close-socket c)))
+      (stop-server server)
+      (reset!))
+    received))
+
+(test "27. capacity boundary: exactly queue-capacity items enqueue; the capacity+1th is dropped and becomes the marker"
+  (let ((client (sexpr.tui::make-client :id *synthetic-client-id* :queue-capacity 4)))
+    (loop for i from 1 to 4
+          do (sexpr.tui::%enqueue-backpressured client "edge-A"
+               (list 'delta :agent "edge-A" :content (format nil "d~A" i))))
+    (and (= (getf client :queue-length) 4)
+         (= (getf client :dropped) 0)
+         (= (getf client :resyncs) 0)
+         (not (getf client :resync-pending))
+         ;; the first overflow: dropped, and the marker takes its place
+         (not (sexpr.tui::%enqueue-backpressured client "edge-A"
+                 (list 'delta :agent "edge-A" :content "over")))
+         (= (getf client :dropped) 1)
+         (= (getf client :resyncs) 1)
+         (getf client :resync-pending)
+         (= (getf client :queue-length) 5)
+         (wire-equal (car (sexpr.tui::snapshot-queue client))
+                     '(delta :agent "edge-A" :content "d1"))
+         (wire-equal (car (last (sexpr.tui::snapshot-queue client)))
+                     '(resync :agent "edge-A" :cursor 0)))))
+
+(test "28. resync storm suppression: one marker serves a whole burst, not one per dropped fragment"
+  (let ((client (sexpr.tui::make-client :id (1+ *synthetic-client-id*) :queue-capacity 4)))
+    ;; 4 fill the queue, 10 overflow. Without the pending-flag rule this would be
+    ;; 10 resync markers; with it the stalled client gets exactly one signal.
+    (loop for i from 1 to 14
+          do (sexpr.tui::%enqueue-backpressured client "storm-A"
+               (list 'delta :agent "storm-A" :content "x")))
+    (and (= (getf client :dropped) 10)
+         (= (getf client :resyncs) 1)
+         (= (getf client :queue-length) 5)
+         (= (length (sexpr.tui::snapshot-queue client)) 5)
+         ;; the marker is the only resync in the queue
+         (= 1 (count-if (lambda (item) (equal (symbol-name (car item)) "RESYNC"))
+                        (sexpr.tui::snapshot-queue client))))))
+
+(test "29. the burst flag clears when the marker is delivered, so a later burst can signal again"
+  (let ((client (sexpr.tui::make-client :id (+ 2 *synthetic-client-id*) :queue-capacity 2))
+        (first-burst nil)
+        (second-burst nil)
+        (drained nil))
+    (loop for i from 1 to 3
+          do (sexpr.tui::%enqueue-backpressured client "burst-A"
+               (list 'delta :agent "burst-A" :content "x")))
+    (setf first-burst (and (= (getf client :resyncs) 1)
+                           (getf client :resync-pending)
+                           (= (getf client :dropped) 1)))
+    ;; drain as the writer would: the marker leaves the queue and the flag clears
+    (loop while (> (getf client :queue-length) 0)
+          do (sexpr.tui::%dequeue client))
+    ;; captured BEFORE the second burst: the flag must be clear at this point
+    (setf drained (not (getf client :resync-pending)))
+    (loop for i from 1 to 3
+          do (sexpr.tui::%enqueue-backpressured client "burst-A"
+               (list 'delta :agent "burst-A" :content "y")))
+    (setf second-burst (and (= (getf client :resyncs) 2)
+                            (= (getf client :dropped) 2)
+                            (getf client :resync-pending)))
+    (and first-burst
+         drained
+         second-burst
+         ;; the second burst's marker is the only resync in the queue
+         (= 1 (count-if (lambda (item) (equal (symbol-name (car item)) "RESYNC"))
+                        (sexpr.tui::snapshot-queue client))))))
+
+(test "30. cursor semantics: a mid-stream resync carries the PRE-STREAM transcript length, not the length at overflow"
+  (let ((server (start-server :port 0 :queue-capacity 2))
+        (agent (sexpr.kernel:make-agent :name "midstream-A" :goal "probe"))
+        (received nil))
+    (sexpr.transcript:append-event (sexpr.kernel:agent-transcript agent)
+                                   (sexpr.transcript:make-user-event "hello"))
+    (sexpr.transcript:append-event (sexpr.kernel:agent-transcript agent)
+                                   (sexpr.transcript:make-model-event "world"))
+    (sexpr.agents:register-agent! agent)
+    (unwind-protect
+        (let* ((port (push-server-port server))
+               (c (make-instance 'sb-bsd-sockets:inet-socket
+                                  :type :stream :protocol :tcp)))
+          (sb-bsd-sockets:socket-connect c #(127 0 0 1) port)
+          (let ((stream (sb-bsd-sockets:socket-make-stream c
+                                                           :buffering :line
+                                                           :input t
+                                                           :output t)))
+            (unwind-protect
+                (progn
+                  (send-sexpr stream '(subscribe :agent "midstream-A"))
+                  (let ((reply (read-or-eof stream 3.0)))
+                    ;; 60 streaming :delta events: none of them advances the transcript,
+                    ;; so the resync cursor must still be 2 — the pre-stream length.
+                    (loop for i from 1 to 60
+                          do (sexpr.kernel:emit-event "midstream-A"
+                               (list :type :delta :agent-id "midstream-A"
+                                     :chunk-delta (format nil "s~A" i))))
+                    (setf received (read-until-quiet stream))
+                    (let ((resync (find-if (lambda (m) (equal (symbol-name (car m)) "RESYNC"))
+                                           received)))
+                      (and (wire-equal reply '(subscribed :agent "midstream-A" :cursor 2))
+                           resync
+                           (= (getf (cdr resync) :cursor) 2)
+                           ;; the transcript did not advance during the burst
+                           (= (sexpr.transcript:transcript-length
+                               (sexpr.kernel:agent-transcript agent)) 2)
+                           ;; and the cursor is not the burst size
+                           (< (getf (cdr resync) :cursor) 60))))))
+              (safe-close-socket c)))
+      (sexpr.agents:deregister-agent! agent)
+      (stop-server server)
+      (reset!))
+    received))
+
+(test "31. 10x load with backpressure: every stalled client stays bounded at capacity+1 (memory, not loss, is the guarantee)"
+  (let ((server (start-server :port 0 :queue-capacity 4))
+        (n 10)
+        (events 1000)
+        (sockets '())
+        (streams '())
+        (max-observed 0)
+        (elapsed 0.0)
+        (result nil))
+    (unwind-protect
+        (progn
+          (let ((port (push-server-port server)))
+            (loop for i from 1 to n
+                  do (let ((c (make-instance 'sb-bsd-sockets:inet-socket
+                                              :type :stream :protocol :tcp)))
+                       (sb-bsd-sockets:socket-connect c #(127 0 0 1) port)
+                       (push c sockets)
+                       (let ((s (sb-bsd-sockets:socket-make-stream c
+                                                    :buffering :line
+                                                    :input t
+                                                    :output t)))
+                         (push s streams)
+                         (send-sexpr s (list 'subscribe :agent "load-D"))
+                         ;; stalled clients: they never read the reply either
+                         (read-or-eof s 3.0)))))
+          ;; 10 stalled clients x 1000 events. Without backpressure this is 10,000
+          ;; conses held for clients that will never drain them.
+          (let ((start (get-internal-real-time)))
+            (loop for i from 1 to events
+                  do (sexpr.kernel:emit-event "load-D"
+                       (list :type :delta :agent-id "load-D" :chunk-delta (format nil "~A" i)))
+                  ;; sample the bound every 25 events from the outside (diagnostics
+                  ;; takes the clients-lock, so it must not be called inside a lock)
+                  when (= (mod i 25) 0)
+                    do (loop for rec in (getf (push-server-diagnostics server) :per-client)
+                             do (setf max-observed (max max-observed (getf rec :queue-length)))))
+            (setf elapsed (/ (- (get-internal-real-time) start)
+                             internal-time-units-per-second)))
+          (let ((recs (getf (push-server-diagnostics server) :per-client)))
+            (setf result
+                  (and (= (length recs) n)
+                       ;; the queue is the first resource to saturate, and it is bounded
+                       (<= max-observed 5)
+                       (every (lambda (rec) (<= (getf rec :queue-length) (1+ (getf rec :queue-capacity))))
+                              recs)
+                       ;; every stalled client was dropped-from and signalled
+                       (every (lambda (rec) (> (getf rec :dropped) 0)) recs)
+                       (every (lambda (rec) (>= (getf rec :resyncs) 1)) recs)
+                       ;; storm suppression: far fewer signals than drops
+                       (< (reduce #'+ recs :key (lambda (rec) (getf rec :resyncs)) :initial-value 0)
+                          (reduce #'+ recs :key (lambda (rec) (getf rec :dropped)) :initial-value 0))
+                       ;; nothing was lost silently: enqueued + dropped == events
+                       (every (lambda (rec) (= (+ (getf rec :enqueued) (getf rec :dropped)
+                                    (- (getf rec :resyncs)))
+                              events))
+                              recs)
+                       ;; the emitter was not stalled by the stalled clients
+                       (< elapsed 1.0)
+                       (= (length (threads-named "push-server-client")) n)
+                       (= (length (threads-named "push-writer")) n)))))
+        (loop for s in streams do (close s))
+        (loop for c in sockets do (safe-close-socket c))
+        (stop-server server)
+        (reset!))
+    result))
+
+;;;; --- failure modes (Q5) and boundary conditions (Q7) for the resync path --
+
+(test "32. capacity 0 boundary: every fragment is dropped and the first overflow signals immediately"
+  (let ((client (sexpr.tui::make-client :id (+ 3 *synthetic-client-id*) :queue-capacity 0)))
+    (loop for i from 1 to 3
+          do (sexpr.tui::%enqueue-backpressured client "zero-A"
+               (list 'delta :agent "zero-A" :content "x")))
+    ;; nothing can ever be below capacity, so the queue holds only the marker
+    (and (= (getf client :dropped) 3)
+         (= (getf client :resyncs) 1)
+         (= (getf client :enqueued) 1)
+         (= (getf client :queue-length) 1)
+         (wire-equal (car (sexpr.tui::snapshot-queue client))
+                     '(resync :agent "zero-A" :cursor 0)))))
+
+(test "33. failure mode: a stalled client hangs up with a resync marker pending — the listener is removed, not leaked"
+  (let ((server (start-server :port 0 :queue-capacity 2))
+        (exited nil))
+    (unwind-protect
+        (let ((c (make-instance 'sb-bsd-sockets:inet-socket
+                                  :type :stream :protocol :tcp)))
+          (sb-bsd-sockets:socket-connect c #(127 0 0 1) (push-server-port server))
+          (let ((stream (sb-bsd-sockets:socket-make-stream c
+                                                           :buffering :line
+                                                           :input t
+                                                           :output t)))
+            (send-sexpr stream '(subscribe :agent "hangup-R"))
+            (read-or-eof stream 3.0)
+            ;; fill the queue and leave a marker pending, then hang up without
+            ;; saying unsubscribe: the pending marker is discarded with the record
+            (loop for i from 1 to 6
+                  do (sexpr.kernel:emit-event "hangup-R"
+                       (list :type :delta :agent-id "hangup-R" :chunk-delta "x")))
+            (safe-close-socket c)
+            (setf exited (wait-for (lambda ()
+                                     (let ((rec (first-client-rec (push-server-diagnostics server))))
+                                       (and rec (getf rec :exited)))) 5.0))
+            (let ((rec (first-client-rec (push-server-diagnostics server))))
+              (and exited
+                   ;; no listener survives the hang-up: the next emit-event is a no-op
+                   (null (getf rec :subscriptions))
+                   (= (stats-value (push-server-diagnostics server) :listeners-removed) 1)
+                   (> (getf rec :dropped) 0)
+                   ;; the marker was never written to a dead socket
+                   (and (= (getf rec :resyncs) 1)
+                        (= (getf rec :delivered) 1))))))
+      (stop-server server)
+      (reset!))))
 
 ;;;; --- summary -------------------------------------------------------
 

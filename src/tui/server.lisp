@@ -262,6 +262,9 @@ loop and the client handlers saw."
                                           :queue (snapshot-queue c)
                                           :enqueued (getf c :enqueued)
                                           :delivered (snapshot-delivered c)
+                                          :dropped (snapshot-counter c :dropped)
+                                          :resyncs (snapshot-counter c :resyncs)
+                                          :resync-pending (snapshot-counter c :resync-pending)
                                           :writer-alive
                                             (let ((wt (getf c :writer-thread)))
                                               (and wt (sb-thread:thread-alive-p wt))))))))
@@ -290,10 +293,11 @@ loop and the client handlers saw."
 ;;;; drains the queue and writes to the socket — that is the decoupling that
 ;;;; protects the kernel.
 ;;;;
-;;;; Capacity is stored per-client but not enforced yet: T04 adds the overflow
-;;;; check and the (resync ...) response. Until then the queue grows unbounded,
-;;;; which is exactly why the load-profile test names the queue as the first
-;;;; resource to saturate.
+;;;; Capacity is stored per-client and ENFORCED by T04 (%enqueue-backpressured):
+;;;; at/over capacity the pending fragment is dropped and a single (resync ...) is
+;;;; queued per burst. The queue can therefore hold at most capacity + 1 cells
+;;;; (capacity fragments + the one marker). The queue is still the first resource
+;;;; to saturate under load — T04 is what bounds it.
 
 (defun %enqueue (client item)
   "Append ITEM to CLIENT's FIFO queue under the queue-lock. O(1), no I/O.
@@ -303,14 +307,8 @@ file): this runs from a bus listener, which is called with the event-bus lock
 held, so taking any other lock from here could deadlock against a handler that
 holds a client lock and then the event-bus lock. Returns ITEM."
   (sb-thread:with-mutex ((getf client :queue-lock))
-    (let ((cell (list item)))
-      (if (getf client :queue-tail)
-          (setf (cdr (getf client :queue-tail)) cell)
-          (setf (getf client :queue-head) cell))
-      (setf (getf client :queue-tail) cell)
-      (incf (getf client :queue-length))
-      (incf (getf client :enqueued)))
-    item))
+    (%append-queue client item))
+  item)
 
 (defun %dequeue (client)
   "Remove and return the head item from CLIENT's FIFO queue under the
@@ -326,7 +324,64 @@ calls this in its drain loop; it never holds the write-lock while dequeuing."
           (when (null (getf client :queue-head))
             (setf (getf client :queue-tail) nil))
           (decf (getf client :queue-length))
+          ;; T04: the burst flag is cleared as the marker leaves the queue, so
+          ;; a later overflow burst can signal again.
+          (when (eq (car item) 'resync)
+            (setf (getf client :resync-pending) nil))
           item)))))
+
+(defun %append-queue (client item)
+  "Append ITEM to CLIENT's queue. THE CALLER MUST ALREADY HOLD the queue-lock.
+  Split out of %enqueue so the T04 capacity check and the append form one atomic
+  critical section (checking length and then appending outside the lock would
+  let two listeners both see room and both append). %count is deliberately NOT
+  called here: the clients-lock must never be taken inside the queue-lock."
+  (let ((cell (list item)))
+    (if (getf client :queue-tail)
+        (setf (cdr (getf client :queue-tail)) cell)
+        (setf (getf client :queue-head) cell))
+    (setf (getf client :queue-tail) cell)
+    (incf (getf client :queue-length))
+    (incf (getf client :enqueued))))
+
+(defun %enqueue-backpressured (client agent-id item)
+  "Bounded-queue enqueue with backpressure (T04). Runs from the bus listener, so
+  the event-bus lock is held and the queue-lock is the only lock this may take.
+
+  Below capacity, ITEM is appended as usual. At or over capacity, ITEM (a pending
+  fragment) is DROPPED and the client is told to refetch: exactly one
+  (resync :agent A :cursor N) marker is queued per overflow burst. :resync-pending
+  guards the burst — while a marker is still in the queue, further overflow drops
+  silently instead of emitting a resync storm, so a client that never reads gets
+  one signal rather than one per dropped fragment. The flag is cleared when the
+  marker is dequeued, so a later burst can signal again.
+
+  The marker is appended even though the queue is at capacity, so a queue can hold
+  at most capacity + 1 cells (capacity fragments + the single marker). That bound
+  is what keeps memory bounded under a stalled client — without it a slow client
+  would grow the queue until the image ran out of memory.
+
+  CURSOR SEMANTICS — IMPORTANT: transcript-length does NOT advance mid-stream.
+  model-step-streaming emits :delta events during the stream and only RETURNS the
+  final model event, which the caller appends to the transcript afterwards
+  (src/kernel/kernel.lisp:299). A resync sent mid-stream therefore carries the
+  PRE-STREAM cursor, not the cursor at the moment of overflow. The client refetches
+  transcript-delta (over Swank, S03's job), sees nothing new yet, and the finalized
+  event lands later. S02 only SENDS resync; it does not implement the refetch.
+
+  Returns T when ITEM was enqueued, NIL when it was dropped."
+  (sb-thread:with-mutex ((getf client :queue-lock))
+    (if (< (getf client :queue-length) (getf client :queue-capacity))
+        (progn (%append-queue client item) t)
+        (progn
+          (incf (getf client :dropped))
+          (unless (getf client :resync-pending)
+            (setf (getf client :resync-pending) t)
+            (%append-queue client (list 'resync
+                                        :agent agent-id
+                                        :cursor (%cursor-for agent-id)))
+            (incf (getf client :resyncs)))
+          nil))))
 
 (defun snapshot-queue (client)
   "The queue contents in FIFO order, under the queue-lock. Safe from any thread
@@ -340,6 +395,13 @@ calls this in its drain loop; it never holds the write-lock while dequeuing."
   "Queue depth under the queue-lock."
   (sb-thread:with-mutex ((getf client :queue-lock))
     (getf client :queue-length)))
+
+(defun snapshot-counter (client key)
+  "Read one queue-lock-guarded counter (T04: :dropped, :resyncs, :resync-pending)
+  from CLIENT under the queue-lock. Safe from any thread as long as the caller
+  does not already hold the queue-lock."
+  (sb-thread:with-mutex ((getf client :queue-lock))
+    (getf client key)))
 
 (defun snapshot-delivered (client)
   "Lifetime count of messages written to this client's socket, under the
@@ -362,17 +424,24 @@ approval-needed and an S02 server should simply not act on them.
 
 CHEAP BY CONTRACT: the body is a translate plus an enqueue under the queue-lock
 only. It never writes to the socket, because emit-event runs listeners
-synchronously in the kernel's agent thread (S01/MEM084). It also never reads
-the transcript, so a delta burst costs one cons per event.
+synchronously in the kernel's agent thread (S01/MEM084). It also never reads the
+transcript on the happy path — the cursor lookup happens only when the queue is
+already full and a resync is being formed, so a normal delta burst costs one
+cons per event.
+
+T04: the enqueue is capacity-checked (%enqueue-backpressured), so a client that
+stops reading gets bounded memory and one (resync ...) instead of an unbounded
+queue. The listener still never blocks: dropping is cheaper than buffering.
 
 The event-bus lock is held while this runs, so the queue-lock is the only lock
 this closure may take."
   (lambda (event)
     (when (consp event)
       (when (eq (getf event :type) :delta)
-        (%enqueue client (list 'delta
-                               :agent (or (getf event :agent-id) agent-id)
-                               :content (getf event :chunk-delta)))))))
+        (%enqueue-backpressured client agent-id
+                                (list 'delta
+                                      :agent (or (getf event :agent-id) agent-id)
+                                      :content (getf event :chunk-delta)))))))
 
 (defun %cursor-for (agent-id)
   "Resync cursor for AGENT-ID: its current transcript length, or 0 when the
@@ -776,6 +845,11 @@ T03 adds the writer thread and its lifecycle state:
         :queue-lock (sb-thread:make-mutex :name "push-server-client-queue")
         :enqueued 0
         :delivered 0
+        ;; T04 backpressure state — all guarded by the queue-lock, so they are
+        ;; safe to read from the listener and from push-server-diagnostics.
+        :dropped 0
+        :resyncs 0
+        :resync-pending nil
         :subscriptions nil
         :subscriptions-lock (sb-thread:make-mutex :name "push-server-client-subs")
         :writer-thread nil
