@@ -112,6 +112,68 @@
    #:client-note-error!
    #:client-log!
 
-   ;; --- model and entry point (added by later S03 tasks) ---
+   ;; --- panes and layout (view.lisp, T04) ---
+   #:lines-to-string
+   #:one-line
+   #:make-chat-viewport
+   #:make-chat-textarea
+   #:make-repl-viewport
+   #:make-repl-textarea
+   #:make-agent-viewport
+   #:agent-row
+   #:render-agent-rows
+   #:render-section
+   #:render-status-bar
+   #:compose-layout
+   #:border
+   #:chat-width
+   #:agent-width
+   #:chat-viewport-height
+   #:repl-viewport-height
+   #:textarea-height
+
+   ;; --- the TEA model (model.lisp, T04) ---
    #:tui-model
+   #:model-program
+   #:model-push-connection
+   #:model-swank-connection
+   #:model-picked-agent
+   #:model-agents
+   #:model-cursor
+   #:model-scrollback
+   #:model-scrollback-cap
+   #:model-repl-lines
+   #:model-repl-cap
+   #:model-chat-viewport
+   #:model-chat-textarea
+   #:model-repl-viewport
+   #:model-repl-textarea
+   #:model-agent-viewport
+   #:model-focused
+   #:model-term-width
+   #:model-term-height
+   #:model-stats
+   #:model-status-text
+   #:model-readers-running
+   #:model-quitting
+   #:tui-init-tick
+   #:scrollback-cap
+   #:repl-cap
+   #:default-term-width
+   #:default-term-height
+   #:append-line
+   #:event-to-line
+   #:reply-error-text
+   #:swank-rpc
+   #:rpc-agent-snapshot
+   #:rpc-transcript-delta
+   #:program-running-p
+   #:refresh-status
+   #:last-error-of
+   #:build-panes
+   #:refresh-agent-viewport
+   #:handle-key
+   #:resize-panes
+
+   ;; --- entry point (main.lisp, T05) ---
    #:main))
