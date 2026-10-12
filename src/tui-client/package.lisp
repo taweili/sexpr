@@ -152,6 +152,7 @@
    #:model-push-connection
    #:model-swank-connection
    #:model-picked-agent
+   #:model-pending-approval
    #:model-agents
    #:model-cursor
    #:model-scrollback
@@ -182,6 +183,9 @@
    #:swank-rpc
    #:rpc-agent-snapshot
    #:rpc-transcript-delta
+   #:rpc-resolve-approval
+   #:agent-light
+   #:resolve-pending-approval
    #:program-running-p
    #:refresh-status
    #:last-error-of

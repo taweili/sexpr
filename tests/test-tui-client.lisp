@@ -730,6 +730,192 @@ write. Replies are placed in continuation-id order; swank-read-reply matches by 
     (tui:init model)
     (search "boom" (model-status-text model))))
 
+;;;; --- 8c. S04 T04: agent lights, per-agent state, subscribe-all, resolve RPC ---
+;;;
+;;; The model is the source of truth for the agent lights. agent-light is a pure
+;;; function; the status/approval branches are driven through tui:update; the
+;;; subscribe burst and the resolution RPC are asserted on the bytes the client
+;;; wrote plus the model state they changed. Still headless: no TTY, no network,
+;;; `tui:run` never called.
+
+(defun model-agent-row (model name)
+  "The agent-snapshot plist named NAME in MODEL, or NIL."
+  (find name (model-agents model)
+        :key (lambda (a) (getf a :name)) :test #'string=))
+
+(defun count-substring (needle haystack)
+  "How many times NEEDLE occurs in HAYSTACK (non-overlapping)."
+  (let ((count 0) (start 0))
+    (loop for pos = (search needle haystack :start2 start)
+          while pos
+          do (incf count) (setf start (+ pos (length needle))))
+    count))
+
+(defun canned-swank-capturing (&rest replies)
+  "Like canned-swank, but returns (VALUES connection out-stream) so a test can read
+back the request packet TEXT the client wrote (the RPC path writes to the output side
+of the two-way stream, which canned-swank discards)."
+  (let* ((in (make-string-input-stream (apply #'concatenate 'string replies)))
+         (out (make-string-output-stream)))
+    (values (new-swank-connection :port 0 :stream (make-two-way-stream in out))
+            out)))
+
+(defun capturing-push ()
+  "A push connection over a two-way string stream; returns (VALUES connection out) so
+a test can read the frames init wrote (the SUBSCRIBE burst). The reader thread is
+never started because the model has no program, so program-running-p is NIL."
+  (let* ((in (make-string-input-stream ""))
+         (out (make-string-output-stream)))
+    (values (make-client-connection :host "127.0.0.1" :port 0
+                                    :stream (make-two-way-stream in out))
+            out)))
+
+(defun two-agent-snapshot-reply ()
+  "An agent-snapshot :ok reply (continuation id 1) carrying two rows, so the model has
+a society to light up. init's transcript-delta is id 2."
+  (swank-reply :ok '((:name "Alpha" :status :idle) (:name "Beta" :status :idle)) 1))
+
+(defun init-two-agent-model (&key (picked "Alpha") push swank)
+  "Build and init a tui-model over a canned two-agent swank connection. SWANK, when
+given, replaces the canned connection (so a test can capture its output). Returns the
+model. The transcript-delta reply is id 2 (an empty refetch)."
+  (let* ((conn (or swank
+                   (canned-swank (two-agent-snapshot-reply)
+                                 (swank-reply :ok '(nil . 0) 2))))
+         (model (make-instance 'tui-model :swank-connection conn
+                                         :push-connection push
+                                         :picked-agent picked)))
+    (tui:init model)
+    model))
+
+(test "S04/T04: agent-light maps pending -> yellow, running+live -> red, else green, and never signals"
+  (and (eq :yellow (agent-light (list :name "A" :pending-approval t)))
+       (eq :yellow (agent-light (list :name "A" :status :idle
+                                      :pending-approval '(:capability "net"))))
+       (eq :red (agent-light (list :name "A" :status :running :thread-alive-p t)))
+       (eq :green (agent-light (list :name "A" :status :finished)))
+       (eq :green (agent-light (list :name "A" :status :running :thread-alive-p nil)))
+       ;; a bare plist and NIL degrade to green rather than signalling
+       (eq :green (agent-light (list :name "A")))
+       (eq :green (agent-light nil))))
+
+(test "S04/T04: a status-msg updates the matching row and sets model-pending-approval only for the picked agent"
+  (let ((model (init-two-agent-model :picked "Alpha")))
+    (tui:update model (make-status-msg :agent "Alpha" :status :running
+                                       :pending-approval :x))
+    (let ((alpha-status (getf (model-agent-row model "Alpha") :status))
+          (alpha-pending (getf (model-agent-row model "Alpha") :pending-approval))
+          (picked-pending (model-pending-approval model)))
+      (tui:update model (make-status-msg :agent "Beta" :status :running
+                                         :pending-approval :y))
+      (and (eq :running alpha-status)
+           (eq :x alpha-pending)
+           (eq :x picked-pending)
+           ;; Beta's row is updated, but Beta is not picked, so the picked pending
+           ;; state is untouched
+           (eq :running (getf (model-agent-row model "Beta") :status))
+           (eq :y (getf (model-agent-row model "Beta") :pending-approval))
+           (eq :x (model-pending-approval model))))))
+
+(test "S04/T04: an approval-needed-msg builds the pending plist on the row and the picked state, preserving status"
+  (let ((model (init-two-agent-model :picked "Alpha")))
+    (tui:update model (make-status-msg :agent "Alpha" :status :running
+                                       :pending-approval nil))
+    (tui:update model (make-approval-needed-msg :agent "Alpha" :capability "net"
+                                                :target "http://x" :description "d"
+                                                :restarts 2))
+    (let ((row-pending (getf (model-agent-row model "Alpha") :pending-approval))
+          (picked-pending (model-pending-approval model)))
+      ;; a non-picked agent's approval updates its row but not the picked state
+      (tui:update model (make-approval-needed-msg :agent "Beta" :capability "fs"
+                                                  :target "/tmp" :description "e"
+                                                  :restarts 1))
+      (and (listp row-pending)
+           (equal "net" (getf row-pending :capability))
+           (equal "http://x" (getf row-pending :target))
+           (= 2 (getf row-pending :restarts))
+           (equal row-pending picked-pending)
+           ;; the approval branch preserves the :status the prior status-msg set
+           (eq :running (getf (model-agent-row model "Alpha") :status))
+           (listp (getf (model-agent-row model "Beta") :pending-approval))
+           (equal row-pending (model-pending-approval model))))))
+
+(test "S04/T04: a status-msg for an agent not in the snapshot is ignored, not fatal"
+  (let ((model (init-two-agent-model :picked "Alpha")))
+    (let ((before (model-agents model)))
+      (tui:update model (make-status-msg :agent "Ghost" :status :running
+                                         :pending-approval t))
+      (and ;; no matching row: the snapshot is unchanged (the mapcar copies the list
+           ;; but no row is touched)
+           (equal before (model-agents model))
+           ;; Ghost is not the picked agent, so the picked pending state is untouched
+           (null (model-pending-approval model))
+           (stringp (tui:view model))))))
+
+(test "S04/T04: init subscribes to EVERY agent in the snapshot (two SUBSCRIBE frames)"
+  (multiple-value-bind (push out) (capturing-push)
+    (let ((model (init-two-agent-model :picked nil :push push)))
+      (let ((sent (get-output-stream-string out)))
+        (and ;; no picked agent: init defaults to the first name sorted, so the id-2
+             ;; transcript reply above is for "Alpha"
+             (string= "Alpha" (model-picked-agent model))
+             ;; init's literal 'subscribe is interned in SEXPR-TUI, so the frame
+             ;; prints as (SEXPR-TUI::SUBSCRIBE ...) when *package* is the test
+             ;; package; assert on the qualifier-agnostic parts (the operator NAME
+             ;; and the :AGENT argument), not on an unqualified spelling.
+             (= 2 (count-substring "SUBSCRIBE" sent))
+             (search ":AGENT \"Alpha\"" sent)
+             (search ":AGENT \"Beta\"" sent))))))
+
+(test "S04/T04: a subscribed-msg for a non-picked agent does NOT refetch the transcript"
+  ;; Empty society + picked "A": init consumes exactly two swank packets (ids 1 and
+  ;; 2). A subscribe reply for "B" must not fire a third RPC (research risk 5).
+  (let* ((swank (apply #'canned-swank *init-replies*))
+         (model (make-instance 'tui-model :swank-connection swank
+                                         :push-connection nil
+                                         :picked-agent "A")))
+    (tui:init model)
+    (let ((before (client-stats-get swank :packets-read)))
+      (tui:update model (make-subscribed-msg :agent "B" :cursor 9))
+      (and (= 2 before)
+           (= before (client-stats-get swank :packets-read))))))
+
+(test "S04/T04: resolve-pending-approval sends the resolve RPC and clears the pending state"
+  (multiple-value-bind (swank out)
+      (canned-swank-capturing (two-agent-snapshot-reply)
+                              (swank-reply :ok '(nil . 0) 2)
+                              (swank-reply :ok t 3))
+    (let ((model (init-two-agent-model :picked "Alpha" :swank swank)))
+      (setf (model-pending-approval model) t)
+      (resolve-pending-approval model :grant-once)
+      (let ((sent (get-output-stream-string out)))
+        (and (search "(sexpr.tui:resolve-approval \"Alpha\" :GRANT-ONCE)" sent)
+             (null (model-pending-approval model)))))))
+
+(test "S04/T04: a failed resolve keeps the pending state and shows the error in the status bar"
+  (multiple-value-bind (swank out)
+      (canned-swank-capturing (two-agent-snapshot-reply)
+                              (swank-reply :ok '(nil . 0) 2)
+                              (swank-reply :abort "denied" 3))
+    (declare (ignore out))
+    (let ((model (init-two-agent-model :picked "Alpha" :swank swank)))
+      (setf (model-pending-approval model) t)
+      (resolve-pending-approval model :grant-once)
+      (and (eq t (model-pending-approval model))
+           (search "denied" (model-status-text model))))))
+
+(test "S04/T04: resolve with no pending state changes nothing and sends no packet"
+  (multiple-value-bind (swank out)
+      (canned-swank-capturing (two-agent-snapshot-reply)
+                              (swank-reply :ok '(nil . 0) 2))
+    (let ((model (init-two-agent-model :picked "Alpha" :swank swank)))
+      (get-output-stream-string out)        ; drain the init requests
+      (let ((before (client-stats-get swank :packets-read)))
+        (resolve-pending-approval model :grant-once)
+        (and (= before (client-stats-get swank :packets-read))
+             (string= "" (get-output-stream-string out))
+             (search "no pending approval" (model-note model)))))))
+
 ;;;; --- 9. gates: SPDX headers and the R015 / deprecation invariants ------
 
 (test "every new file carries the SPDX GPL-3.0-or-later header"

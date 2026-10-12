@@ -77,6 +77,12 @@ reader thread is only started when this is non-nil AND program-running is T.")
                      :documentation "The swank RPC connection (swank-rpc.lisp), or NIL.")
    (picked-agent :initarg :picked-agent :initform nil :accessor model-picked-agent
                  :documentation "The picked agent's NAME, a string. Never an agent object.")
+   (pending-approval :initform nil :accessor model-pending-approval
+                     :documentation "The PICKED agent's pending-approval plist (or T
+when only a flag arrived), or NIL. Data only (R023): a projection of the image's
+registry, never a live condition or restart object. Cleared optimistically when a
+resolution RPC succeeds; the confirming :status push corrects it if the image
+disagrees (research risk 9).")
    (agents :initform nil :accessor model-agents
            :documentation "The agent-snapshot: a list of agent plists, or nil while
 unfetched. Data, never live agents.")
@@ -244,6 +250,18 @@ nothing-new rather than treating it as an error. The cursor is still adopted."
                    (format nil "transcript-delta: unexpected reply ~S" value)))))))
 (export 'rpc-transcript-delta)
 
+(defun rpc-resolve-approval (connection agent-name decision)
+  "Resolve a pending approval for AGENT-NAME with DECISION via
+`sexpr.tui:resolve-approval`. Returns (VALUES value error) like the other RPCs.
+DECISION is a keyword such as :grant-once; `~S` prints it as :GRANT-ONCE, which the
+image's reader interns back as the same keyword. AGENT-NAME goes through
+swank-escape-string so a name containing a quote cannot break the form."
+  (let ((form-text (format nil "(sexpr.tui:resolve-approval ~A ~S)"
+                            (swank-escape-string (or agent-name ""))
+                            decision)))
+    (swank-rpc connection form-text)))
+(export 'rpc-resolve-approval)
+
 ;;;; --- program-running -----------------------------------------------
 
 (defun program-running-p (program)
@@ -343,6 +361,100 @@ re-entered after a resize."
     (when vp (tui.viewport:viewport-set-content vp (render-agent-rows (model-agents model)))))
   model)
 
+;;;; --- agent lights and per-agent state (M004/S04 T04) ----------------
+
+(defun agent-light (agent)
+  "The v1 green/red/yellow light for an agent-snapshot plist (D028):
+  :yellow  when :pending-approval is non-NIL (the agent is blocked on an approval)
+  :red     when :status is :running AND :thread-alive-p is true (busy)
+  :green   otherwise (idle/finished/failed/killed, or running with no live thread)
+PURE and total: a missing key or a NIL AGENT degrades to :green, and nothing here
+signals. There is no true \"busy\" status yet (agent-status has only
+running/finished/failed/killed), so red is approximated by running+live-thread and
+documented as v1; S05's streaming/budget slice replaces the heuristic."
+  (cond
+    ((getf agent :pending-approval) :yellow)
+    ((and (eq (getf agent :status) :running)
+          (getf agent :thread-alive-p))
+     :red)
+    (t :green)))
+(export 'agent-light)
+
+(defun %map-agent-row (model name fn)
+  "Return MODEL's agent snapshot with the row named NAME replaced by (FUNCALL FN row).
+A NAME that matches no row returns the snapshot unchanged: a status for an agent the
+client has not snapshotted is not fatal. The row is copied before FN mutates it, so
+the snapshot list stays the source of truth rather than a partially-shared structure."
+  (setf (model-agents model)
+        (mapcar (lambda (a)
+                  (if (and (stringp name) (stringp (getf a :name))
+                           (string= (getf a :name) name))
+                      (funcall fn a)
+                      a))
+                (model-agents model)))
+  (model-agents model))
+(export '%map-agent-row)
+
+(defun %set-agent-status (model name status pending)
+  "Set :status to STATUS and :pending-approval to PENDING on the row named NAME.
+Returns the updated model-agents list. Used by the status-msg branch; the
+approval-needed branch updates only :pending-approval so a richer approval plist
+cannot clobber a status."
+  (%map-agent-row model name
+                  (lambda (a)
+                    (let ((copy (copy-list a)))
+                      (setf (getf copy :status) status
+                            (getf copy :pending-approval) pending)
+                      copy))))
+(export '%set-agent-status)
+
+(defun %set-agent-pending (model name pending)
+  "Set only :pending-approval to PENDING on the row named NAME, preserving :status.
+Returns the updated model-agents list."
+  (%map-agent-row model name
+                  (lambda (a)
+                    (let ((copy (copy-list a)))
+                      (setf (getf copy :pending-approval) pending)
+                      copy))))
+(export '%set-agent-pending)
+
+(defun resolve-pending-approval (model decision)
+  "Resolve the picked agent's pending approval with DECISION (a keyword such as
+:grant-once). Returns MODEL.
+On success the local pending state is cleared OPTIMISTICALLY (research risk 9: the
+confirming :status push corrects it if the image disagrees), a local confirmation
+line is appended to the chat pane, and the agent pane is refreshed. With no picked
+agent or no pending approval it records a status-bar error and changes nothing. On
+an RPC error it KEEPS the pending state and records the error, so the operator can
+retry."
+  (let ((picked (model-picked-agent model))
+        (pending (model-pending-approval model)))
+    (cond
+      ((null picked)
+       (note-error model "no agent picked — cannot resolve approval")
+       model)
+      ((null pending)
+       (note-error model "no pending approval to resolve")
+       model)
+      (t
+       (multiple-value-bind (value error)
+           (rpc-resolve-approval (model-swank-connection model) picked decision)
+         (declare (ignore value))
+         (if error
+             (note-error model (format nil "resolve failed: ~A" error))
+             (progn
+               (setf (model-pending-approval model) nil)
+               (%set-agent-pending model picked nil)
+               (refresh-agent-viewport model)
+               (model-append-chat-line model
+                                       (format nil "resolved ~A: ~A" picked decision))))
+         ;; refresh-status folds the note (on error) into the status line; on success
+         ;; it is a no-op rebuild. Doing it here keeps the function self-contained for
+         ;; the headless test, which calls it directly rather than through update.
+         (refresh-status model)
+         model)))))
+(export 'resolve-pending-approval)
+
 ;;;; --- init ------------------------------------------------------------
 
 (defmethod tui:init ((model tui-model))
@@ -363,6 +475,13 @@ Nothing here signals: every failure is recorded and the last good state is kept.
       (setf (model-agents model) agents)
       (refresh-agent-viewport model))
     (note-error model error))
+  ;; default the picked agent to the first snapshot row (sorted by name for a stable
+  ;; choice) so a client started without --agent still has a society view and a
+  ;; target; --agent overrides it by being set before init runs.
+  (when (and (null (model-picked-agent model)) (model-agents model))
+    (let ((names (sort (remove nil (mapcar (lambda (a) (getf a :name)) (model-agents model)))
+                       #'string<)))
+      (when names (setf (model-picked-agent model) (first names)))))
   ;; initial transcript
   (when (model-picked-agent model)
     (multiple-value-bind (events cursor error)
@@ -372,17 +491,25 @@ Nothing here signals: every failure is recorded and the last good state is kept.
         (model-append-chat-line model line))
       (when (integerp cursor) (setf (model-cursor model) cursor))
       (note-error model error)))
-  ;; subscribe on the push channel
-  (let ((push (model-push-connection model))
-        (agent (model-picked-agent model)))
-    (when (and push agent)
-      (handler-case
-          (progn
-            (write-wire push (list 'subscribe :agent agent))
-            nil)
-        (error (e)
-          (handler-case (client-note-error! push e) (error () nil))
-          (note-error model (format nil "subscribe failed: ~A" e))))))
+  ;; subscribe on the push channel to EVERY agent (D028): each row's light is live,
+  ;; not just the picked one. When the snapshot is empty the picked name is still
+  ;; subscribed so a later --agent run has a channel. A failed subscribe is noted,
+  ;; never signalled.
+  (let ((push (model-push-connection model)))
+    (when push
+      (let ((names (remove-duplicates
+                    (or (remove nil (mapcar (lambda (a) (getf a :name)) (model-agents model)))
+                        (list (model-picked-agent model)))
+                    :test #'string=)))
+        (dolist (agent names)
+          (when agent
+            (handler-case
+                (progn
+                  (write-wire push (list 'subscribe :agent agent))
+                  nil)
+              (error (e)
+                (handler-case (client-note-error! push e) (error () nil))
+                (note-error model (format nil "subscribe failed: ~A" e)))))))))
   (refresh-agent-viewport model)
   ;; the reader thread, last
   (let ((push (model-push-connection model)))
@@ -591,15 +718,58 @@ the single `update` method owns the dispatch."
     ((subscribed-msg-p msg)
      (let* ((cursor (subscribed-msg-cursor msg))
             (agent (or (subscribed-msg-agent msg) (model-picked-agent model)))
+            (picked (model-picked-agent model))
             (events nil) (new-cursor cursor) (error nil))
-       (setf (model-picked-agent model) (or agent (model-picked-agent model)))
+       (cond
+         ;; a reply for an agent we are not showing: adopt only when nothing is
+         ;; picked, otherwise do NOT refetch — this is the gate that stops N
+         ;; subscribe replies firing N swank RPCs at init (research risk 5).
+         ((null agent) nil)
+         ((null picked)
+          (setf (model-picked-agent model) agent)
+          (multiple-value-setq (events new-cursor error)
+            (rpc-transcript-delta (model-swank-connection model) agent cursor))
+          (dolist (line (mapcar #'event-to-line (or events '())))
+            (model-append-chat-line model line))
+          (when (integerp new-cursor) (setf (model-cursor model) new-cursor))
+          (note-error model error))
+         ((string= agent picked)
+          (multiple-value-setq (events new-cursor error)
+            (rpc-transcript-delta (model-swank-connection model) agent cursor))
+          (dolist (line (mapcar #'event-to-line (or events '())))
+            (model-append-chat-line model line))
+          (when (integerp new-cursor) (setf (model-cursor model) new-cursor))
+          (note-error model error))
+         (t nil)))
+     (values model nil))
+    ;; push channel: a per-agent status update (S04)
+    ((status-msg-p msg)
+     (let ((agent (status-msg-agent msg))
+           (status (status-msg-status msg))
+           (pending (status-msg-pending-approval msg)))
        (when agent
-         (multiple-value-setq (events new-cursor error)
-           (rpc-transcript-delta (model-swank-connection model) agent cursor))
-         (dolist (line (mapcar #'event-to-line (or events '())))
-           (model-append-chat-line model line))
-         (when (integerp new-cursor) (setf (model-cursor model) new-cursor)))
-       (note-error model error))
+         (%set-agent-status model agent status pending)
+         (when (and (model-picked-agent model)
+                    (string= agent (model-picked-agent model)))
+           (setf (model-pending-approval model) pending))
+         (refresh-agent-viewport model)))
+     (values model nil))
+    ;; push channel: an agent blocked on an approval (S04)
+    ((approval-needed-msg-p msg)
+     (let* ((agent (approval-needed-msg-agent msg))
+            (pending (list :agent agent
+                           :capability (approval-needed-msg-capability msg)
+                           :target (approval-needed-msg-target msg)
+                           :description (approval-needed-msg-description msg)
+                           :restarts (approval-needed-msg-restarts msg))))
+       (when agent
+         ;; update only :pending-approval, so the richer plist cannot clobber the
+         ;; status the last status-msg set.
+         (%set-agent-pending model agent pending)
+         (when (and (model-picked-agent model)
+                    (string= agent (model-picked-agent model)))
+           (setf (model-pending-approval model) pending))
+         (refresh-agent-viewport model)))
      (values model nil))
     ;; swank: a REPL or RPC reply rendered into the REPL pane
     ((rpc-result-msg-p msg)
