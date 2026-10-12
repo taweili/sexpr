@@ -128,18 +128,27 @@
                    (if (typep stream 'fake-stream)
                        nil
                        (funcall real-stc stream))))
-           (let ((event (model-step-streaming
-                         (spawn :goal "g" :name "int-streamer"
-                                :endpoint :ollama))))
-             (ok (= (length received) 3)
+           (let* ((event (model-step-streaming
+                          (spawn :goal "g" :name "int-streamer"
+                                 :endpoint :ollama)))
+                  ;; S05/T02: model-step-streaming now also emits one :finalize
+                  ;; that ends the stream, so assert over the deltas only.
+                  ;; non-destructive REVERSE: NREVERSE would leave RECEIVED
+                  ;; pointing at the old head cell (now the tail), truncating it
+                  ;; for the length assertion below.
+                  (deltas (remove-if-not (lambda (e) (eq (getf e :type) :delta))
+                                         (reverse received)))
+                  (finalizes (remove-if-not (lambda (e) (eq (getf e :type) :finalize))
+                                            received)))
+             (ok (= (length received) 4)
+                 "three :delta events plus one :finalize were emitted")
+             (ok (= (length deltas) 3)
                  "three :delta events were emitted — one per chunk")
-             (ok (every (lambda (e) (eq (getf e :type) :delta))
-                        received)
-                 "every emitted event is a :delta event")
-             (ok (equal (mapcar (lambda (e) (getf e :chunk-delta))
-                                (nreverse received))
+             (ok (equal (mapcar (lambda (e) (getf e :chunk-delta)) deltas)
                         '("Hello" " world" ""))
                  "chunk-deltas arrive in stream order")
+             (ok (= (length finalizes) 1)
+                 "exactly one :finalize event closes the stream")
              (ok (eq (event-type event) :model)
                  "the returned event is a model event")
              (ok (string= (event-content event) "Hello world")

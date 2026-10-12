@@ -39,6 +39,7 @@
    #:agent-parent
    #:agent-status
    #:agent-child-list
+   #:agent-streaming-p
    #:*current-agent*
    #:make-agent
    #:spawn
@@ -49,6 +50,7 @@
    #:dispatch-tool-call
    #:finished-p
    #:agent-loop
+   #:agent-loop-streaming
    #:run-until-finished
    #:event-to-message
    #:transcript-to-messages))

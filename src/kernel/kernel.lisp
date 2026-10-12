@@ -164,6 +164,16 @@ process tree views and capability inheritance.")
     :accessor agent-status
     :initform :running
     :documentation "One of :running, :finished, :failed, :killed.")
+   (streaming-p
+    :initarg :streaming-p
+    :accessor agent-streaming-p
+    :initform nil
+    :type boolean
+    :documentation "T exactly while a model stream is in flight (S05/F6): the
+true busy signal behind the agent red light. model-step-streaming sets it
+before the pull loop and clears it in an UNWIND-PROTECT cleanup, so an
+interrupted or failed stream can never leave it stuck on. A data-only boolean,
+never a live stream object (R023).")
    (children
     :accessor agent-child-list
     :initform nil
@@ -174,6 +184,7 @@ capability set, and a provider endpoint.
 
 This milestone gives the agent a body (the loop) and no thread."))
 (export 'agent)
+(export 'agent-streaming-p)
 
 (defun make-agent (&key name goal system transcript budget capabilities thread endpoint parent)
   "Return a new agent.
@@ -336,7 +347,15 @@ bus event and marking the returned event with :budget-exceeded t. A
 provider-side interruption (cl-llm-provider:stream-interrupted-error) is
 converted into the same clean abort by invoking the provider's exported
 ABORT-STREAM restart; that path marks the returned event with :interrupted t.
-ABORT-STREAM is a RESTART NAME, not a function — never call it."
+ABORT-STREAM is a RESTART NAME, not a function — never call it.
+
+The agent's STREAMING-P flag is T exactly while the stream is in flight and
+cleared on the way out (UNWIND-PROTECT), so it is the true busy signal the
+agent red light reads (F6). Every stream ends with a :finalize bus event
+carrying the pre-integration :event-index — the transcript length at emit time
+— on the clean, budget-abort, and interrupted paths alike, so the client can
+tell a completed stream from a stalled one (F3). Each :delta is marked
+:kind :model so model prose stays distinguishable from tool output (R023)."
   (let* ((endpoint (or (agent-endpoint agent)
                        sexpr.provider:*model-endpoint*
                        (setf sexpr.provider:*model-endpoint*
@@ -354,38 +373,60 @@ ABORT-STREAM is a RESTART NAME, not a function — never call it."
          (tokens-used 0)
          (budget-exceeded-p nil)
          (interrupted-p nil))
-    ;; A provider-detected interruption is converted to the provider's own
-    ;; clean abort: the restart is established by read-stream-chunk's
-    ;; restart-case while the condition propagates, so this caller-bound
-    ;; handler is in scope, and invoking it unwinds to the restart body, which
-    ;; sets stream-state :closed and returns NIL so the loop ends cleanly.
-    (handler-bind ((cl-llm-provider:stream-interrupted-error
-                    (lambda (c)
-                      (declare (ignore c))
-                      (setf interrupted-p t)
-                      (invoke-restart 'cl-llm-provider:abort-stream))))
-      (loop :for chunk = (cl-llm-provider:read-stream-chunk stream)
-            :while chunk
-            :do (setf last-chunk chunk)
-                (setf tokens-used (%stream-chunk-tokens chunk tokens-used))
-                (emit-event agent-id
-                            (list :type :delta
-                                  :agent-id agent-id
-                                  :chunk-delta (cl-llm-provider:chunk-delta chunk)))
-                (when (and (not (unlimited-p budget :kind :tokens))
-                           (> tokens-used (budget-tokens budget)))
-                  ;; Budget abort (F1 half 1): close the stream through the
-                  ;; provider's state machine and break explicitly, so the abort
-                  ;; does not depend on the stream honoring stream-state on the
-                  ;; next pull.
-                  (setf budget-exceeded-p t)
-                  (setf (cl-llm-provider:stream-state stream) :closed)
-                  (emit-event agent-id
-                              (list :type :budget-exceeded
-                                    :agent-id agent-id
-                                    :tokens-used tokens-used
-                                    :limit (budget-tokens budget)))
-                  (return))))
+    ;; The true busy signal (F6): T exactly while a stream is in flight. Set
+    ;; before the pull loop and cleared in the UNWIND-PROTECT cleanup below, so
+    ;; an interrupted or failed stream can never leave it stuck on.
+    (setf (agent-streaming-p agent) t)
+    (unwind-protect
+         (progn
+           ;; A provider-detected interruption is converted to the provider's
+           ;; own clean abort: the restart is established by read-stream-chunk's
+           ;; restart-case while the condition propagates, so this caller-bound
+           ;; handler is in scope, and invoking it unwinds to the restart body,
+           ;; which sets stream-state :closed and returns NIL so the loop ends
+           ;; cleanly.
+           (handler-bind ((cl-llm-provider:stream-interrupted-error
+                           (lambda (c)
+                             (declare (ignore c))
+                             (setf interrupted-p t)
+                             (invoke-restart 'cl-llm-provider:abort-stream))))
+             (loop :for chunk = (cl-llm-provider:read-stream-chunk stream)
+                   :while chunk
+                   :do (setf last-chunk chunk)
+                       (setf tokens-used (%stream-chunk-tokens chunk tokens-used))
+                       (emit-event agent-id
+                                   (list :type :delta
+                                         :agent-id agent-id
+                                         :kind :model
+                                         :chunk-delta (cl-llm-provider:chunk-delta chunk)))
+                       (when (and (not (unlimited-p budget :kind :tokens))
+                                  (> tokens-used (budget-tokens budget)))
+                         ;; Budget abort (F1 half 1): close the stream through
+                         ;; the provider's state machine and break explicitly, so
+                         ;; the abort does not depend on the stream honoring
+                         ;; stream-state on the next pull.
+                         (setf budget-exceeded-p t)
+                         (setf (cl-llm-provider:stream-state stream) :closed)
+                         (emit-event agent-id
+                                     (list :type :budget-exceeded
+                                           :agent-id agent-id
+                                           :tokens-used tokens-used
+                                           :limit (budget-tokens budget)))
+                         (return))))
+           ;; The stream always ends with a :finalize, on every path — a clean
+           ;; finish, a budget abort, or a converted interruption — so the
+           ;; client can tell a completed stream from a stalled one (F3). The
+           ;; event-index is the transcript length at emit time: the
+           ;; pre-integration cursor, the same coordinate %cursor-for / MEM089
+           ;; use, because model-step-streaming never integrates its own event.
+           (emit-event agent-id
+                       (list :type :finalize
+                             :agent-id agent-id
+                             :event-index (sexpr.transcript:transcript-length
+                                           (agent-transcript agent)))))
+      ;; Clear the busy flag however the stream ended (clean, aborted, or an
+      ;; escaping error).
+      (setf (agent-streaming-p agent) nil))
     (append
      (make-model-event
       (cl-llm-provider:stream-accumulated-content stream)
@@ -470,7 +511,7 @@ as if it were a tool result."
                      (getf tool-call :name) err)))))
 (export 'dispatch-tool-call)
 
-(defun run-until-finished (agent &key max-steps)
+(defun run-until-finished (agent &key max-steps streaming)
   "Run AGENT's loop: model-step, integrate, repeat until finished-p or
 MAX-STEPS. Returns the transcript. With MAX-STEPS nil the loop is unbounded
 (the contract agent-loop preserves); with a positive integer it stops after
@@ -482,17 +523,45 @@ tool calls returned (R021). The cap check runs AFTER dispatch and never as an
 :until clause: a tool round at step-count == max-steps dispatches and then
 stops without a follow-up model call (D005). That ordering is the one place
 the cap's meaning is ambiguous — max-steps counts model turns, and a tool round
-is one of them — so dispatch comes first and the stop comes after."
+is one of them — so dispatch comes first and the stop comes after.
+
+STREAMING selects the streaming model step (model-step-streaming, S05) instead
+of the non-streaming model-step. On that path the loop emits a :tool-start bus
+event before each dispatch and a :tool-result after it, carrying the result
+event's printed projection (event-text) as both :value and :text so the bus
+never carries a live object (R023). The loop also stops on a truncated turn: a
+budget abort or a converted interruption leaves the event with no :finish, so
+without the :budget-exceeded / :interrupted checks the loop would ask the model
+again forever. The non-streaming path emits no tool events and is otherwise
+unchanged."
   (let ((*current-agent* agent))
     (loop
        :with step-count = 0
-       :for event = (model-step agent)
+       :for event = (if streaming (model-step-streaming agent) (model-step agent))
        :do (integrate agent event)
            (incf step-count)
            (when (tool-round-p event)
              (dolist (call (event-tool-calls event))
-               (integrate agent (dispatch-tool-call agent call))))
+               (let ((call-id (getf call :id))
+                     (call-name (getf call :name)))
+                 (when streaming
+                   (emit-event (agent-name agent)
+                               (list :type :tool-start
+                                     :agent-id (agent-name agent)
+                                     :call-id call-id
+                                     :name call-name)))
+                 (let ((result (dispatch-tool-call agent call)))
+                   (when streaming
+                     (emit-event (agent-name agent)
+                                 (list :type :tool-result
+                                       :agent-id (agent-name agent)
+                                       :call-id call-id
+                                       :value (sexpr.transcript:event-text result)
+                                       :text (sexpr.transcript:event-text result))))
+                   (integrate agent result)))))
            (when (or (finished-p event)
+                     (getf event :budget-exceeded)
+                     (getf event :interrupted)
                      (and max-steps (>= step-count max-steps)))
              (return)))
     (agent-transcript agent)))
@@ -504,3 +573,13 @@ max-steps, preserving the unbounded contract. Chat callers use
 run-until-finished with :max-steps."
   (run-until-finished agent))
 (export 'agent-loop)
+
+(defun agent-loop-streaming (agent)
+  "Run AGENT's loop to completion through the STREAMING model step.
+
+Delegates to run-until-finished with :streaming t and no max-steps, so a
+subagent's model turn emits :delta / :finalize / :tool-start / :tool-result
+onto the event bus (S05). agent-loop stays non-streaming so the
+non-streaming provider-call path is untouched."
+  (run-until-finished agent :streaming t))
+(export 'agent-loop-streaming)

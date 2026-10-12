@@ -127,6 +127,26 @@ the same shape the provider's real readers establish."))
 (defvar *last-tools* nil
   "The :tools argument the stubbed complete-stream most recently received.")
 
+;;; --- the non-streaming provider stub --------------------------------
+;;;;
+;;;; Test 14 needs the NON-streaming loop to run, and that path goes
+;;;; model-step -> sexpr.provider:provider-call, not complete-stream. A stub
+;;;; endpoint class with a canned node list is the same seam tests/kernel.lisp
+;;;; uses, so no fdefinition surgery on model-step is needed.
+
+(defclass tool-stub-endpoint ()
+  ((responses
+    :initarg :responses
+    :initform nil
+    :accessor tool-stub-responses
+    :documentation "Canned provider nodes, consumed in order.")))
+
+(defmethod sexpr.provider:provider-call ((endpoint tool-stub-endpoint) messages
+                                         &key system tools temperature max-tokens)
+  (declare (ignore messages system tools temperature max-tokens))
+  (let ((next (pop (tool-stub-responses endpoint))))
+    (or next (error "tool-stub-endpoint exhausted"))))
+
 ;;; --- stub + restore -------------------------------------------------
 
 (defparameter *real-complete-stream* nil)
@@ -181,16 +201,19 @@ fake-stream. Real providers are untouched for everything else."
                                               (make-fake-chunk "" :finish-reason :stop))
                                 :content "Hello world"
                                 :tool-calls nil))
-           (let ((event (model-step-streaming
-                         (spawn :goal "g" :name "streamer" :endpoint :ollama))))
+           (let* ((event (model-step-streaming
+                          (spawn :goal "g" :name "streamer" :endpoint :ollama)))
+                  ;; model-step-streaming now also emits one :finalize, so count
+                  ;; only the deltas here.
+                  (deltas (remove-if-not (lambda (e) (eq (getf e :type) :delta))
+                                         (nreverse received))))
              (declare (ignore event))
-             (and (= (length received) 3)
-                  (every (lambda (e) (eq (getf e :type) :delta)) received)
-                  (equal (mapcar (lambda (e) (getf e :chunk-delta))
-                                 (nreverse received))
+             (and (= (length deltas) 3)
+                  (equal (mapcar (lambda (e) (getf e :chunk-delta)) deltas)
                          '("Hello" " world" ""))
+                  (every (lambda (e) (eq (getf e :kind) :model)) deltas)
                   (every (lambda (e) (string= (getf e :agent-id) "streamer"))
-                         received)))))
+                         deltas)))))
 
        (test "2. the final event carries accumulated content, finish and usage"
          (setf *fake-stream*
@@ -283,6 +306,8 @@ fake-stream. Real providers are untouched for everything else."
                   (= (getf bus :tokens-used) 6)
                   (= (getf bus :limit) 5)
                   (string= (getf bus :agent-id) "streamer")
+                  ;; the budget-abort path still ends the stream with :finalize
+                  (find :finalize received :key (lambda (e) (getf e :type)))
                   ;; the loop stopped at the ceiling: the last two chunks are unread
                   (= (length (fake-chunks *fake-stream*)) 2)))))
 
@@ -303,7 +328,11 @@ fake-stream. Real providers are untouched for everything else."
              (and (null (getf event :budget-exceeded))
                   (null (find :budget-exceeded received
                               :key (lambda (e) (getf e :type))))
-                  (= (length received) 3)
+                  ;; deltas only: the stream also emits one :finalize
+                  (= (length (remove-if-not
+                              (lambda (e) (eq (getf e :type) :delta))
+                              received))
+                     3)
                   (not (cl-llm-provider:stream-closed-p *fake-stream*))))))
 
        (test "9. the delta-character proxy trips a budget with no usage reported"
@@ -341,7 +370,128 @@ fake-stream. Real providers are untouched for everything else."
              (and (getf event :interrupted)
                   (cl-llm-provider:stream-closed-p *fake-stream*)
                   (string= (event-content event) "partial")
-                  (null (getf event :budget-exceeded))))))
+                  (null (getf event :budget-exceeded))
+                  ;; the interruption path also ends the stream with :finalize
+                  (find :finalize received :key (lambda (e) (getf e :type)))))))
+
+       (test "11. a clean stream emits exactly one :finalize with the pre-integration index"
+         (clrhash *event-bus*)
+         (let ((received nil)
+               (agent (spawn :goal "g" :name "streamer" :endpoint :ollama)))
+           ;; two pre-existing events so the cursor is a non-trivial number
+           (integrate agent (make-user-event "one"))
+           (integrate agent (make-user-event "two"))
+           (subscribe-event-bus "streamer" (lambda (e) (push e received)))
+           (setf *fake-stream*
+                 (make-instance 'fake-stream
+                                :chunks (list (make-fake-chunk "Hello")
+                                              (make-fake-chunk " world" :finish-reason :stop))
+                                :content "Hello world"
+                                :tool-calls nil))
+           (let* ((event (model-step-streaming agent))
+                  (finalizes (remove-if-not (lambda (e) (eq (getf e :type) :finalize))
+                                            (nreverse received))))
+             (declare (ignore event))
+             (and (= (length finalizes) 1)
+                  (= (getf (first finalizes) :event-index) 2)
+                  (string= (getf (first finalizes) :agent-id) "streamer")))))
+
+       (test "12. agent-streaming-p is T while a stream is in flight and NIL after"
+         (clrhash *event-bus*)
+         (let ((streaming-during nil)
+               (agent (spawn :goal "g" :name "streamer" :endpoint :ollama)))
+           (subscribe-event-bus "streamer"
+                                (lambda (e)
+                                  (when (eq (getf e :type) :delta)
+                                    (setf streaming-during (agent-streaming-p agent)))))
+           (setf *fake-stream*
+                 (make-instance 'fake-stream
+                                :chunks (list (make-fake-chunk "x" :finish-reason :stop))
+                                :content "x"
+                                :tool-calls nil))
+           (let ((before (agent-streaming-p agent)))
+             (model-step-streaming agent)
+             (and (null before)
+                  streaming-during
+                  (null (agent-streaming-p agent))))))
+
+       (test "13. run-until-finished :streaming t emits tool progress and stops on budget"
+         (clrhash *event-bus*)
+         (reset-tool-registry!)
+         (define-tool stream-echo (x)
+           "Echo a value for the streaming tool-progress test."
+           x)
+         (let ((received nil)
+               (agent (spawn :goal "g" :name "streamer" :endpoint :ollama
+                             :budget (make-budget :tokens 1))))
+           (subscribe-event-bus "streamer" (lambda (e) (push e received)))
+           (setf *fake-stream*
+                 (make-instance 'fake-stream
+                                ;; 4 chars -> 1 token per chunk by the proxy; the
+                                ;; second chunk takes the total to 2 > 1 and trips.
+                                :chunks (list (make-fake-chunk "aaaa")
+                                              (make-fake-chunk "bbbb"))
+                                :content "aaaabbbb"
+                                :tool-calls (list (make-fake-tool-call
+                                                   "c1" "stream-echo" '(:x 42)))))
+           (run-until-finished agent :streaming t)
+           (let* ((events (nreverse received))
+                  (types (mapcar (lambda (e) (getf e :type)) events))
+                  (start (find :tool-start events :key (lambda (e) (getf e :type))))
+                  (result (find :tool-result events :key (lambda (e) (getf e :type)))))
+             (and (member :budget-exceeded types)
+                  ;; the truncated turn still ends the stream with :finalize
+                  (member :finalize types)
+                  start
+                  result
+                  (< (position :tool-start types) (position :tool-result types))
+                  (string= (getf start :call-id) "c1")
+                  (string= (getf start :name) "stream-echo")
+                  (string= (getf result :call-id) "c1")
+                  (stringp (getf result :value))
+                  (string= (getf result :value) (getf result :text))
+                  ;; the budget abort stopped the loop after one model turn
+                  (= (length (remove-if-not (lambda (e) (eq (getf e :type) :delta))
+                                            events))
+                     2)))))
+
+       (test "14. the non-streaming loop emits no tool events for the same round"
+         (clrhash *event-bus*)
+         (reset-tool-registry!)
+         (define-tool stream-echo (x)
+           "Echo a value for the non-streaming tool-progress control."
+           x)
+         (let* ((received nil)
+                (endpoint (make-instance 'tool-stub-endpoint
+                                         :responses
+                                         (list (list :content ""
+                                                     :tool-calls (list (list :id "c1"
+                                                                             :name "stream-echo"
+                                                                             :arguments '(:x 42)))
+                                                     :finish :tool-calls)
+                                               (list :content "done" :finish :stop))))
+                (agent (spawn :goal "g" :name "streamer" :endpoint endpoint)))
+           (subscribe-event-bus "streamer" (lambda (e) (push e received)))
+           (run-until-finished agent)
+           (and (null received)
+                ;; the tool round really dispatched: model, result, model
+                (= (transcript-length (agent-transcript agent)) 3))))
+
+       (test "15. agent-loop-streaming is fbound and drives the streaming path"
+         (clrhash *event-bus*)
+         (let ((received nil)
+               (agent (spawn :goal "g" :name "streamer" :endpoint :ollama)))
+           (subscribe-event-bus "streamer" (lambda (e) (push e received)))
+           (setf *fake-stream*
+                 (make-instance 'fake-stream
+                                :chunks (list (make-fake-chunk "hi" :finish-reason :stop))
+                                :content "hi"
+                                :tool-calls nil))
+           (and (fboundp 'agent-loop-streaming)
+                (progn (agent-loop-streaming agent) t)
+                ;; the streaming path emits a :finalize the non-streaming
+                ;; model-step never does
+                (find :finalize received :key (lambda (e) (getf e :type))))))
 
   (restore-streaming-api))
 
