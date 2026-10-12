@@ -954,11 +954,15 @@ model. The transcript-delta reply is id 2 (an empty refetch)."
     (tui:init model)
     model))
 
-(test "S04/T04: agent-light maps pending -> yellow, running+live -> red, else green, and never signals"
+(test "S05/T06: agent-light maps pending -> yellow, streaming -> red, else green, and never signals"
+  ;; S05/T06 retires S04's v1 running+live-thread heuristic: the true busy signal is
+  ;; the data-only :streaming boolean (F6). A running agent with a live thread but no
+  ;; in-flight stream is NOT busy and lights green.
   (and (eq :yellow (agent-light (list :name "A" :pending-approval t)))
        (eq :yellow (agent-light (list :name "A" :status :idle
                                       :pending-approval '(:capability "net"))))
-       (eq :red (agent-light (list :name "A" :status :running :thread-alive-p t)))
+       (eq :red (agent-light (list :name "A" :streaming t)))
+       (eq :green (agent-light (list :name "A" :status :running :thread-alive-p t)))
        (eq :green (agent-light (list :name "A" :status :finished)))
        (eq :green (agent-light (list :name "A" :status :running :thread-alive-p nil)))
        ;; a bare plist and NIL degrade to green rather than signalling
@@ -1437,6 +1441,91 @@ can assert on the packet text the model wrote."
       (tui:update model (make-key-msg :key #\g :ctrl t))
       (and (null (model-pending-approval model))
            (search "GRANT-ONCE" (get-output-stream-string out))))))
+
+;;;; --- 8e. S05 T06: in-flight accumulation, tool/budget rendering, streaming lights ---
+;;;
+;;; These tests drive the REAL update/view path over the canned two-agent model. The
+;;; in-flight line is asserted on `model-in-flight` and through `tui:view` (the render
+;;; path), because the whole point of T06 is the shape the operator sees: one growing
+;;; line, not one line per fragment (F5).
+
+(test "S05/T06: three model deltas accumulate into ONE in-flight line, and finalize commits it as one scrollback line"
+  (let* ((model (init-two-agent-model :picked "Alpha"))
+         (before (length (model-scrollback model))))
+    (dolist (frag '("Hel" "lo " "world"))
+      (tui:update model (make-delta-msg :agent "Alpha" :content frag)))
+    (let ((v (tui:view model)))
+      (and (equal "Hello world" (model-in-flight model))
+           ;; the view shows the concatenation EXACTLY once: one growing line, not a
+           ;; waterfall of per-fragment lines
+           (= 1 (count-substring "Hello world" v))
+           ;; nothing has been committed to the scrollback while the turn streams
+           (= before (length (model-scrollback model)))
+           (progn
+             (tui:update model (make-finalize-msg :agent "Alpha" :event-index 3))
+             (and (null (model-in-flight model))
+                  ;; committed as EXACTLY one line
+                  (= (1+ before) (length (model-scrollback model)))
+                  (equal "Hello world" (first (model-scrollback model)))
+                  (= 1 (count-substring "Hello world" (tui:view model)))))))))
+
+(test "S05/T06: a :kind :tool delta renders as its own tool-prefixed line and does not join the in-flight model line"
+  (let ((model (init-two-agent-model :picked "Alpha")))
+    (tui:update model (make-delta-msg :agent "Alpha" :content "prose"))
+    (tui:update model (make-delta-msg :agent "Alpha" :content "chunk" :kind :tool))
+    (let ((v (tui:view model)))
+      (and (equal "prose" (model-in-flight model))
+           (search "tool: chunk" v)
+           (search "tool: chunk" (lines-to-string (model-scrollback model)))
+           ;; the tool fragment never leaked into the in-flight model line
+           (not (search "prosechunk" v))))))
+
+(test "S05/T06: tool-start and tool-result render prefixed progress lines in the view"
+  (let ((model (init-two-agent-model :picked "Alpha")))
+    (tui:update model (make-tool-start-msg :agent "Alpha" :call-id "c1" :name "get_weather"))
+    (tui:update model (make-tool-result-msg :agent "Alpha" :call-id "c1" :value :ok :text "18C"))
+    (let ((v (tui:view model)))
+      (and (search "tool: get_weather (call c1) started" v)
+           (search "tool: c1 -> 18C" v)))))
+
+(test "S05/T06: a budget-exceeded-msg commits a budget line with tokens-used/limit to the view"
+  (let ((model (init-two-agent-model :picked "Alpha")))
+    (tui:update model (make-budget-exceeded-msg :agent "Alpha" :tokens-used 4096 :limit 4000))
+    (let ((v (tui:view model)))
+      (and (search "budget: 4096/4000 tokens" v)
+           (search "budget: 4096/4000 tokens"
+                   (lines-to-string (model-scrollback model)))))))
+
+(test "S05/T06: a delta sets :streaming on the row (red light) and finalize clears it (green)"
+  (let ((model (init-two-agent-model :picked "Alpha")))
+    (tui:update model (make-delta-msg :agent "Alpha" :content "x"))
+    (let ((red (eq :red (agent-light (model-agent-row model "Alpha")))))
+      (tui:update model (make-finalize-msg :agent "Alpha" :event-index 0))
+      (and red
+           (eq :green (agent-light (model-agent-row model "Alpha")))
+           ;; a NON-picked agent's delta still lights its own row red (F6)
+           (progn
+             (tui:update model (make-delta-msg :agent "Beta" :content "y"))
+             (eq :red (agent-light (model-agent-row model "Beta"))))))))
+
+(test "S05/T06: an out-of-order finalize with no in-flight line is a safe no-op"
+  (let* ((model (init-two-agent-model :picked "Alpha"))
+         (before (length (model-scrollback model))))
+    (tui:update model (make-finalize-msg :agent "Alpha" :event-index 0))
+    (and (null (model-in-flight model))
+         (= before (length (model-scrollback model)))
+         (stringp (tui:view model))
+         ;; a finalize for an unknown agent is also safe
+         (progn
+           (tui:update model (make-finalize-msg :agent "Ghost" :event-index 0))
+           (stringp (tui:view model))))))
+
+(test "S05/T06: switching agents drops a half-streamed in-flight line rather than bleeding it"
+  (let ((model (init-two-agent-model :picked "Alpha")))
+    (tui:update model (make-delta-msg :agent "Alpha" :content "partial"))
+    (model-switch-agent model "Beta")
+    (and (null (model-in-flight model))
+         (not (search "partial" (tui:view model))))))
 
 ;;;; --- summary -------------------------------------------------------------
 

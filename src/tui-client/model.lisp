@@ -93,6 +93,13 @@ the client persists it so each event is fetched exactly once.")
                :documentation "The chat lines, NEWEST FIRST, bounded by scrollback-cap.
 This is the bounded copy: the viewport content is derived from it, so the cap is
 enforced in the data and the pane cannot overflow it.")
+   (in-flight :initform nil :accessor model-in-flight
+              :documentation "The growing line of the PICKED agent's in-flight stream,
+or NIL when no turn is streaming. Deltas accumulate here instead of each becoming its
+own scrollback line, so a streamed sentence renders as ONE growing line rather than
+one word per line (research F5). The value is committed to the scrollback as a single
+line by finalize-msg and cleared; model-switch-agent clears it too, because a
+half-streamed line for the old agent must never bleed into the new transcript.")
    (scrollback-cap :initarg :scrollback-cap :initform *scrollback-cap* :accessor model-scrollback-cap)
    (repl-lines :initform nil :accessor model-repl-lines
                :documentation "The REPL output lines, newest first, bounded by repl-cap.")
@@ -136,19 +143,34 @@ because entries are stored newest-first."
   (%cap (cons (one-line line) list) cap))
 (export 'append-line)
 
+(defun model-render-chat (model)
+  "Set the chat viewport content to the committed scrollback followed by the in-flight
+line (when any), then scroll to the bottom. This is the ONE place the chat pane content
+is written, so a committed line and a growing in-flight line always render together and
+a streamed turn re-renders once per fragment instead of once per fragment-plus-whole-
+scrollback (research F5: the O(n^2) shape). The in-flight line is NOT in the scrollback:
+it is appended at render time, so it can grow without touching the bounded scrollback
+cap and is committed exactly once by finalize-msg."
+  (let ((vp (model-chat-viewport model)))
+    (when vp
+      (tui.viewport:viewport-set-content
+       vp (lines-to-string
+           (append (nreverse (model-scrollback model))
+                   (when (model-in-flight model)
+                     (list (model-in-flight model))))))
+      (tui.viewport:viewport-goto-bottom vp)))
+  model)
+(export 'model-render-chat)
+
 (defun model-append-chat-line (model line)
-  "Append LINE to the chat scrollback, re-cap it, and push the new content into the
-chat viewport scrolled to the bottom. The viewport follows the newest line, which is
-what makes a streamed turn readable without scrolling."
+  "Append LINE to the chat scrollback, re-cap it, and re-render the chat pane via
+model-render-chat so any in-flight streamed line stays visible below it. The viewport
+follows the newest line, which is what makes a streamed turn readable without
+scrolling."
   (setf (model-scrollback model)
         (append-line (model-scrollback model)
                      (model-scrollback-cap model) line))
-  (let ((vp (model-chat-viewport model)))
-    (when vp
-      (tui.viewport:viewport-set-content vp
-                                         (lines-to-string
-                                          (nreverse (model-scrollback model))))
-      (tui.viewport:viewport-goto-bottom vp)))
+  (model-render-chat model)
   model)
 
 (defun model-append-repl-line (model line)
@@ -369,19 +391,18 @@ the model's picked state (S04/T05)."
 ;;;; --- agent lights and per-agent state (M004/S04 T04) ----------------
 
 (defun agent-light (agent)
-  "The v1 green/red/yellow light for an agent-snapshot plist (D028):
+  "The green/red/yellow light for an agent-snapshot plist:
   :yellow  when :pending-approval is non-NIL (the agent is blocked on an approval)
-  :red     when :status is :running AND :thread-alive-p is true (busy)
-  :green   otherwise (idle/finished/failed/killed, or running with no live thread)
+  :red     when :streaming is true (a stream is in flight for this agent — the true
+           busy signal, F6, replacing S04's running+live-thread heuristic)
+  :green   otherwise (idle/finished/failed/killed, or running with no in-flight stream)
 PURE and total: a missing key or a NIL AGENT degrades to :green, and nothing here
-signals. There is no true \"busy\" status yet (agent-status has only
-running/finished/failed/killed), so red is approximated by running+live-thread and
-documented as v1; S05's streaming/budget slice replaces the heuristic."
+signals. :streaming is the data-only boolean the image sets while model-step-streaming
+runs for that agent; S04's v1 heuristic is retired because a running agent with a live
+thread is not necessarily busy streaming a turn."
   (cond
     ((getf agent :pending-approval) :yellow)
-    ((and (eq (getf agent :status) :running)
-          (getf agent :thread-alive-p))
-     :red)
+    ((getf agent :streaming) :red)
     (t :green)))
 (export 'agent-light)
 
@@ -422,6 +443,18 @@ Returns the updated model-agents list."
                       (setf (getf copy :pending-approval) pending)
                       copy))))
 (export '%set-agent-pending)
+
+(defun %set-agent-streaming (model name streaming)
+  "Set the data-only :streaming boolean on the row named NAME. Returns the updated
+model-agents list. STREAMING is T while a stream is in flight for that agent and NIL
+once finalize arrives; AGENT-LIGHT reads it for the red busy light (F6). A NAME that
+matches no row is a no-op (the snapshot is unchanged)."
+  (%map-agent-row model name
+                  (lambda (a)
+                    (let ((copy (copy-list a)))
+                      (setf (getf copy :streaming) streaming)
+                      copy))))
+(export '%set-agent-streaming)
 
 (defun resolve-pending-approval (model decision)
   "Resolve the picked agent's pending approval with DECISION (a keyword such as
@@ -505,7 +538,10 @@ signalled."
                    :key (lambda (a) (getf a :name)) :test #'string=))
     (setf (model-picked-agent model) name
           (model-cursor model) 0
-          (model-scrollback model) nil)
+          (model-scrollback model) nil
+          ;; a half-streamed line for the OLD agent must never bleed into the new
+          ;; transcript; drop it rather than commit a partial line under the wrong agent.
+          (model-in-flight model) nil)
     (let ((vp (model-chat-viewport model)))
       (when vp (tui.viewport:viewport-set-content vp "")))
     (multiple-value-bind (events cursor error)
@@ -779,11 +815,73 @@ the single `update` method owns the dispatch."
     ;; push channel: a streamed fragment
     ((delta-msg-p msg)
      (let ((agent (delta-msg-agent msg))
-           (content (delta-msg-content msg)))
+           (content (delta-msg-content msg))
+           (kind (delta-msg-kind msg)))
+       ;; ANY agent's stream lights its row red (F6): set the data-only :streaming
+       ;; boolean and refresh the agent pane even when the fragment is for an agent
+       ;; that is not the picked one. %map-agent-row is a no-op for an unknown name.
+       (when agent
+         (%set-agent-streaming model agent t)
+         (refresh-agent-viewport model))
        (when (or (null agent)
                  (null (model-picked-agent model))
                  (string= agent (model-picked-agent model)))
-         (model-append-chat-line model (or content ""))))
+         (if (eq kind :tool)
+             ;; a tool's streamed output is its own committed line, never joined into
+             ;; the model's in-flight prose line.
+             (model-append-chat-line model (format nil "tool: ~A" (or content "")))
+             ;; model prose ACCUMULATES into one growing line and re-renders ONCE,
+             ;; so a streamed sentence is one line, not one word per line (F5).
+             (progn
+               (setf (model-in-flight model)
+                     (concatenate 'string (or (model-in-flight model) "")
+                                  (or content "")))
+               (model-render-chat model))))
+       (values model nil)))
+    ;; push channel: the streaming turn ended — commit the in-flight line (S05)
+    ((finalize-msg-p msg)
+     (let ((agent (finalize-msg-agent msg))
+           (line (model-in-flight model)))
+       ;; commit the accumulated line as ONE scrollback line and clear the buffer
+       ;; BEFORE re-rendering, so the committed line is not also shown as in-flight.
+       (when line
+         (setf (model-in-flight model) nil)
+         (model-append-chat-line model line)
+         (setf (model-status-text model) "turn done"))
+       ;; clear the red light for the finished agent (an out-of-order finalize with
+       ;; no in-flight line is still a safe no-op beyond this).
+       (when agent
+         (%set-agent-streaming model agent nil)
+         (refresh-agent-viewport model)))
+     (values model nil))
+    ;; push channel: a tool call began (S05) — a plain prefixed progress line
+    ((tool-start-msg-p msg)
+     (model-append-chat-line
+      model
+      (format nil "tool: ~A (call ~A) started"
+              (or (tool-start-msg-name msg) "?")
+              (or (tool-start-msg-call-id msg) "?")))
+     (values model nil))
+    ;; push channel: a tool call finished (S05)
+    ((tool-result-msg-p msg)
+     (model-append-chat-line
+      model
+      (format nil "tool: ~A -> ~A"
+              (or (tool-result-msg-call-id msg) "?")
+              (or (tool-result-msg-text msg) "")))
+     (values model nil))
+    ;; push channel: the token budget was hit and the stream aborted mid-turn (S05)
+    ((budget-exceeded-msg-p msg)
+     (let ((used (budget-exceeded-msg-tokens-used msg))
+           (limit (budget-exceeded-msg-limit msg)))
+       ;; the durable signal is the committed budget line; the status text is set too
+       ;; (refresh-status rebuilds it each update, matching the resync branch).
+       (setf (model-status-text model)
+             (one-line (format nil "budget: ~A/~A tokens"
+                               (or used "?") (or limit "?"))))
+       (model-append-chat-line
+        model
+        (format nil "budget: ~A/~A tokens" (or used "?") (or limit "?"))))
      (values model nil))
     ;; push channel: backpressure — the server dropped fragments
     ((resync-msg-p msg)

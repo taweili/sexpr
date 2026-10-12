@@ -184,6 +184,8 @@
    #:model-agents
    #:model-cursor
    #:model-scrollback
+   #:model-in-flight
+   #:model-render-chat
    #:model-scrollback-cap
    #:model-repl-lines
    #:model-repl-cap

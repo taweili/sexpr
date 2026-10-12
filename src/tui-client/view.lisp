@@ -29,6 +29,13 @@
 ;;;; plus an approval strip whose [grant-once]/[deny] affordances are zoned. The
 ;;;; zone markers are recorded and stripped by the ROOT zone-scan in tui:view, which
 ;;;; is also why the pane's viewport height is now *agent-pane-height* and not 0.
+;;;;
+;;;; THE IN-FLIGHT STREAM IS PART OF THE CHAT VIEWPORT (M004/S05 T06). The growing
+;;;; streamed line is NOT a separate pane or layout state: MODEL-RENDER-CHAT (model.lisp)
+;;;; writes the committed scrollback followed by the in-flight line into the chat
+;;;; viewport's content, and tui:view already renders that viewport. So view.lisp needs
+;;;; no new state — tool/budget progress lines are plain prefixed scrollback lines and
+;;;; the in-flight line simply rides along as the viewport's last line.
 
 (in-package :sexpr-tui)
 
