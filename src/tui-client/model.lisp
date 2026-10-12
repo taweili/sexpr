@@ -155,7 +155,12 @@ cap and is committed exactly once by finalize-msg."
     (when vp
       (tui.viewport:viewport-set-content
        vp (lines-to-string
-           (append (nreverse (model-scrollback model))
+           ;; NON-DESTRUCTIVE reverse: the scrollback slot is stored NEWEST FIRST, so
+           ;; the view needs it oldest-first. NRVERSE would mutate the slot's cons
+           ;; cells in place, leaving the slot pointing at the old head (now the tail)
+           ;; and silently truncating the bounded scrollback to ONE line after every
+           ;; render (only the two most recent appends ever survived).
+           (append (reverse (model-scrollback model))
                    (when (model-in-flight model)
                      (list (model-in-flight model))))))
       (tui.viewport:viewport-goto-bottom vp)))
@@ -179,9 +184,11 @@ scrolling."
         (append-line (model-repl-lines model) (model-repl-cap model) line))
   (let ((vp (model-repl-viewport model)))
     (when vp
+      ;; NON-DESTRUCTIVE reverse for the same reason as MODEL-RENDER-CHAT: the
+      ;; repl-lines slot is stored newest-first and NRVERSE would truncate it.
       (tui.viewport:viewport-set-content vp
                                          (lines-to-string
-                                          (nreverse (model-repl-lines model))))
+                                          (reverse (model-repl-lines model))))
       (tui.viewport:viewport-goto-bottom vp)))
   model)
 

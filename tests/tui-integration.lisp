@@ -642,3 +642,191 @@ mirror zone-in-bounds-p's own (1- x) / (- y 2) mapping."
       (sexpr.tui:stop-server server)
       (clrhash sexpr.kernel:*event-bus*)
       (clrhash sexpr.agents:*agent-table*))))
+
+;;; --- (8) the M004/S05 full streaming + budget round trip -----------
+;;;;
+;;;; T07's integration closure. Every hop between the kernel and the pane is REAL:
+;;;; the kernel emits a streaming turn's bus events (:delta x2, :tool-start,
+;;;; :tool-result, :budget-exceeded, :finalize), the push server's per-subscription
+;;;; listener translates each one and enqueues it, the writer thread drains the queue
+;;;; onto a loopback TCP socket, the client reads and decodes each frame into a
+;;;; message object, and `tui:update` folds it into the TEA model that `tui:view`
+;;;; renders. Nothing here is hand-built: the frames on the socket are the server's
+;;;; translation of real bus events, not canned wire strings.
+;;;;
+;;;; The assertion surface is `tui:view` (the REAL render path). The streamed prose
+;;;; must appear as ONE line ("Hello world", not "Hello " and "world"), the tool
+;;;; progress and the budget abort must appear as their own prefixed lines, and the
+;;;; agent's row must be RED while the stream is in flight and GREEN after finalize
+;;;; (the true busy signal, F6). Only the swank channel is a string stream — no RPC
+;;;; is issued by these push branches, so no live swank server is needed.
+
+(rove:deftest m004-streaming-and-budget-round-trip-through-the-real-push-server
+  (clrhash sexpr.kernel:*event-bus*)
+  (clrhash sexpr.agents:*agent-table*)
+  (let* ((a-name "int-s05-e2e")
+         (server (sexpr.tui:start-server :port 0))
+         (collected nil)
+         (conn nil)
+         (model nil)
+         (reader nil))
+    (unwind-protect
+         (progn
+           (sexpr.agents:register-agent!
+            (sexpr.kernel:spawn :goal "g" :name a-name :endpoint :ollama))
+           ;; a real loopback client, subscribed to the streaming agent
+           (setf conn (sexpr-tui:connect-push
+                       "127.0.0.1" (sexpr.tui:push-server-port server)
+                       :on-message (lambda (m) (push m collected))))
+           (ok (typep conn 'sexpr-tui:tui-connection)
+               "connect-push returns a tui-connection over loopback")
+           (sexpr-tui:write-wire conn (list 'subscribe :agent a-name))
+           (let ((reply (sexpr-tui:decode-wire conn (bounded-tui-read conn))))
+             (ok (sexpr-tui:subscribed-msg-p reply)
+                 "the subscribe race-closure reply is read")
+             (ok (string= (sexpr-tui:subscribed-msg-agent reply) a-name)
+                 "the race-closure reply names the subscribed agent"))
+           ;; the TEA model over a string-stream swank channel, with the agent picked
+           ;; so streamed prose accumulates into the picked agent's in-flight line.
+           (setf model (make-instance 'sexpr-tui:tui-model
+                                      :swank-connection
+                                      (sexpr-tui:new-swank-connection
+                                       :port 0
+                                       :stream (make-string-input-stream ""))
+                                      :picked-agent a-name))
+           (sexpr-tui:build-panes model)
+           (setf (sexpr-tui:model-agents model)
+                 (list (list :name a-name :handle nil :status :running
+                             :thread-alive-p t)))
+           (tui:init-global-zone-manager)
+           (tui:zone-set-enabled t)
+           (sexpr-tui:refresh-agent-viewport model)
+           ;; one helper: read one frame off the real socket, decode it, fold it in
+           (flet ((int-step ()
+                    (let ((m (sexpr-tui:decode-wire conn (bounded-tui-read conn))))
+                      (tui:update model m)
+                      m)))
+             ;; --- the kernel's streaming turn, emitted on the bus ------------
+             (sexpr.kernel:emit-event
+              a-name (list :type :delta :agent-id a-name :kind :model
+                           :chunk-delta "Hello "))
+             (let ((m (int-step)))
+               (ok (and (sexpr-tui:delta-msg-p m)
+                        (string= (sexpr-tui:delta-msg-content m) "Hello "))
+                   "the first model fragment round-trips as a delta-msg")
+               (ok (eq :model (sexpr-tui:delta-msg-kind m))
+                   "the model fragment carries :kind :model"))
+             (sexpr.kernel:emit-event
+              a-name (list :type :delta :agent-id a-name :kind :model
+                           :chunk-delta "world"))
+             (int-step)
+             (ok (string= "Hello world" (sexpr-tui:model-in-flight model))
+                 "the two fragments accumulate into ONE in-flight line, not two")
+             (ok (eq :red (sexpr-tui:agent-light (int-agent-row model a-name)))
+                 "the agent row is RED while the stream is in flight (the true busy signal)")
+             ;; --- tool progress -----------------------------------------------
+             (sexpr.kernel:emit-event
+              a-name (list :type :tool-start :agent-id a-name
+                           :call-id "c1" :name "read-file"))
+             (let ((m (int-step)))
+               (ok (sexpr-tui:tool-start-msg-p m)
+                   "the tool-start event round-trips as a tool-start-msg"))
+             (sexpr.kernel:emit-event
+              a-name (list :type :tool-result :agent-id a-name
+                           :call-id "c1" :value "contents" :text "contents"))
+             (let ((m (int-step)))
+               (ok (sexpr-tui:tool-result-msg-p m)
+                   "the tool-result event round-trips as a tool-result-msg"))
+             ;; --- the budget abort --------------------------------------------
+             (sexpr.kernel:emit-event
+              a-name (list :type :budget-exceeded :agent-id a-name
+                           :tokens-used 12 :limit 10))
+             (let ((m (int-step)))
+               (ok (sexpr-tui:budget-exceeded-msg-p m)
+                   "the budget-exceeded event round-trips as a budget-exceeded-msg")
+               (ok (= 12 (sexpr-tui:budget-exceeded-msg-tokens-used m))
+                   "the budget frame carries the tokens used"))
+             ;; --- finalize: commit the in-flight line and clear the light -----
+             (sexpr.kernel:emit-event
+              a-name (list :type :finalize :agent-id a-name :event-index 1))
+             (let ((m (int-step)))
+               (ok (sexpr-tui:finalize-msg-p m)
+                   "the finalize event round-trips as a finalize-msg"))
+             (ok (null (sexpr-tui:model-in-flight model))
+                 "finalize clears the in-flight line")
+             (ok (eq :green (sexpr-tui:agent-light (int-agent-row model a-name)))
+                 "the agent row is GREEN after finalize (the stream is over)"))
+           ;; --- assertions through tui:view (the real render path) ----------
+           (let ((v (tui:view model)))
+             (ok (search "Hello world" v)
+                 "the streamed prose appears in the view as one contiguous line")
+             (ok (search "tool: read-file (call c1) started" v)
+                 "the tool-start renders as a tool-prefixed progress line")
+             (ok (search "tool: c1 -> contents" v)
+                 "the tool-result renders as a tool-prefixed progress line")
+             (ok (search "budget: 12/10 tokens" v)
+                 "the budget abort renders as a budget line with tokens-used/limit")
+             (ok (search a-name v)
+                 "the agent pane still renders the agent row"))
+           ;; the streamed turn is exactly ONE scrollback line, not one per fragment
+           (let ((sb (sexpr-tui:model-scrollback model)))
+             (ok (= 1 (count-if (lambda (l) (search "Hello world" l)) sb))
+                 "the streamed turn is committed as exactly ONE scrollback line")
+             (ok (notany (lambda (l) (and (search "Hello" l)
+                                          (not (search "world" l))))
+                         sb)
+                 "no partial 'Hello' line survived — the fragments were joined"))
+           ;; --- negative controls: malformed S05 frame + unknown operator ---
+           (let ((bad (sexpr-tui:make-client-connection
+                       :stream (make-string-input-stream
+                                (format nil "(budget-exceeded :agent)~%")))))
+             (ok (sexpr-tui:wire-ignored-msg-p
+                  (sexpr-tui:decode-wire bad (sexpr-tui:read-wire bad)))
+                 "a malformed S05 frame decodes to a wire-ignored-msg")
+             (ok (= 1 (sexpr-tui:stats-get bad :malformed))
+                 "the malformed S05 frame is counted as :malformed, not crashed"))
+           (let ((odd (sexpr-tui:make-client-connection
+                       :stream (make-string-input-stream
+                                (format nil "(frobnicate :agent \"A\")~%")))))
+             (let ((m (sexpr-tui:decode-wire odd (sexpr-tui:read-wire odd))))
+               (ok (sexpr-tui:wire-ignored-msg-p m)
+                   "an unknown operator is ignored, not rejected")
+               (ok (equal (sexpr-tui:wire-ignored-msg-op m) "FROBNICATE")
+                   "the ignored frame keeps its upcased operator name")
+               (ok (= 1 (sexpr-tui:stats-get odd :decode-unknown))
+                   "the unknown operator is counted as :decode-unknown")))
+           ;; --- the reader thread over the real socket, then its leak check --
+           (setf reader (sexpr-tui:start-wire-reader conn))
+           (sexpr.kernel:emit-event
+            a-name (list :type :delta :agent-id a-name :kind :model
+                         :chunk-delta "reader-frag"))
+           (loop repeat 250
+                 until (find-if (lambda (m)
+                                  (and (sexpr-tui:delta-msg-p m)
+                                       (string= (sexpr-tui:delta-msg-content m)
+                                                "reader-frag")))
+                                collected)
+                 do (sleep 0.02))
+           (ok (find-if (lambda (m)
+                          (and (sexpr-tui:delta-msg-p m)
+                               (string= (sexpr-tui:delta-msg-content m)
+                                        "reader-frag")))
+                        collected)
+               "the wire reader thread decodes a real-socket delta through the connection")
+           ;; stopping the server closes the client socket, so the reader sees EOF
+           ;; and exits; the join then makes the leak assertion meaningful.
+           (sexpr.tui:stop-server server)
+           (handler-case (sb-thread:join-thread reader :timeout 5.0) (error () nil))
+           (when (sb-thread:thread-alive-p reader)
+             (handler-case (sb-thread:terminate-thread reader) (error () nil)))
+           (ok (null (remove-if-not
+                      (lambda (th)
+                        (and (sb-thread:thread-name th)
+                             (equal (sb-thread:thread-name th)
+                                    sexpr-tui:*wire-reader-thread-name*)))
+                      (sb-thread:list-all-threads)))
+               "no tui-wire-reader thread survives cleanup"))
+      (when conn (sexpr-tui:close-connection conn))
+      (sexpr.tui:stop-server server)
+      (clrhash sexpr.kernel:*event-bus*)
+      (clrhash sexpr.agents:*agent-table*))))
