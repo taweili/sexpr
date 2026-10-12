@@ -293,14 +293,18 @@
                 "the client reads the (subscribed ...) reply — the race-closure signal")
             ;; the real streaming path: no hand-built event, no direct socket write
             (sexpr.kernel:model-step-streaming agent)
-            (loop repeat 3 do (push (read-wire stream 5.0) got))
+            ;; T04: three deltas (now carrying :kind :model) plus the :finalize
+            ;; that S05/T02 emits to end the stream.
+            (loop repeat 4 do (push (read-wire stream 5.0) got))
             (setf got (nreverse got))
-            (ok (wire-equal (first got) (list 'delta :agent agent-name :content "Hello"))
-                "the first streamed fragment arrives on the client socket as (delta ...)")
-            (ok (wire-equal (second got) (list 'delta :agent agent-name :content " world"))
+            (ok (wire-equal (first got) (list 'delta :agent agent-name :kind :model :content "Hello"))
+                "the first streamed fragment arrives on the client socket as (delta ...) with :kind :model")
+            (ok (wire-equal (second got) (list 'delta :agent agent-name :kind :model :content " world"))
                 "the second fragment arrives in stream order")
-            (ok (wire-equal (third got) (list 'delta :agent agent-name :content ""))
+            (ok (wire-equal (third got) (list 'delta :agent agent-name :kind :model :content ""))
                 "the final chunk arrives too — the client sees the whole stream")
+            (ok (wire-equal (fourth got) (list 'finalize :agent agent-name :event-index 0))
+                "the stream ends with a (finalize ...) carrying the pre-integration cursor")
             ;; the fragments are only on the wire: model-step-streaming RETURNS the
             ;; final event and the caller appends it afterwards (MEM089), so the push
             ;; channel is the only place the fragments are visible mid-stream.
@@ -308,8 +312,8 @@
                         (sexpr.kernel:agent-transcript agent)))
                 "the transcript has not advanced — the wire is the only record of the fragments")
             (let ((rec (car (getf (sexpr.tui:push-server-diagnostics server) :per-client))))
-              (ok (and rec (= (getf rec :enqueued) 3) (= (getf rec :dropped) 0))
-                  "the listener enqueued exactly three items and dropped none")))
+              (ok (and rec (= (getf rec :enqueued) 4) (= (getf rec :dropped) 0))
+                  "the listener enqueued exactly four items (three deltas + finalize) and dropped none")))
       (handler-case (sexpr.tui:stop-server server) (error () nil))
       (setf (fdefinition 'cl-llm-provider:complete-stream) real-cs)
       (setf (fdefinition 'cl-llm-provider:stream-tool-calls) real-stc)

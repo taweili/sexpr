@@ -144,6 +144,18 @@ Returns the last value of PRED."
   evaluated inside the image. A GLOBAL is required — the reader cannot see a
   lexical binding, so a lexical sentinel would make the test trivially true.")
 
+(defun wire-equal (a b)
+  "Compare two wire messages by SYMBOL-NAME rather than EQ.
+  The server's listener interns its operator symbols in :sexpr.tui while this test
+  package interns them locally, so plain EQUAL on a message read from the socket can
+  fail for the wrong reason. Comparing names is the package-independent contract —
+  the same reason %op dispatches by name."
+  (cond
+    ((and (symbolp a) (symbolp b)) (string= (symbol-name a) (symbol-name b)))
+    ((and (consp a) (consp b)) (and (wire-equal (car a) (car b))
+                                    (wire-equal (cdr a) (cdr b))))
+    (t (equal a b))))
+
 ;;;; --- tests ---------------------------------------------------------
 
 (format t "Push server tests (T01 accept loop + T02 subscribe protocol):~%~%")
@@ -566,16 +578,18 @@ Returns the last value of PRED."
                       (list :type :delta :agent-id "probe-A" :chunk-delta "hi"))
                     (let ((item (read-or-eof stream 2.0))
                           (rec (first-client-rec (push-server-diagnostics server))))
-                      (and (equal reply '(subscribed :agent "probe-A" :cursor 0))
+                      (and (wire-equal reply '(subscribed :agent "probe-A" :cursor 0))
                            (= (getf rec :enqueued) 1)
-                           (equal item (list 'delta :agent "probe-A" :content "hi"))
+                           ;; T04: the wire item now carries :kind, defaulted to
+                           ;; :model for a kind-less bus event.
+                           (wire-equal item (list 'delta :agent "probe-A"
+                                                  :kind :model :content "hi"))
                            ;; drain invariant: delivered + queue-length - replies == enqueued
                            (= (+ (getf rec :delivered) (getf rec :queue-length) -1)
-                              (getf rec :enqueued)))))
-                  )
-              (safe-close-socket c)))
+                              (getf rec :enqueued))))))
+              (safe-close-socket c))))
       (stop-server server)
-      (reset!)))))
+      (reset!))))
 
 (test "16. cursor is the transcript length of a REGISTERED agent (the resync cursor the client refetches from)"
   (let ((server (start-server :port 0))
@@ -641,7 +655,7 @@ Returns the last value of PRED."
       (stop-server server)
       (reset!)))))
 
-(test "18. a non-:delta event type is ignored, not enqueued (forward-compatible with S04/S05)"
+(test "18. an unknown event type is ignored, not enqueued (forward-compatibility)"
   (let ((server (start-server :port 0)))
     (unwind-protect
         (let* ((port (push-server-port server))
@@ -657,10 +671,11 @@ Returns the last value of PRED."
                   (send-sexpr stream '(subscribe :agent "type-A"))
                   (read-or-eof stream 3.0)
                   (sexpr.kernel:emit-event "type-A"
-                    (list :type :finalize :agent-id "type-A" :content "done"))
+                    (list :type :future-unknown :agent-id "type-A" :content "done"))
                   (let ((rec (first-client-rec (push-server-diagnostics server))))
                     (and (zerop (getf rec :queue-length))
                          (zerop (getf rec :enqueued))
+                         (zerop (getf rec :dropped))
                          ;; the subscription itself is still live
                          (equal (getf rec :subscriptions) '("type-A")))))
               (safe-close-socket c)))
@@ -960,18 +975,6 @@ Returns the last value of PRED."
         (when (or (eq obj 'eof) (eq obj 'timeout) (eq obj 'closed)) (return))
         (push obj out)))
     (nreverse out)))
-
-(defun wire-equal (a b)
-  "Compare two wire messages by SYMBOL-NAME rather than EQ.
-  The server's listener interns its operator symbols in :sexpr.tui while this test
-  package interns them locally, so plain EQUAL on a message read from the socket can
-  fail for the wrong reason. Comparing names is the package-independent contract —
-  the same reason %op dispatches by name."
-  (cond
-    ((and (symbolp a) (symbolp b)) (string= (symbol-name a) (symbol-name b)))
-    ((and (consp a) (consp b)) (and (wire-equal (car a) (car b))
-                                    (wire-equal (cdr a) (cdr b))))
-    (t (equal a b))))
 
 (defparameter *synthetic-client-id* 900
   "Ids for client records built with make-client outside the accept loop. Tests
@@ -1607,6 +1610,187 @@ Returns the last value of PRED."
                            (wire-equal (read-or-eof stream 3.0)
                                        (list 'status :agent "iso-status-A" :status :waiting
                                              :pending-approval '(:agent "iso-status-A")))))))
+              (safe-close-socket c))))
+      (stop-server server)
+      (reset!))))
+
+;;;; --- S05/T04: :finalize, :tool-start, :tool-result, :budget-exceeded,
+;;;;     and :kind on :delta --------------------------------------------
+;;
+;; S05's streaming loop emits :finalize (every stream end), :tool-start /
+;; :tool-result (tool progress) and :budget-exceeded (a mid-stream abort), and
+;; tags every :delta with :kind. T04 forwards all of them; the client can only
+;; see a turn end, tool progress, and a budget abort if the listener translates
+;; them, and a streamed model fragment cannot be told from tool output without
+;; :kind. Test 18 proves an unknown :type is still ignored.
+
+(test "44. a :finalize event is translated to (finalize ...) with its event-index"
+  (let ((server (start-server :port 0)))
+    (unwind-protect
+        (let* ((port (push-server-port server))
+               (c (make-instance 'sb-bsd-sockets:inet-socket
+                                  :type :stream :protocol :tcp)))
+          (sb-bsd-sockets:socket-connect c #(127 0 0 1) port)
+          (let ((stream (sb-bsd-sockets:socket-make-stream c
+                                                           :buffering :line
+                                                           :input t
+                                                           :output t)))
+            (unwind-protect
+                (progn
+                  (send-sexpr stream '(subscribe :agent "s-A"))
+                  (let ((reply (read-or-eof stream 3.0)))
+                    (sexpr.kernel:emit-event "s-A"
+                      (list :type :finalize :agent-id "s-A" :event-index 7))
+                    (let ((item (read-or-eof stream 2.0)))
+                      (and (wire-equal reply '(subscribed :agent "s-A" :cursor 0))
+                           (wire-equal item (list 'finalize :agent "s-A" :event-index 7))))))
+              (safe-close-socket c))))
+      (stop-server server)
+      (reset!))))
+
+(test "45. a :tool-start event is translated to (tool-start ...) with call-id and name"
+  (let ((server (start-server :port 0)))
+    (unwind-protect
+        (let* ((port (push-server-port server))
+               (c (make-instance 'sb-bsd-sockets:inet-socket
+                                  :type :stream :protocol :tcp)))
+          (sb-bsd-sockets:socket-connect c #(127 0 0 1) port)
+          (let ((stream (sb-bsd-sockets:socket-make-stream c
+                                                           :buffering :line
+                                                           :input t
+                                                           :output t)))
+            (unwind-protect
+                (progn
+                  (send-sexpr stream '(subscribe :agent "s-A"))
+                  (let ((reply (read-or-eof stream 3.0)))
+                    (sexpr.kernel:emit-event "s-A"
+                      (list :type :tool-start :agent-id "s-A"
+                            :call-id "call-1" :name "get_weather"))
+                    (let ((item (read-or-eof stream 2.0)))
+                      (and (wire-equal reply '(subscribed :agent "s-A" :cursor 0))
+                           (wire-equal item (list 'tool-start :agent "s-A"
+                                                  :call-id "call-1" :name "get_weather"))))))
+              (safe-close-socket c))))
+      (stop-server server)
+      (reset!))))
+
+(test "46. a :tool-result event is translated to (tool-result ...) with value and text"
+  (let ((server (start-server :port 0)))
+    (unwind-protect
+        (let* ((port (push-server-port server))
+               (c (make-instance 'sb-bsd-sockets:inet-socket
+                                  :type :stream :protocol :tcp)))
+          (sb-bsd-sockets:socket-connect c #(127 0 0 1) port)
+          (let ((stream (sb-bsd-sockets:socket-make-stream c
+                                                           :buffering :line
+                                                           :input t
+                                                           :output t)))
+            (unwind-protect
+                (progn
+                  (send-sexpr stream '(subscribe :agent "s-A"))
+                  (let ((reply (read-or-eof stream 3.0)))
+                    (sexpr.kernel:emit-event "s-A"
+                      (list :type :tool-result :agent-id "s-A"
+                            :call-id "call-1" :value "sunny" :text "sunny"))
+                    (let ((item (read-or-eof stream 2.0)))
+                      (and (wire-equal reply '(subscribed :agent "s-A" :cursor 0))
+                           (wire-equal item (list 'tool-result :agent "s-A"
+                                                  :call-id "call-1"
+                                                  :value "sunny" :text "sunny"))))))
+              (safe-close-socket c))))
+      (stop-server server)
+      (reset!))))
+
+(test "47. a :budget-exceeded event is translated to (budget-exceeded ...) with tokens-used and limit"
+  (let ((server (start-server :port 0)))
+    (unwind-protect
+        (let* ((port (push-server-port server))
+               (c (make-instance 'sb-bsd-sockets:inet-socket
+                                  :type :stream :protocol :tcp)))
+          (sb-bsd-sockets:socket-connect c #(127 0 0 1) port)
+          (let ((stream (sb-bsd-sockets:socket-make-stream c
+                                                           :buffering :line
+                                                           :input t
+                                                           :output t)))
+            (unwind-protect
+                (progn
+                  (send-sexpr stream '(subscribe :agent "s-A"))
+                  (let ((reply (read-or-eof stream 3.0)))
+                    (sexpr.kernel:emit-event "s-A"
+                      (list :type :budget-exceeded :agent-id "s-A"
+                            :tokens-used 120 :limit 100))
+                    (let ((item (read-or-eof stream 2.0)))
+                      (and (wire-equal reply '(subscribed :agent "s-A" :cursor 0))
+                           (wire-equal item (list 'budget-exceeded :agent "s-A"
+                                                  :tokens-used 120 :limit 100))))))
+              (safe-close-socket c))))
+      (stop-server server)
+      (reset!))))
+
+(test "48. a :delta carries :kind — defaults to :model and honors a tool kind"
+  (let ((server (start-server :port 0)))
+    (unwind-protect
+        (let* ((port (push-server-port server))
+               (c (make-instance 'sb-bsd-sockets:inet-socket
+                                  :type :stream :protocol :tcp)))
+          (sb-bsd-sockets:socket-connect c #(127 0 0 1) port)
+          (let ((stream (sb-bsd-sockets:socket-make-stream c
+                                                           :buffering :line
+                                                           :input t
+                                                           :output t)))
+            (unwind-protect
+                (progn
+                  (send-sexpr stream '(subscribe :agent "s-A"))
+                  (let ((reply (read-or-eof stream 3.0)))
+                    ;; no :kind on the event -> the wire item defaults to :model
+                    (sexpr.kernel:emit-event "s-A"
+                      (list :type :delta :agent-id "s-A" :chunk-delta "plain"))
+                    ;; an explicit tool kind is carried through unchanged
+                    (sexpr.kernel:emit-event "s-A"
+                      (list :type :delta :agent-id "s-A" :kind :tool
+                            :chunk-delta "tool out"))
+                    (and (wire-equal reply '(subscribed :agent "s-A" :cursor 0))
+                         (wire-equal (read-or-eof stream 3.0)
+                                     (list 'delta :agent "s-A" :kind :model
+                                           :content "plain"))
+                         (wire-equal (read-or-eof stream 3.0)
+                                     (list 'delta :agent "s-A" :kind :tool
+                                           :content "tool out")))))
+              (safe-close-socket c))))
+      (stop-server server)
+      (reset!))))
+
+(test "49. isolation holds for the new types: a :finalize for agent B does not reach a subscriber of A"
+  (let ((server (start-server :port 0)))
+    (unwind-protect
+        (let* ((port (push-server-port server))
+               (c (make-instance 'sb-bsd-sockets:inet-socket
+                                  :type :stream :protocol :tcp)))
+          (sb-bsd-sockets:socket-connect c #(127 0 0 1) port)
+          (let ((stream (sb-bsd-sockets:socket-make-stream c
+                                                           :buffering :line
+                                                           :input t
+                                                           :output t)))
+            (unwind-protect
+                (progn
+                  (send-sexpr stream '(subscribe :agent "iso-new-A"))
+                  (let ((reply (read-or-eof stream 3.0)))
+                    (sexpr.kernel:emit-event "iso-new-B"
+                      (list :type :finalize :agent-id "iso-new-B" :event-index 3))
+                    (and (wire-equal reply '(subscribed :agent "iso-new-A" :cursor 0))
+                         ;; nothing arrives for the other agent's finalize
+                         (eq (read-or-eof stream 0.5) 'timeout)
+                         (equal (getf (first-client-rec (push-server-diagnostics server))
+                                      :subscriptions)
+                                '("iso-new-A"))
+                         ;; POSITIVE CONTROL: the same client still receives its
+                         ;; own agent's finalize, so the isolation assertion is
+                         ;; not passing because the connection is broken.
+                         (progn
+                           (sexpr.kernel:emit-event "iso-new-A"
+                             (list :type :finalize :agent-id "iso-new-A" :event-index 4))
+                           (wire-equal (read-or-eof stream 3.0)
+                                       (list 'finalize :agent "iso-new-A" :event-index 4))))))
               (safe-close-socket c))))
       (stop-server server)
       (reset!))))

@@ -441,14 +441,22 @@ calls this in its drain loop; it never holds the write-lock while dequeuing."
 (defun %delta-listener (client agent-id)
   "Build the event-bus listener for one (CLIENT, AGENT-ID) subscription.
 
-Translation: a bus event (:type :delta :agent-id A :chunk-delta X) becomes the
-wire item (delta :agent A :content X). A (:type :status :agent-id A :status S
-:pending-approval P) event becomes (status :agent A :status S :pending-approval
-P). A (:type :approval-needed :agent-id A :capability C :target T :description D
-:restarts R) event becomes (approval-needed :agent A :capability C :target T
-:description D :restarts R). Any other :type is ignored — that is
-forward-compatibility, not an error: S05 may add tool-start and an S04 server
-should simply not act on them.
+Translation: a bus event (:type :delta :agent-id A :kind K :chunk-delta X)
+becomes the wire item (delta :agent A :kind K :content X), where K defaults to
+:model when the event carries no :kind — so a streamed model fragment is
+distinguishable from tool output on the wire (R023). A (:type :finalize
+:agent-id A :event-index N) event becomes (finalize :agent A :event-index N).
+A (:type :tool-start :agent-id A :call-id C :name N) event becomes (tool-start
+:agent A :call-id C :name N). A (:type :tool-result :agent-id A :call-id C
+:value V :text T) event becomes (tool-result :agent A :call-id C :value V :text
+T). A (:type :budget-exceeded :agent-id A :tokens-used U :limit L) event becomes
+(budget-exceeded :agent A :tokens-used U :limit L). A (:type :status :agent-id A
+:status S :pending-approval P) event becomes (status :agent A :status S
+:pending-approval P). A (:type :approval-needed :agent-id A :capability C :target
+T :description D :restarts R) event becomes (approval-needed :agent A :capability
+C :target T :description D :restarts R). Any other :type is ignored — that is
+forward-compatibility, not an error: a future server may add an event type and
+an older client should simply not act on it.
 
 CHEAP BY CONTRACT: the body is a translate plus an enqueue under the queue-lock
 only. It never writes to the socket, because emit-event runs listeners
@@ -470,7 +478,32 @@ this closure may take."
          (%enqueue-backpressured client agent-id
                                  (list 'delta
                                        :agent (or (getf event :agent-id) agent-id)
+                                       :kind (or (getf event :kind) :model)
                                        :content (getf event :chunk-delta))))
+        (:finalize
+         (%enqueue-backpressured client agent-id
+                                 (list 'finalize
+                                       :agent (or (getf event :agent-id) agent-id)
+                                       :event-index (getf event :event-index))))
+        (:tool-start
+         (%enqueue-backpressured client agent-id
+                                 (list 'tool-start
+                                       :agent (or (getf event :agent-id) agent-id)
+                                       :call-id (getf event :call-id)
+                                       :name (getf event :name))))
+        (:tool-result
+         (%enqueue-backpressured client agent-id
+                                 (list 'tool-result
+                                       :agent (or (getf event :agent-id) agent-id)
+                                       :call-id (getf event :call-id)
+                                       :value (getf event :value)
+                                       :text (getf event :text))))
+        (:budget-exceeded
+         (%enqueue-backpressured client agent-id
+                                 (list 'budget-exceeded
+                                       :agent (or (getf event :agent-id) agent-id)
+                                       :tokens-used (getf event :tokens-used)
+                                       :limit (getf event :limit))))
         (:status
          (%enqueue-backpressured client agent-id
                                  (list 'status
