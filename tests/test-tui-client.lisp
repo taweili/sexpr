@@ -469,6 +469,122 @@ Normalizing to names is what makes the boundary assertion testable."
          (= (* 2 (length *client-stats-keys*)) (length (tui-connection-stats conn)))
          (null *tui-client-log*))))
 
+;;;; --- 8b. T04: the TEA model and the three panes ---------------------
+;;;
+;;; Headless model tests: every connection is a string stream, no TTY, no
+;;; network. `tui:run` is never called. The model is driven through the
+;;; TUITION seam `init`/`update`/`view` directly. The reader thread is never
+;;; started: there is no program, so program-running-p is NIL and init skips it
+;;; (MEM103). `tui:init` always runs one agent-snapshot RPC (continuation id 1)
+;;; and, when a picked agent is set, one transcript-delta RPC (id 2); a resync in
+;;; `update` runs a second transcript-delta (id 3). The canned swank stream
+;;; below carries exactly those framed replies in id order.
+
+(defun swank-reply (status value id)
+  "One framed swank reply packet: `(:return (STATUS VALUE) ID)`.
+The header is a BYTE count (MEM110) and the payload is prin1'd data, so the
+model's `swank-value` reads it back with *read-eval* NIL. STATUS is :ok or
+:abort; VALUE is the reply payload as Lisp data (a dotted pair for
+transcript-delta, so (consp value) and (integerp (cdr value)) both hold)."
+  (let* ((payload (let ((*print-pretty* nil))
+                    (with-output-to-string (s)
+                      (prin1 (list :return (list status value) id) s)))))
+    (concatenate 'string (packet-header (length (utf8-bytes payload))) payload)))
+
+(defun canned-swank (&rest replies)
+  "A swank connection over a TWO-WAY string stream carrying REPLIES (framed packet
+strings). The model's `swank-rpc` writes its request to the output side
+(discarded) and reads the next matching reply from the input side, so the
+connection must be bidirectional — a plain input stream cannot accept the request
+write. Replies are placed in continuation-id order; swank-read-reply matches by id."
+  (let ((in (make-string-input-stream (apply #'concatenate 'string replies)))
+        (out (make-string-output-stream)))
+    (new-swank-connection :port 0 :stream (make-two-way-stream in out))))
+
+;; The two replies tui:init always consumes for a picked agent: agent-snapshot
+;; (id 1, empty agent list) and the initial transcript-delta (id 2, empty events,
+;; cursor 0). Tests that drive a resync append a third reply (id 3) to this list.
+(defparameter *init-replies*
+  (list (swank-reply :ok nil 1) (swank-reply :ok '(nil . 0) 2)))
+
+(defun init-model (replies &key (picked "A") (push nil) (cap nil))
+  "Build a tui-model over a canned swank connection carrying REPLIES and run
+`tui:init` so the panes exist (the chat viewport is nil until init builds it, and
+`view` renders nothing without it). CAP, when given, bounds the scrollback."
+  (let ((model (if cap
+                   (make-instance 'tui-model
+                                   :swank-connection (apply #'canned-swank replies)
+                                   :push-connection push
+                                   :picked-agent picked
+                                   :scrollback-cap cap)
+                   (make-instance 'tui-model
+                                   :swank-connection (apply #'canned-swank replies)
+                                   :push-connection push
+                                   :picked-agent picked))))
+    (tui:init model)
+    model))
+
+(test "T04: a delta-msg puts the fragment text in the view string"
+  (let ((model (init-model *init-replies*)))
+    (tui:update model (make-delta-msg :agent "A" :content "frag"))
+    (search "frag" (tui:view model))))
+
+(test "T04: render-agent-rows shows the picked agent's name and status columns"
+  (let ((rows (render-agent-rows (list (list :name "Alpha" :status :running)
+                                       (list :name "Beta" :status :idle)))))
+    (and (search "agent" rows)
+         (search "status" rows)
+         (search "Alpha" rows)
+         (search "RUNNING" rows)
+         (search "Beta" rows)
+         (search "IDLE" rows))))
+
+(test "T04: a resync-msg refetches; an empty (nil . cursor) reply is tolerated and the cursor is adopted"
+  (let ((model (init-model (append *init-replies*
+                                   (list (swank-reply :ok '(nil . 7) 3))))))
+    (tui:update model (make-resync-msg :agent "A" :cursor 5))
+    (and (= 7 (model-cursor model))
+         ;; no error: the empty refetch is a success, and the ok reply never calls
+         ;; client-note-error!, so :last-error keeps its zeroed initial value and
+         ;; refresh-status's error suffix does not fire
+         (eql 0 (client-stats-get (model-swank-connection model) :last-error))
+         (search "agent: A" (model-status-text model))
+         (stringp (tui:view model)))))
+
+(test "T04: the scrollback cap holds across a 1000-delta burst"
+  (let ((model (init-model *init-replies* :cap 50)))
+    (loop for i from 1 to 1000
+          do (tui:update model (make-delta-msg :agent "A" :content (format nil "c~D" i))))
+    (and (<= (length (model-scrollback model)) 50)
+         (stringp (tui:view model)))))
+
+(test "T04: a wire-ignored-msg adds no chat line and does not corrupt the view"
+  ;; The branch calls note-error with "ignored: <op>", but refresh-status rewrites
+  ;; model-status-text from connection stats at the end of every update, so that
+  ;; transient label is not durable. The durable contract is that an ignored wire
+  ;; frame leaves the chat pane and the render path untouched. (The op is also
+  ;; counted as :decode-unknown when it arrives through the decoder, not here.)
+  (let ((model (init-model *init-replies*)))
+    (let ((before (length (model-scrollback model))))
+      (tui:update model (make-wire-ignored-msg :op "frob" :form '(frob)))
+      (and (= before (length (model-scrollback model)))
+           (stringp (tui:view model))))))
+
+(test "T04: the status bar shows the last error after a failed RPC"
+  ;; refresh-status derives the error line from each connection's :last-error
+  ;; (note-error's label is transient and overwritten). client-note-error! is the
+  ;; durable seam: a prior RPC that left :last-error set surfaces in the status
+  ;; bar across the next refresh. init's agent-snapshot (id 1) is given an :ok
+  ;; reply so it does not overwrite the prior error.
+  (let* ((swank (canned-swank (swank-reply :ok nil 1)))
+         (model (make-instance 'tui-model
+                                :swank-connection swank
+                                :push-connection nil
+                                :picked-agent nil)))
+    (client-note-error! swank "boom")
+    (tui:init model)
+    (search "boom" (model-status-text model))))
+
 ;;;; --- 9. gates: SPDX headers and the R015 / deprecation invariants ------
 
 (test "every new file carries the SPDX GPL-3.0-or-later header"
@@ -477,6 +593,8 @@ Normalizing to names is what makes the boundary assertion testable."
            "src/tui-client/package.lisp"
            "src/tui-client/messages.lisp"
            "src/tui-client/wire.lisp"
+           "src/tui-client/view.lisp"
+           "src/tui-client/model.lisp"
            "tests/test-tui-client.lisp")))
 
 (test "R015: the client never names the provider transport"

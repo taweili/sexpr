@@ -41,7 +41,7 @@ line and the viewport would stop scrolling."
   "Strip any newline out of STRING, clipping to LIMIT columns. A pane title and the
 status bar are one line by contract; a delta fragment containing a newline must not
 break the layout."
-  (let ((flat (replace #\Space (string #\Newline) string)))
+  (let ((flat (substitute #\Space #\Newline string)))
     (cond
       ((>= (length flat) limit) (subseq flat 0 limit))
       (t flat))))

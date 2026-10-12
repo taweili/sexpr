@@ -258,6 +258,17 @@ object exists at all) rather than crashing init."
 
 ;;;; --- status bar ------------------------------------------------------
 
+(defun connection-error-text (connection)
+  "The last error TEXT recorded on CONNECTION, or NIL when there is none.
+`:last-error` shares the stats plist with the counters but is not one: it starts at
+0 (see *client-stats-keys* / %new-stats) and becomes a string only when
+client-note-error! records a condition. So only a non-empty STRING is an error —
+the initial 0 and a NIL connection both mean \"no error\". Without this, the status
+bar appends a bogus \"| 0\" to every healthy frame."
+  (let ((e (client-stats-get connection :last-error)))
+    (when (and (stringp e) (plusp (length e))) e)))
+(export 'connection-error-text)
+
 (defun refresh-status (model)
   "Rebuild the combined stats plist and the status line from both connections.
 Called from update, so the status line is model STATE and `view` never reads a live
@@ -273,8 +284,8 @@ one supersedes it — clearing it on the next healthy tick would hide the failur
                                      (client-stats-get swank :packets-read)
                                      (client-stats-get swank :connection-closed)))))
     (let ((errors (loop for c in (remove nil (list push swank))
-                        for err = (client-stats-get c :last-error)
-                        when (and err (not (null err))) collect err))
+                        for err = (connection-error-text c)
+                        when err collect err))
           (push-state (cond
                         ((null push) "push: none")
                         ((eq 0 (client-stats-get push :connection-closed)) "push: connected")
@@ -289,8 +300,7 @@ one supersedes it — clearing it on the next healthy tick would hide the failur
             (one-line
              (format nil "~A | ~A | ~A | agent: ~A~@[ | ~A~]"
                      swank-state push-state readers picked
-                     (or (model-status-text model) ""
-                         (if errors (last-error-of errors) "")))))))
+                     (when errors (last-error-of errors)))))))
   model)
 
 (defun last-error-of (errors)
@@ -413,7 +423,7 @@ Ctrl+C and Escape quit; Tab cycles focus between chat and repl."
                       (model-repl-textarea model)))
               (other (if (eq (model-focused model) :chat)
                          (model-repl-textarea model)
-                         (model-chat-textarea model))))
+                         (model-chat-textarea model)))
               (cmd nil))
          (when ta
            (multiple-value-setq (ta cmd)
@@ -449,9 +459,8 @@ Dispatch order: wire push messages first (they carry content), then RPC results,
 window size, then keys, then quit. `update-message` is the TUITION convention, but this
 model needs to sequence two effects per message (apply state, then refresh status), so
 the single `update` method owns the dispatch."
-  (declare (ignore msg))
-  (unwind-protect
-     (let ((result (cond
+  (multiple-value-bind (next-model cmd)
+      (cond
     ;; push channel: a streamed fragment
     ((delta-msg-p msg)
      (let ((agent (delta-msg-agent msg))
@@ -530,9 +539,9 @@ the single `update` method owns the dispatch."
      (values model (%quit-cmd)))
     ;; keyboard
     ((tui:key-msg-p msg) (handle-key model msg))
-      (t (values model nil)))))
-     (refresh-status model)
-     (values (car result) (cadr result))))
+      (t (values model nil)))
+    (refresh-status next-model)
+    (values next-model cmd)))
 
 ;;;; --- view ------------------------------------------------------------
 
