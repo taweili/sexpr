@@ -86,7 +86,17 @@ is NIL), and UIOP is always present because ASDF is built into SBCL."
                                               :swank-connection swank-conn
                                               :push-connection push-conn
                                               :picked-agent agent)))
-                    (let ((program (tui:make-program :model model)))
+                    ;; The zone manager must exist and be enabled BEFORE the first
+                    ;; view, or every zone-mark is a no-op and no row is clickable.
+                    ;; :mouse :cell-motion makes the terminal report mouse presses;
+                    ;; without it the mouse dispatch in update never fires.
+                    (tui:init-global-zone-manager)
+                    ;; TUI:MAKE-PROGRAM takes the model POSITIONALLY (its signature is
+                    ;; (make-program model &key alt-screen mouse pool-size)); the old
+                    ;; :model keyword form was an odd-arity call that silently bound
+                    ;; nothing. :mouse :cell-motion makes the terminal report mouse
+                    ;; presses, without which the mouse dispatch never fires.
+                    (let ((program (tui:make-program model :mouse :cell-motion)))
                       (tui:run program))))
               (error (e)
                 (close-swank-connection swank-conn)

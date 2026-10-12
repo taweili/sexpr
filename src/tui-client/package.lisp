@@ -135,13 +135,16 @@
    #:make-repl-textarea
    #:make-agent-viewport
    #:agent-row
+   #:agent-row-text
    #:render-agent-rows
+   #:render-approval-strip
    #:render-section
    #:render-status-bar
    #:compose-layout
    #:border
    #:chat-width
    #:agent-width
+   #:agent-pane-height
    #:chat-viewport-height
    #:repl-viewport-height
    #:textarea-height
@@ -186,6 +189,10 @@
    #:rpc-resolve-approval
    #:agent-light
    #:resolve-pending-approval
+   #:agent-at-mouse
+   #:approval-action-at-mouse
+   #:model-switch-agent
+   #:handle-mouse
    #:program-running-p
    #:refresh-status
    #:last-error-of

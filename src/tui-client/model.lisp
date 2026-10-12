@@ -356,9 +356,14 @@ re-entered after a resize."
 (export 'build-panes)
 
 (defun refresh-agent-viewport (model)
-  "Push the current agent snapshot into the agent pane viewport."
+  "Push the current agent snapshot into the agent pane viewport, highlighting the
+picked agent. The picked name is threaded through so the pane's row highlight follows
+the model's picked state (S04/T05)."
   (let ((vp (model-agent-viewport model)))
-    (when vp (tui.viewport:viewport-set-content vp (render-agent-rows (model-agents model)))))
+    (when vp
+      (tui.viewport:viewport-set-content
+       vp (render-agent-rows (model-agents model)
+                             :picked (model-picked-agent model)))))
   model)
 
 ;;;; --- agent lights and per-agent state (M004/S04 T04) ----------------
@@ -454,6 +459,81 @@ retry."
          (refresh-status model)
          model)))))
 (export 'resolve-pending-approval)
+
+;;;; --- click-to-focus and approval resolution (M004/S04 T05) ----------
+;;;
+;;; The mouse path is PURE at the hit-test seam: agent-at-mouse and
+;;; approval-action-at-mouse read the global zone manager's recorded bounds and a
+;;; mouse event, and return a decision — no model, no I/O. That is what makes the
+;;; click contract testable from the recorded zone bounds (research risk 2) instead
+;;; of hand-computed terminal coordinates. The zone bounds are recorded by the
+;;; ROOT zone-scan in tui:view; zone-scan never clears stale zones, so the decision
+;;; is validated again against model-agents before any state changes (risk 3).
+
+(defun agent-at-mouse (agents msg)
+  "The name of the agent whose \"agent-row:<name>\" zone contains MSG, or NIL.
+PURE: it reads the zone manager and the event only. A stale zone (a name no longer in
+AGENTS) can still be returned here — MODEL-SWITCH-AGENT re-validates it — but a
+stale zone whose bounds are not hit is never returned."
+  (loop for a in agents
+        for name = (getf a :name)
+        for id = (and (stringp name) (format nil "agent-row:~A" name))
+        for zone = (and id (tui:zone-get id))
+        when (and zone (tui:zone-in-bounds-p zone msg))
+          do (return name)))
+(export 'agent-at-mouse)
+
+(defun approval-action-at-mouse (msg)
+  "The approval decision a click at MSG selects: :grant-once when the
+grant-once zone is hit, :deny when the deny zone is hit, else NIL. PURE."
+  (cond
+    ((tui:zone-in-bounds-p (tui:zone-get "approval:grant-once") msg) :grant-once)
+    ((tui:zone-in-bounds-p (tui:zone-get "approval:deny") msg) :deny)
+    (t nil)))
+(export 'approval-action-at-mouse)
+
+(defun model-switch-agent (model name)
+  "Re-point the viewport at agent NAME. Returns MODEL.
+NAME is validated against the current snapshot first: a click on a stale zone whose
+name is no longer in model-agents changes nothing (research risk 3). On a real switch
+it sets the picked name, resets the transcript cursor to 0, clears the chat scrollback
+and the chat viewport, refetches transcript-delta for the new agent, and refreshes the
+agent pane so the highlight moves. An RPC error is recorded on the status bar, never
+signalled."
+  (when (and (stringp name)
+             (find name (model-agents model)
+                   :key (lambda (a) (getf a :name)) :test #'string=))
+    (setf (model-picked-agent model) name
+          (model-cursor model) 0
+          (model-scrollback model) nil)
+    (let ((vp (model-chat-viewport model)))
+      (when vp (tui.viewport:viewport-set-content vp "")))
+    (multiple-value-bind (events cursor error)
+        (rpc-transcript-delta (model-swank-connection model) name 0)
+      (dolist (line (mapcar #'event-to-line (or events '())))
+        (model-append-chat-line model line))
+      (when (integerp cursor) (setf (model-cursor model) cursor))
+      (note-error model error))
+    (refresh-agent-viewport model))
+  model)
+(export 'model-switch-agent)
+
+(defun handle-mouse (model msg)
+  "Handle one mouse event and return (VALUES MODEL NIL).
+Only a LEFT mouse PRESS does anything. While an approval is pending, a click is
+resolved through APPROVAL-ACTION-AT-MOUSE first — the strip owns the click so a stray
+row click cannot switch away from the agent awaiting resolution. Otherwise a click on
+a row zone switches the picked agent via MODEL-SWITCH-AGENT. Every other event is a
+no-op."
+  (when (and (tui:mouse-press-event-p msg)
+             (eq (tui:mouse-event-button msg) :left))
+    (if (model-pending-approval model)
+        (let ((action (approval-action-at-mouse msg)))
+          (when action (resolve-pending-approval model action)))
+        (let ((name (agent-at-mouse (model-agents model) msg)))
+          (when name (model-switch-agent model name)))))
+  (values model nil))
+(export 'handle-mouse)
 
 ;;;; --- init ------------------------------------------------------------
 
@@ -554,6 +634,15 @@ Ctrl+C and Escape quit; Tab cycles focus between chat and repl."
        (values model nil))
       ((eq key :enter)
        (handle-enter model))
+      ;; Approval keyboard fallback, intercepted ONLY while an approval is pending and
+      ;; placed BEFORE the textarea branch so it cannot steal printable keys (D027).
+      ;; C-g grants once, C-d denies; with no pending approval both fall through to
+      ;; the focused textarea unchanged.
+      ((and (model-pending-approval model)
+            ctrl (characterp key)
+            (or (char-equal key #\g) (char-equal key #\d)))
+       (resolve-pending-approval model (if (char-equal key #\g) :grant-once :deny))
+       (values model nil))
       (t
        (let* ((ta (if (eq (model-focused model) :chat)
                       (model-chat-textarea model)
@@ -806,6 +895,8 @@ the single `update` method owns the dispatch."
     ((tui:quit-msg-p msg)
      (setf (model-quitting model) t)
      (values model (%quit-cmd)))
+    ;; mouse: click-to-focus or approval resolution (S04)
+    ((tui:mouse-press-event-p msg) (handle-mouse model msg))
     ;; keyboard
     ((tui:key-msg-p msg) (handle-key model msg))
       (t (values model nil)))
@@ -816,19 +907,26 @@ the single `update` method owns the dispatch."
 
 (defmethod tui:view ((model tui-model))
   "Render the full frame as one string. Pure: reads only model state, never a live
-connection. This is the assertion surface for the headless tests."
-  (compose-layout
-   (when (model-chat-viewport model)
-     (tui:join-vertical :left
-                        (tui.viewport:viewport-view (model-chat-viewport model))
-                        (when (model-chat-textarea model)
-                          (tui.textarea:textarea-view (model-chat-textarea model)))))
-   (when (model-repl-viewport model)
-     (tui:join-vertical :left
-                        (tui.viewport:viewport-view (model-repl-viewport model))
-                        (when (model-repl-textarea model)
-                          (tui.textarea:textarea-view (model-repl-textarea model)))))
-   (when (model-agent-viewport model)
-     (tui.viewport:viewport-view (model-agent-viewport model)))
-   (model-status-text model)))
+connection. This is the assertion surface for the headless tests.
+The frame is wrapped in TUI:ZONE-SCAN — the ROOT-only call that records every zone
+mark's position in the global manager and strips the markers from the returned text.
+Without it the agent-row and approval zones are never registered and nothing is
+clickable (the zone-mark call is a no-op for recording). The approval strip is passed
+as its own line between the body and the status bar."
+  (tui:zone-scan
+   (compose-layout
+    (when (model-chat-viewport model)
+      (tui:join-vertical :left
+                         (tui.viewport:viewport-view (model-chat-viewport model))
+                         (when (model-chat-textarea model)
+                           (tui.textarea:textarea-view (model-chat-textarea model)))))
+    (when (model-repl-viewport model)
+      (tui:join-vertical :left
+                         (tui.viewport:viewport-view (model-repl-viewport model))
+                         (when (model-repl-textarea model)
+                           (tui.textarea:textarea-view (model-repl-textarea model)))))
+    (when (model-agent-viewport model)
+      (tui.viewport:viewport-view (model-agent-viewport model)))
+    (model-status-text model)
+    (render-approval-strip (model-pending-approval model)))))
 (export 'tui:view)

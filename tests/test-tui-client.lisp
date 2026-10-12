@@ -1134,6 +1134,144 @@ can assert on the packet text the model wrote."
          (search "sb-ext:exit :code (sexpr-tui:main" mk)
          (search "TUI_ARGS" mk))))
 
+;;;; --- 8d. S04 T05: agent pane rendering, zones, click-to-focus, resolution ---
+;;;
+;;; These tests assert through tui:view (the REAL render path), not only through the
+;;; row helper, because the blank-pane bug (F2) hid behind a row-helper-only test.
+;;; zone-scan runs on the root view string, so a test must init and enable the global
+;;; zone manager before calling tui:view, then build mouse coordinates FROM the
+;;; recorded zone bounds (research risk 2) — never hand-computed terminal columns.
+;;;
+;;; zone-info-start-x/start-y are NOT exported from :tuition, so the internal
+;;; accessors are named with ::. The +1/+2 offsets mirror zone-in-bounds-p's own
+;;; (1- x) / (- y 2) empirical mapping, so a press built here lands inside the zone.
+
+(tui:init-global-zone-manager)
+(tui:zone-set-enabled t)
+
+(defun press-zone (zone &key (button :left))
+  "A mouse press built from a recorded ZONE's bounds."
+  (tui:make-mouse-press-event :x (1+ (tui::zone-info-start-x zone))
+                              :y (+ 2 (tui::zone-info-start-y zone))
+                              :button button))
+
+(test "S04/T05: *agent-pane-height* is positive and the agent viewport uses it"
+  (and (integerp *agent-pane-height*)
+       (plusp *agent-pane-height*)
+       (= *agent-pane-height*
+          (tui.viewport:viewport-height (make-agent-viewport)))))
+
+(test "S04/T05: agent-row-text is plain, carries the picked marker, and degrades on missing fields"
+  (let ((picked (agent-row-text (list :name "Alpha" :status :running) :picked "Alpha"))
+        (unpicked (agent-row-text (list :name "Alpha" :status :running)))
+        (bare (agent-row-text nil)))
+    (and (search "* ● Alpha RUNNING" picked)
+         (search "Alpha RUNNING" unpicked)
+         (not (search "*" unpicked))
+         (search "? UNKNOWN" bare)
+         ;; ANSI-free: no escape character in the plain row text
+         (null (find #\Escape picked)))))
+
+(test "S04/T05: render-agent-rows highlights exactly the picked row and keeps both headers"
+  (let ((rows (render-agent-rows (list (list :name "Alpha" :status :running)
+                                       (list :name "Beta" :status :idle))
+                                 :picked "Alpha")))
+    (and (search "agent" rows) (search "status" rows)
+         (search "* ● Alpha RUNNING" rows)
+         (search "Beta IDLE" rows)
+         (= 1 (count-substring "* ● " rows)))))
+
+(test "S04/T05: the agent pane is non-empty in the real view — both agents render (F2 guard)"
+  (let ((model (init-two-agent-model :picked "Alpha")))
+    (refresh-agent-viewport model)
+    (let ((v (tui:view model))
+          (pane (tui.viewport:viewport-view (model-agent-viewport model))))
+      (and (search "Alpha" v)
+           (search "Beta" v)
+           (not (string= "" pane))
+           (search "agent" pane)))))
+
+(test "S04/T05: clicking an agent row zone switches the picked agent and refetches the transcript"
+  (multiple-value-bind (swank out)
+      (canned-swank-capturing (two-agent-snapshot-reply)
+                              (swank-reply :ok '(nil . 0) 2)
+                              (swank-reply :ok '(((:type :user :content "beta history")) . 4) 3))
+    (let ((model (init-two-agent-model :picked "Alpha" :swank swank)))
+      (get-output-stream-string out)      ; drain the init requests
+      (tui:view model)                    ; record zones from the root render
+      (let ((zone (tui:zone-get "agent-row:Beta")))
+        (and zone
+             (progn
+               (tui:update model (press-zone zone))
+               (and (string= "Beta" (model-picked-agent model))
+                    ;; the refetch re-pointed the viewport: Beta's history is in the
+                    ;; chat scrollback and the request named Beta
+                    (search "beta history" (lines-to-string (model-scrollback model)))
+                    (search "transcript-delta" (get-output-stream-string out))
+                    (search "Beta" (model-status-text model)))))))))
+
+(test "S04/T05: a stale name (not in the snapshot) never switches the picked agent"
+  (let ((model (init-two-agent-model :picked "Alpha")))
+    ;; direct call: the guard is against model-agents, not against the zone system
+    (model-switch-agent model "Ghost")
+    (and (string= "Alpha" (model-picked-agent model))
+         ;; and a synthesized click on a zone whose row name is not in the snapshot:
+         ;; the hit-test may name it, but the switch re-validates and refuses
+         (progn
+           (tui:zone-scan (tui:zone-mark "agent-row:Ghost" "Ghost row"))
+           (let ((z (tui:zone-get "agent-row:Ghost")))
+             (and z
+                  (progn (handle-mouse model (press-zone z))
+                         (string= "Alpha" (model-picked-agent model)))))))))
+
+(test "S04/T05: the approval strip is NIL without a pending approval and names the request when set"
+  (and (null (render-approval-strip nil))
+       (let ((strip (render-approval-strip (list :capability "net" :target "http://x"
+                                                 :description "fetch"))))
+         (and (search "grant-once" strip)
+              (search "deny" strip)
+              (search "net" strip)
+              (search "http://x" strip)))
+       ;; a bare T flag degrades to placeholders rather than signalling
+       (let ((strip (render-approval-strip t)))
+         (and (search "grant-once" strip) (search "deny" strip)))))
+
+(test "S04/T05: a click on the approval strip resolves via RPC and clears the yellow light"
+  (multiple-value-bind (swank out)
+      (canned-swank-capturing (two-agent-snapshot-reply)
+                              (swank-reply :ok '(nil . 0) 2)
+                              (swank-reply :ok "granted" 3))
+    (let ((model (init-two-agent-model :picked "Alpha" :swank swank)))
+      (get-output-stream-string out)
+      (tui:update model (make-approval-needed-msg :agent "Alpha" :capability "net"
+                                                  :target "http://x" :description "fetch"))
+      (let ((v (tui:view model)))
+        (and (search "grant-once" v)
+             (search "deny" v)
+             ;; the pending row lights yellow (agent-light)
+             (eq :yellow (agent-light (model-agent-row model "Alpha")))
+             (let ((zone (tui:zone-get "approval:grant-once")))
+               (and zone
+                    (progn
+                      (tui:update model (press-zone zone))
+                      (and (null (model-pending-approval model))
+                           (eq :green (agent-light (model-agent-row model "Alpha")))
+                           (search "resolve-approval \"Alpha\" :GRANT-ONCE"
+                                   (get-output-stream-string out)))))))))))
+
+(test "S04/T05: the C-g keyboard fallback resolves grant-once only while an approval is pending"
+  (multiple-value-bind (swank out)
+      (canned-swank-capturing (two-agent-snapshot-reply)
+                              (swank-reply :ok '(nil . 0) 2)
+                              (swank-reply :ok "granted" 3))
+    (let ((model (init-two-agent-model :picked "Alpha" :swank swank)))
+      (get-output-stream-string out)
+      (tui:update model (make-approval-needed-msg :agent "Alpha" :capability "net"
+                                                  :target "http://x" :description "fetch"))
+      (tui:update model (make-key-msg :key #\g :ctrl t))
+      (and (null (model-pending-approval model))
+           (search "GRANT-ONCE" (get-output-stream-string out))))))
+
 ;;;; --- summary -------------------------------------------------------------
 
 (format t "~%~D tests, ~D passed, ~D failed~%" *tests-run* *tests-passed* *tests-failed*)

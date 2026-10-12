@@ -22,9 +22,13 @@
 ;;;; Only FORMAT control strings interpret `~%`. Every multi-line string here is
 ;;;; therefore built through LINES-TO-STRING.
 ;;;;
-;;;; THE AGENT PANE IS ROWS ONLY. No status lights and no click handling: S04
-;;;; specializes this host with zones and colors. The plan names this explicitly, so
-;;;; the pane is deliberately a plain table the next slice can decorate.
+;;;; THE AGENT PANE IS NOW LIVE (M004/S04). S03 shipped it as a plain table with no
+;;;; status lights and no click handling; S04 replaced make-table with manual row
+;;;; composition: a colored status light chosen by AGENT-LIGHT, a picked-row
+;;;; highlight, and a (tui:zone-mark "agent-row:<name>" ...) click target per row,
+;;;; plus an approval strip whose [grant-once]/[deny] affordances are zoned. The
+;;;; zone markers are recorded and stripped by the ROOT zone-scan in tui:view, which
+;;;; is also why the pane's viewport height is now *agent-pane-height* and not 0.
 
 (in-package :sexpr-tui)
 
@@ -62,6 +66,12 @@ must stay under a common terminal width.")
 (defparameter *agent-width* 30
   "The agent pane width.")
 (export '*agent-width*)
+
+(defparameter *agent-pane-height* 12
+  "The agent pane height in lines. Before S04 the viewport was height 0, so the pane
+rendered NOTHING even with rows present (research F2). 12 rows fit a useful society
+and leave room for the chat/repl column in a 24-line terminal.")
+(export '*agent-pane-height*)
 
 (defparameter *chat-viewport-height* 10
   "Chat viewport height in lines.")
@@ -117,8 +127,9 @@ press should land in chat and not in the REPL."
   "The agent pane. A VIEWPORT, not a table component: `table-render` is a one-shot
 string function with no TEA protocol, so composing it inside a viewport keeps the
 pane scrollable when the society is larger than the pane. The rows themselves are
-rendered by RENDER-AGENT-ROWS."
-  (tui.viewport:make-viewport :width *agent-width* :height 0))
+rendered by RENDER-AGENT-ROWS. The height is *agent-pane-height*, never 0: a
+zero-height viewport clips every row away (research F2)."
+  (tui.viewport:make-viewport :width *agent-width* :height *agent-pane-height*))
 (export 'make-agent-viewport)
 
 (defun agent-row (agent)
@@ -130,17 +141,69 @@ NIL cell, which `table-render` would pad as an empty string anyway."
         (symbol-name (or (getf agent :status) :unknown))))
 (export 'agent-row)
 
-(defun render-agent-rows (agents)
-  "The agent pane body: headers `agent`/`status` and one row per snapshot entry.
-No status lights and no click handling (S04 specializes this host).
-An empty society renders the headers alone — the pane must still be visible, so an
-empty table is a real layout element, not a gap."
-  (let ((tbl (tui.render.table:make-table
-              :headers (list "agent" "status")
-              :rows (mapcar #'agent-row agents)
-              :border *border*)))
-    (tui.render.table:table-render tbl)))
+(defun agent-row-text (agent &key picked)
+  "The PLAIN, ANSI-free, zone-free text of one agent row: a picked marker (\"*\" when
+PICKED names this agent, else a space), the light glyph \"●\", the agent name, and
+the UPPERCASED status symbol-name — e.g. \"* ● Alpha RUNNING\".
+PURE and total: a missing :name/:status degrades to \"?\"/\"UNKNOWN\" and nothing here
+signals. This is the string the headless tests assert on, so it carries no escape
+codes; RENDER-AGENT-ROWS adds the color and the zone markers around it."
+  (let ((name (or (getf agent :name) "?"))
+        (status (symbol-name (or (getf agent :status) :unknown)))
+        (marker (if (and picked (stringp (getf agent :name))
+                          (string= picked (getf agent :name)))
+                    "*"
+                    " ")))
+    (format nil "~A ● ~A ~A" marker name status)))
+(export 'agent-row-text)
+
+(defun render-agent-rows (agents &key picked)
+  "The agent pane body: a header line containing both `agent` and `status`, then one
+line per snapshot entry.
+MANUAL COMPOSITION, not make-table: the table component has no zone support, so a
+row built through it cannot be clicked (research F5). Each row is rendered with a
+foreground color chosen by AGENT-LIGHT (green/red/yellow), a picked-row highlight
+(blue background + bold) when PICKED names that agent, and wrapped in
+(tui:zone-mark \"agent-row:<name>\" ...) so the row is a click target. The whole row,
+including its closing marker, stays on ONE line and short enough for *agent-width*
+so the viewport does not clip the end marker (research risk 4).
+An empty society renders the header alone — the pane must still be visible.
+Calling it with no :picked is valid and renders every row unhighlighted."
+  (let ((lines (list (format nil "  ~A  ~A" "agent" "status"))))
+    (dolist (agent agents)
+      (let* ((name (or (getf agent :name) "?"))
+             (color (ecase (agent-light agent)
+                      (:green tui:*fg-green*)
+                      (:red tui:*fg-red*)
+                      (:yellow tui:*fg-yellow*)))
+             (row-picked (and picked (stringp name) (string= picked name)))
+             (style (if row-picked
+                        (tui:make-style :foreground color
+                                        :background tui:*bg-blue* :bold t)
+                        (tui:make-style :foreground color)))
+             (text (tui:render-styled style (agent-row-text agent :picked picked))))
+        (push (tui:zone-mark (format nil "agent-row:~A" name) text) lines)))
+    (lines-to-string (nreverse lines))))
 (export 'render-agent-rows)
+
+(defun render-approval-strip (pending)
+  "The approval resolution strip: NIL when PENDING is NIL, else one line naming the
+capability/target/description and carrying the two zoned affordances the mouse
+dispatch hit-tests — (tui:zone-mark \"approval:grant-once\" \"[grant-once]\") and
+(tui:zone-mark \"approval:deny\" \"[deny]\").
+PENDING is the model's pending-approval plist (or T when only a flag arrived); a
+non-list PENDING degrades to placeholders rather than signalling. The strip is
+composed as its own line OUTSIDE the chat scrollback, so stored transcript text is
+never polluted with zone markers (research open question 2)."
+  (when pending
+    (let ((plist (if (listp pending) pending nil)))
+      (format nil "approval: ~A ~A ~A  ~A ~A"
+              (or (getf plist :capability) "?")
+              (or (getf plist :target) "")
+              (or (getf plist :description) "")
+              (tui:zone-mark "approval:grant-once" "[grant-once]")
+              (tui:zone-mark "approval:deny" "[deny]")))))
+(export 'render-approval-strip)
 
 (defun render-section (title body)
   "A bordered block with a TITLE line above BODY, per notes/tui.md §4."
@@ -155,7 +218,7 @@ plain — no border — so an error is never hidden behind layout decoration."
 
 ;;;; --- layout ------------------------------------------------------------
 
-(defun compose-layout (chat-body repl-body agent-body status-line)
+(defun compose-layout (chat-body repl-body agent-body status-line &optional approval-line)
   "The full frame, per notes/tui.md §4 master-detail:
   +-------------------------------------+--------------------+
   | chat viewport                       | agent rows         |
@@ -165,11 +228,17 @@ plain — no border — so an error is never hidden behind layout decoration."
   +-------------------------------------+--------------------+
   status bar
 The left column is chat over repl; the agent pane spans the right; the status bar is
-the last line. Borderless strings are passed through unchanged."
+the last line. APPROVAL-LINE, when non-NIL, is inserted between the joined body and
+the status bar — its own line, so an approval affordance never lands inside stored
+scrollback. Borderless strings are passed through unchanged. The 4-argument call is
+still valid: APPROVAL-LINE is optional."
   (let* ((left (tui:join-vertical :left (render-section "chat" chat-body)
                                     (render-section "repl" repl-body)))
          (body (tui:join-horizontal :top left (or agent-body
                                                    (render-agent-rows nil))))
-         (frame (tui:join-vertical :left body (render-status-bar status-line))))
+         (frame (if approval-line
+                    (tui:join-vertical :left body approval-line
+                                       (render-status-bar status-line))
+                    (tui:join-vertical :left body (render-status-bar status-line)))))
     frame))
 (export 'compose-layout)
