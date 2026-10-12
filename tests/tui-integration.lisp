@@ -444,3 +444,188 @@ malformed rather than crashing. A closed connection still returns NIL."
       (sexpr.tui:stop-server server)
       (clrhash sexpr.kernel:*event-bus*)
       (clrhash sexpr.agents:*agent-table*))))
+
+;;; --- (7) the M004/S04 full status-light round trip ------------------
+;;;;
+;;;; T06's integration closure. Every hop between the image and the pane is REAL:
+;;;; the image emits a :status bus event, the push server's per-subscription
+;;;; listener translates it and enqueues it, the writer thread drains it onto a
+;;;; loopback TCP socket, the client reads and decodes it into a status-msg, and
+;;;; `tui:update` folds it into the TEA model that `tui:view` renders. The
+;;;; resolution travels the other way: `sexpr.tui:resolve-approval` clears the
+;;;; image-side registry, emits the confirming :status, and the client's yellow
+;;;; light clears. Only the swank channel is a string stream — the client's swank
+;;;; RPCs are packet TEXT (MEM102/D020), so no live swank server is needed.
+;;;;
+;;;; The assertion surface is `tui:view` (the REAL render path), not just the row
+;;;; helper: the F2 regression was a blank agent pane that a helper-only test
+;;;; would have missed. Zones are recorded by the ROOT zone-scan inside `tui:view`,
+;;;; so the click-to-focus press is built from the recorded zone bounds (research
+;;;; risk 2), never from hand-computed terminal columns.
+;;;;
+;;;; ORDER NOTE (deviation from the literal task plan): `handle-mouse` routes a
+;;;; left press to the approval strip FIRST while the picked agent has a pending
+;;;; approval, so a row click cannot switch agents mid-approval. The plan's literal
+;;;; order (click-to-focus before resolution) would therefore never switch. This
+;;;; test resolves first (image -> green), then clicks, so the click lands on the
+;;;; agent-at-mouse path the click contract intends.
+
+(defun int-swank-reply (status value id)
+  "One framed swank reply `(:return (STATUS VALUE) ID)`. The header is a BYTE
+count and the payload is prin1'd data, matching the client's `read-packet`."
+  (let* ((payload (let ((*print-pretty* nil))
+                    (with-output-to-string (s)
+                      (prin1 (list :return (list status value) id) s)))))
+    (concatenate 'string
+                 (sexpr-tui:packet-header (length (sexpr-tui:utf8-bytes payload)))
+                 payload)))
+
+(defun int-canned-swank (&rest replies)
+  "A swank connection over a TWO-WAY string stream carrying REPLIES. Returns
+(VALUES connection output-stream) so a test can read back the request packet
+TEXT the client wrote. Replies are matched by continuation id."
+  (let ((in (make-string-input-stream (apply #'concatenate 'string replies)))
+        (out (make-string-output-stream)))
+    (values (sexpr-tui:new-swank-connection
+             :port 0 :stream (make-two-way-stream in out))
+            out)))
+
+(defun int-zone-press (zone)
+  "A left mouse press at ZONE's recorded top-left, using the +1/+2 offsets that
+mirror zone-in-bounds-p's own (1- x) / (- y 2) mapping."
+  (tui:make-mouse-press-event :x (1+ (tui::zone-info-start-x zone))
+                              :y (+ 2 (tui::zone-info-start-y zone))
+                              :button :left))
+
+(defun int-agent-row (model name)
+  "The agent-snapshot plist named NAME in MODEL, or NIL."
+  (find name (sexpr-tui:model-agents model)
+        :key (lambda (a) (getf a :name)) :test #'string=))
+
+(rove:deftest m004-agent-status-lights-round-trip-through-the-real-push-server
+  (clrhash sexpr.kernel:*event-bus*)
+  (clrhash sexpr.agents:*agent-table*)
+  (let* ((a-name "int-s04-a")
+         (b-name "int-s04-b")
+         (server (sexpr.tui:start-server :port 0))
+         (conn nil)
+         (model nil)
+         (swank-out nil))
+    (unwind-protect
+         (progn
+           ;; two agents in the society, so the pane has two rows to light
+           (sexpr.agents:register-agent!
+            (sexpr.kernel:spawn :goal "ga" :name a-name :endpoint :ollama))
+           (sexpr.agents:register-agent!
+            (sexpr.kernel:spawn :goal "gb" :name b-name :endpoint :ollama))
+           ;; a real loopback client, subscribed to BOTH agents
+           (setf conn (sexpr-tui:connect-push
+                       "127.0.0.1" (sexpr.tui:push-server-port server)))
+           (ok (typep conn 'sexpr-tui:tui-connection)
+               "connect-push returns a tui-connection over loopback")
+           (sexpr-tui:write-wire conn (list 'subscribe :agent a-name))
+           (let ((reply (sexpr-tui:decode-wire conn (bounded-tui-read conn))))
+             (ok (sexpr-tui:subscribed-msg-p reply)
+                 "the A subscribe reply closes the race")
+             (ok (string= (sexpr-tui:subscribed-msg-agent reply) a-name)
+                 "the A reply names the subscribed agent"))
+           (sexpr-tui:write-wire conn (list 'subscribe :agent b-name))
+           (let ((reply (sexpr-tui:decode-wire conn (bounded-tui-read conn))))
+             (ok (sexpr-tui:subscribed-msg-p reply)
+                 "the B subscribe reply closes the race")
+             (ok (string= (sexpr-tui:subscribed-msg-agent reply) b-name)
+                 "the B reply names the subscribed agent"))
+           ;; the TEA model over a canned swank channel. Reply 1 is the click's
+           ;; transcript-delta; reply 2 is the client-side resolve RPC.
+           (multiple-value-bind (swank out)
+               (int-canned-swank (int-swank-reply :ok '(nil . 0) 1)
+                                 (int-swank-reply :ok "resolved" 2))
+             (setf swank-out out
+                   model (make-instance 'sexpr-tui:tui-model
+                                        :swank-connection swank
+                                        :picked-agent a-name)))
+           (sexpr-tui:build-panes model)
+           (setf (sexpr-tui:model-agents model)
+                 (list (list :name a-name :handle nil :status :running
+                             :thread-alive-p t)
+                       (list :name b-name :handle nil :status :finished
+                             :thread-alive-p nil)))
+           (tui:init-global-zone-manager)
+           (tui:zone-set-enabled t)
+           (sexpr-tui:refresh-agent-viewport model)
+           ;; --- image -> pane: a pending approval lights A yellow -----------
+           (sexpr.kernel:emit-event
+            a-name
+            (list :type :status :agent-id a-name :status :waiting
+                  :pending-approval (list :agent a-name :capability :fs-write
+                                          :target "/tmp/x" :description "write it"
+                                          :restarts '(:grant-once :deny))))
+           (let ((msg (sexpr-tui:decode-wire conn (bounded-tui-read conn))))
+             (ok (sexpr-tui:status-msg-p msg)
+                 "the emitted :status round-trips off the real socket as a status-msg")
+             (ok (string= (sexpr-tui:status-msg-agent msg) a-name)
+                 "the status-msg names A")
+             (tui:update model msg))
+           (let ((v (tui:view model)))
+             (ok (search a-name v)
+                 "the F2 blank-pane guard: the agent pane renders A through tui:view")
+             (ok (search b-name v)
+                 "the agent pane renders B too")
+             (ok (search "grant-once" v)
+                 "the approval strip names the grant-once affordance")
+             (ok (search "deny" v)
+                 "the approval strip names the deny affordance"))
+           (ok (eq :yellow (sexpr-tui:agent-light (int-agent-row model a-name)))
+               "A's row lights yellow while the approval is pending")
+           ;; --- image resolve -> pane: the yellow clears --------------------
+           (sexpr.tui:resolve-approval a-name :grant-once)
+           (let ((msg (sexpr-tui:decode-wire conn (bounded-tui-read conn))))
+             (ok (sexpr-tui:status-msg-p msg)
+                 "the confirming :status arrives as a status-msg")
+             (ok (null (sexpr-tui:status-msg-pending-approval msg))
+                 "the confirming status carries a NIL pending-approval")
+             (tui:update model msg))
+           (ok (not (search "grant-once" (tui:view model)))
+               "the approval strip is gone from the view after resolution")
+           (ok (null (sexpr-tui:model-pending-approval model))
+               "the model's picked pending-approval is cleared")
+           (ok (null (getf (int-agent-row model a-name) :pending-approval))
+               "A's row pending-approval is cleared")
+           (ok (not (eq :yellow (sexpr-tui:agent-light (int-agent-row model a-name))))
+               "A's light is no longer yellow after resolution")
+           ;; --- click-to-focus: clicking B re-points the viewport -----------
+           (tui:view model)                     ; record zones from the root render
+           (let ((zone (tui:zone-get (format nil "agent-row:~A" b-name))))
+             (ok zone "the B row has a recorded click zone")
+             (when zone
+               (tui:update model (int-zone-press zone))
+               (ok (string= b-name (sexpr-tui:model-picked-agent model))
+                   "clicking B's row switches the picked agent to B")
+               (let ((v (tui:view model)))
+                 (ok (search a-name v)
+                     "the agent pane still renders A after the switch")
+                 (ok (search b-name v)
+                     "the agent pane still renders B after the switch"))))
+           ;; --- client -> image: the resolve RPC packet text ---------------
+           (multiple-value-bind (value error)
+               (sexpr-tui:rpc-resolve-approval
+                (sexpr-tui:model-swank-connection model) a-name :grant-once)
+             (ok (null error)
+                 "the client resolve RPC succeeds against the canned swank reply")
+             (ok (equal value "resolved")
+                 "the client resolve RPC returns the canned reply value"))
+           (ok (search "(sexpr.tui:resolve-approval \"int-s04-a\" :GRANT-ONCE)"
+                       (get-output-stream-string swank-out))
+               "the client wrote the resolve RPC as sexpr.tui packet text")
+           ;; no wire reader was started here, so the leak check is a clean invariant
+           (ok (null (remove-if-not
+                      (lambda (th)
+                        (and (sb-thread:thread-name th)
+                             (equal (sb-thread:thread-name th)
+                                    sexpr-tui:*wire-reader-thread-name*)))
+                      (sb-thread:list-all-threads)))
+               "no tui-wire-reader thread survives the round trip"))
+      (when conn (sexpr-tui:close-connection conn))
+      (sexpr.tui:stop-server server)
+      (clrhash sexpr.kernel:*event-bus*)
+      (clrhash sexpr.agents:*agent-table*))))
