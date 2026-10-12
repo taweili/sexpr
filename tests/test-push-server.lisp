@@ -18,6 +18,10 @@
 ;;;; T04 adds the bounded-queue backpressure: a client that stops reading gets a
 ;;;; single (resync :agent A :cursor N) per overflow burst instead of an unbounded
 ;;;; queue, and the pending fragments are dropped. Tests 26-31 below prove it.
+;;;;
+;;;; S04/T02 extends the bus listener to translate :status and :approval-needed
+;;;; events into (status ...) and (approval-needed ...) wire items. Tests 41-43
+;;;; below prove the translation and per-agent isolation.
 
 (unless (find-package :ql)
   (load (merge-pathnames "~/.sbclinit" (user-homedir-pathname))))
@@ -1504,6 +1508,108 @@ Returns the last value of PRED."
           (loop for c in sockets do (safe-close-socket c)))
       (reset!))
     result))
+
+;;;; --- S04/T02: :status and :approval-needed translation ---------------
+;;
+;; T01 makes the image emit :status and :approval-needed bus events (the
+;; pending-approval registry). T02 translates them here: the listener dispatches
+;; on :type, so a subscribed client sees (status ...) and (approval-needed ...)
+;; wire items. The isolation test proves a :status for one agent does not leak
+;; into another agent's subscriber.
+
+(test "41. a :status event is translated to (status ...) and reaches the subscribed client"
+  (let ((server (start-server :port 0)))
+    (unwind-protect
+        (let* ((port (push-server-port server))
+               (c (make-instance 'sb-bsd-sockets:inet-socket
+                                  :type :stream :protocol :tcp)))
+          (sb-bsd-sockets:socket-connect c #(127 0 0 1) port)
+          (let ((stream (sb-bsd-sockets:socket-make-stream c
+                                                           :buffering :line
+                                                           :input t
+                                                           :output t)))
+            (unwind-protect
+                (progn
+                  (send-sexpr stream '(subscribe :agent "s-A"))
+                  (let ((reply (read-or-eof stream 3.0)))
+                    (sexpr.kernel:emit-event "s-A"
+                      (list :type :status :agent-id "s-A" :status :waiting
+                            :pending-approval '(:agent "s-A")))
+                    (let ((item (read-or-eof stream 2.0)))
+                      (and (wire-equal reply '(subscribed :agent "s-A" :cursor 0))
+                           (wire-equal item (list 'status :agent "s-A" :status :waiting
+                                                :pending-approval '(:agent "s-A")))))))
+              (safe-close-socket c))))
+      (stop-server server)
+      (reset!))))
+
+(test "42. a :approval-needed event is translated to (approval-needed ...) and reaches the subscribed client"
+  (let ((server (start-server :port 0)))
+    (unwind-protect
+        (let* ((port (push-server-port server))
+               (c (make-instance 'sb-bsd-sockets:inet-socket
+                                  :type :stream :protocol :tcp)))
+          (sb-bsd-sockets:socket-connect c #(127 0 0 1) port)
+          (let ((stream (sb-bsd-sockets:socket-make-stream c
+                                                           :buffering :line
+                                                           :input t
+                                                           :output t)))
+            (unwind-protect
+                (progn
+                  (send-sexpr stream '(subscribe :agent "s-A"))
+                  (let ((reply (read-or-eof stream 3.0)))
+                    (sexpr.kernel:emit-event "s-A"
+                      (list :type :approval-needed :agent-id "s-A"
+                            :capability "exec" :target "/tmp/x"
+                            :description "run a command" :restarts '("retry")))
+                    (let ((item (read-or-eof stream 2.0)))
+                      (and (wire-equal reply '(subscribed :agent "s-A" :cursor 0))
+                           (wire-equal item (list 'approval-needed :agent "s-A"
+                                                :capability "exec" :target "/tmp/x"
+                                                :description "run a command"
+                                                :restarts '("retry")))))))
+              (safe-close-socket c))))
+      (stop-server server)
+      (reset!))))
+
+(test "43. agent isolation: a :status for agent B does not reach a client subscribed only to A"
+  (let ((server (start-server :port 0)))
+    (unwind-protect
+        (let* ((port (push-server-port server))
+               (c (make-instance 'sb-bsd-sockets:inet-socket
+                                  :type :stream :protocol :tcp)))
+          (sb-bsd-sockets:socket-connect c #(127 0 0 1) port)
+          (let ((stream (sb-bsd-sockets:socket-make-stream c
+                                                           :buffering :line
+                                                           :input t
+                                                           :output t)))
+            (unwind-protect
+                (progn
+                  (send-sexpr stream '(subscribe :agent "iso-status-A"))
+                  (let ((reply (read-or-eof stream 3.0)))
+                    (sexpr.kernel:emit-event "iso-status-B"
+                      (list :type :status :agent-id "iso-status-B" :status :waiting
+                            :pending-approval '(:agent "iso-status-B")))
+                    (and (wire-equal reply '(subscribed :agent "iso-status-A" :cursor 0))
+                         ;; nothing arrives for the other agent's status
+                         (eq (read-or-eof stream 0.5) 'timeout)
+                         ;; the subscription is still live and only for A
+                         (equal (getf (first-client-rec (push-server-diagnostics server))
+                                      :subscriptions)
+                                '("iso-status-A"))
+                         ;; POSITIVE CONTROL: the same client still receives its
+                         ;; own agent's status, so the isolation assertion is not
+                         ;; passing because the connection is broken.
+                         (progn
+                           (sexpr.kernel:emit-event "iso-status-A"
+                             (list :type :status :agent-id "iso-status-A" :status :waiting
+                                   :pending-approval '(:agent "iso-status-A")))
+                           (wire-equal (read-or-eof stream 3.0)
+                                       (list 'status :agent "iso-status-A" :status :waiting
+                                             :pending-approval '(:agent "iso-status-A")))))))
+              (safe-close-socket c))))
+      (stop-server server)
+      (reset!))))
 
 ;;;; --- summary -------------------------------------------------------
 
