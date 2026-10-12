@@ -100,7 +100,12 @@
   :author "David Li <taweili@gmail.com>"
   :license "GPL-3.0-or-later"
   :description "Test suite for sexpr (rove)."
-  :depends-on (:sexpr :rove)
+  ;; :sexpr-tui is here (NOT in :sexpr's own :depends-on) so the client package
+  ;; exists at READ time for tests/tui-integration.lisp, which drives the real S02
+  ;; push server through the client decoder and the TEA model. Adding :tuition to
+  ;; :sexpr would pull a TUI library into the image on a plain `ql:quickload :sexpr`
+  ;; (S03 must-have 5, asserted by tests/test-tui-client.lisp).
+  :depends-on (:sexpr :rove :sexpr-tui)
   :components
   ((:module "tests"
      :components

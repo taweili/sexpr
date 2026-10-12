@@ -599,12 +599,69 @@ write. Replies are placed in continuation-id order; swank-read-reply matches by 
            "src/tui-client/main.lisp"
            "tests/test-tui-client.lisp")))
 
-(test "R015: the client never names the provider transport"
-  (not (search "sexpr.provider" (source-text "src/tui-client/wire.lisp"))))
+(defparameter *client-source-files*
+  '("src/tui-client/package.lisp"
+    "src/tui-client/messages.lisp"
+    "src/tui-client/wire.lisp"
+    "src/tui-client/swank-rpc.lisp"
+    "src/tui-client/view.lisp"
+    "src/tui-client/model.lisp"
+    "src/tui-client/main.lisp")
+  "Every source file of the :sexpr-tui system, for the package-wide absence gates.")
 
-(test "deprecation invariant: the client uses make-instance 'sb-bsd-sockets:inet-socket, never make-inet-socket"
-  (and (search "make-instance 'sb-bsd-sockets:inet-socket" (source-text "src/tui-client/wire.lisp"))
-       (not (search "make-inet-socket" (source-text "src/tui-client/wire.lisp")))))
+(defun sexpr-package-tokens (text)
+  "Every `sexpr.<name>` package token in TEXT, downcased and de-duplicated.
+A tiny scanner (CL has no regex): find each `sexpr.` case-insensitively and take
+the following name characters. `sexpr.*` (a docstring's wildcard) yields no token."
+  (let ((tokens '())
+        (start 0))
+    (loop
+      (let ((pos (search "sexpr." text :start2 start :test #'char-equal)))
+        (when (null pos) (return))
+        (let* ((from (+ pos 6))
+               (to (or (position-if-not
+                        (lambda (c) (or (alphanumericp c) (char= c #\-)))
+                        text :start from)
+                       (length text))))
+          (when (> to from)
+            (push (string-downcase (subseq text from to)) tokens)))
+        (setf start (+ pos 6))))
+    (remove-duplicates tokens :test #'string=)))
+
+(test "R015: no client source names the provider transport"
+  (notany (lambda (f)
+            (let ((s (source-text f)))
+              (or (search "sexpr.provider" s :test #'char-equal)
+                  (search "cl-llm-provider" s :test #'char-equal))))
+          *client-source-files*))
+
+(test "R015: the client names only sexpr.tui/sexpr.repl/sexpr.agents — never a provider package"
+  ;; The client process has no sexpr.* package at all (MEM102/D020): every sexpr.*
+  ;; name it uses is either the sexpr.tui RPC inside packet text or the
+  ;; sexpr.repl/sexpr.agents names inside the REPL let-wrapper text. Any other
+  ;; package name (e.g. sexpr.provider) would be a boundary violation.
+  (every (lambda (f)
+           (every (lambda (tok)
+                    (member tok '("tui" "repl" "agents") :test #'string=))
+                  (sexpr-package-tokens (source-text f))))
+         *client-source-files*))
+
+(test "R015: the client's RPCs are sexpr.tui qualified names inside packet text"
+  ;; The three RPC forms the client builds are STRING literals it writes into a
+  ;; swank packet (never forms the client reads). Asserting the exact literals keeps
+  ;; a future edit from turning one into a live symbol read.
+  (let ((model (source-text "src/tui-client/model.lisp")))
+    (and (search "\"(sexpr.tui:agent-snapshot)\"" model)
+         (search "\"(sexpr.tui:transcript-delta ~A ~D)\"" model)
+         (search "\"(sexpr.tui:inject-note ~A ~A)\"" model))))
+
+(test "deprecation invariant: every client socket uses make-instance 'sb-bsd-sockets:inet-socket, never make-inet-socket"
+  (and (notany (lambda (f) (search "make-inet-socket" (source-text f)))
+               *client-source-files*)
+       ;; the two socket-owning files both build the socket with the sanctioned form
+       (every (lambda (f)
+                (search "make-instance 'sb-bsd-sockets:inet-socket" (source-text f)))
+              '("src/tui-client/wire.lisp" "src/tui-client/swank-rpc.lisp"))))
 
 (test "cl-tuition is declared in qlfile"
   (search "cl-tuition" (source-text "qlfile")))

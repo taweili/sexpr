@@ -308,3 +308,139 @@
         (handler-case (sb-bsd-sockets:socket-close socket) (error () nil)))
       (clrhash sexpr.kernel:*event-bus*)
       (clrhash sexpr.agents:*agent-table*)))))
+
+;;; --- (6) the M004 client half: real push server -> client socket -> model ----
+;;;;
+;;;; The S03 integration closure (T06). Everything on the wire is REAL: a push
+;;;; server bound to an ephemeral port, a loopback tui-connection, the subscribe
+;;;; race-closure reply, a kernel :delta emitted on the bus, and the frame read
+;;;; back off the socket and decoded into a client message object. The TEA model
+;;;; is built headlessly — its swank channel is a string stream and `tui:run` is
+;;;; never called (raw mode needs a TTY fd; MEM103) — so the assertion surface is
+;;;; the `tui:view` string, exactly as the slice demo's round trip requires.
+;;;;
+;;;; R015: the client is reached only through the exported :sexpr-tui surface.
+;;;; This file never names sexpr.provider, and the client's swank channel is a
+;;;; string stream, so no live swank server is needed for the round trip.
+
+(defun bounded-tui-read (conn &optional (timeout 5.0))
+  "Read one wire form from a client CONNECTION under a bounded timeout.
+The client's own `read-wire` blocks on `read` with no deadline, so a push server
+that never writes would hang the harness. The bound turns that failure mode into a
+clean assertion failure: a timeout returns :timeout, which `decode-wire` counts as
+malformed rather than crashing. A closed connection still returns NIL."
+  (handler-case (sb-ext:with-timeout timeout (sexpr-tui:read-wire conn))
+    (sb-ext:timeout () :timeout)))
+
+(rove:deftest m004-client-half-round-trips-a-real-push-delta-into-the-view
+  (clrhash sexpr.kernel:*event-bus*)
+  (clrhash sexpr.agents:*agent-table*)
+  (let* ((agent-name "int-tui-e2e")
+         (other-name "int-tui-unsubscribed")
+         (server (sexpr.tui:start-server :port 0))
+         (collected nil)
+         (conn nil)
+         (reader nil))
+    (unwind-protect
+         (progn
+           (sexpr.agents:register-agent!
+            (sexpr.kernel:spawn :goal "g" :name agent-name :endpoint :ollama))
+           (setf conn (sexpr-tui:connect-push
+                       "127.0.0.1" (sexpr.tui:push-server-port server)
+                       :on-message (lambda (m) (push m collected))))
+           (ok (typep conn 'sexpr-tui:tui-connection)
+               "connect-push returns a tui-connection over loopback")
+           ;; subscribe, then read the race-closure reply: once (subscribed ...)
+           ;; has been read the server-side listener is already registered, so an
+           ;; event emitted afterwards cannot be lost.
+           (sexpr-tui:write-wire conn (list 'subscribe :agent agent-name))
+           (let ((reply (sexpr-tui:decode-wire conn (bounded-tui-read conn))))
+             (ok (sexpr-tui:subscribed-msg-p reply)
+                 "the client reads the (subscribed ...) race-closure reply")
+             (ok (string= (sexpr-tui:subscribed-msg-agent reply) agent-name)
+                 "the race-closure reply names the subscribed agent"))
+           ;; negative control 1: an agent with no subscription produces no
+           ;; delivery, so the FIRST frame read is the subscribed agent's.
+           (sexpr.kernel:emit-event other-name
+                                    (list :type :delta :agent-id other-name
+                                          :chunk-delta "unsubscribed-frag"))
+           (sexpr.kernel:emit-event agent-name
+                                    (list :type :delta :agent-id agent-name
+                                          :chunk-delta "first-frag"))
+           (let ((msg (sexpr-tui:decode-wire conn (bounded-tui-read conn))))
+             (ok (and (sexpr-tui:delta-msg-p msg)
+                      (string= (sexpr-tui:delta-msg-content msg) "first-frag"))
+                 "an unsubscribed agent produces no delivery — the first frame is the subscribed agent's"))
+           ;; the positive round trip: bus -> server queue -> writer -> socket ->
+           ;; decoder -> TEA update -> view string
+           (sexpr.kernel:emit-event agent-name
+                                    (list :type :delta :agent-id agent-name
+                                          :chunk-delta "frag-from-image"))
+           (let* ((msg (sexpr-tui:decode-wire conn (bounded-tui-read conn)))
+                  (model (make-instance 'sexpr-tui:tui-model
+                                        :swank-connection
+                                        (sexpr-tui:new-swank-connection
+                                         :port 0
+                                         :stream (make-string-input-stream ""))
+                                        :picked-agent agent-name)))
+             (ok (and (sexpr-tui:delta-msg-p msg)
+                      (string= (sexpr-tui:delta-msg-content msg) "frag-from-image"))
+                 "the emitted :delta round-trips off the real socket as a delta-msg")
+             (sexpr-tui:build-panes model)
+             (tui:update model msg)
+             (ok (search "frag-from-image" (tui:view model))
+                 "tui:update puts the fragment text into the tui:view string"))
+           ;; negative control 2: a malformed frame is counted, not crashed
+           (let ((bad (sexpr-tui:make-client-connection
+                       :stream (make-string-input-stream
+                                (format nil "(delta :agent)~%")))))
+             (let ((form (sexpr-tui:read-wire bad)))
+               (ok (sexpr-tui:wire-ignored-msg-p (sexpr-tui:decode-wire bad form))
+                   "a malformed wire frame decodes to a wire-ignored-msg")
+               (ok (= 1 (sexpr-tui:stats-get bad :malformed))
+                   "the malformed frame is counted as :malformed, not crashed")))
+           ;; negative control 3: an unknown operator is ignored, not rejected
+           (let ((odd (sexpr-tui:make-client-connection
+                       :stream (make-string-input-stream
+                                (format nil "(frobnicate :agent \"A\")~%")))))
+             (let ((msg (sexpr-tui:decode-wire odd (sexpr-tui:read-wire odd))))
+               (ok (sexpr-tui:wire-ignored-msg-p msg)
+                   "an unknown operator is ignored, not rejected")
+               (ok (equal (sexpr-tui:wire-ignored-msg-op msg) "FROBNICATE")
+                   "the ignored frame keeps its upcased operator name")
+               (ok (= 1 (sexpr-tui:stats-get odd :decode-unknown))
+                   "the unknown operator is counted as :decode-unknown")))
+           ;; the reader thread over the real socket, then its leak check
+           (setf reader (sexpr-tui:start-wire-reader conn))
+           (sexpr.kernel:emit-event agent-name
+                                    (list :type :delta :agent-id agent-name
+                                          :chunk-delta "reader-frag"))
+           (loop repeat 250
+                 until (find-if (lambda (m)
+                                  (and (sexpr-tui:delta-msg-p m)
+                                       (string= (sexpr-tui:delta-msg-content m)
+                                                "reader-frag")))
+                                collected)
+                 do (sleep 0.02))
+           (ok (find-if (lambda (m)
+                          (and (sexpr-tui:delta-msg-p m)
+                               (string= (sexpr-tui:delta-msg-content m) "reader-frag")))
+                        collected)
+               "the wire reader thread decodes a real-socket delta through the connection")
+           ;; stopping the server closes the client socket, so the reader sees EOF
+           ;; and exits; the join then makes the leak assertion meaningful.
+           (sexpr.tui:stop-server server)
+           (handler-case (sb-thread:join-thread reader :timeout 5.0) (error () nil))
+           (when (sb-thread:thread-alive-p reader)
+             (handler-case (sb-thread:terminate-thread reader) (error () nil)))
+           (ok (null (remove-if-not
+                      (lambda (th)
+                        (and (sb-thread:thread-name th)
+                             (equal (sb-thread:thread-name th)
+                                    sexpr-tui:*wire-reader-thread-name*)))
+                      (sb-thread:list-all-threads)))
+               "no tui-wire-reader thread survives cleanup"))
+      (when conn (sexpr-tui:close-connection conn))
+      (sexpr.tui:stop-server server)
+      (clrhash sexpr.kernel:*event-bus*)
+      (clrhash sexpr.agents:*agent-table*))))
