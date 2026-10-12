@@ -155,6 +155,7 @@
    #:model-stats
    #:model-status-text
    #:model-readers-running
+   #:model-note
    #:model-quitting
    #:tui-init-tick
    #:scrollback-cap
@@ -173,7 +174,13 @@
    #:build-panes
    #:refresh-agent-viewport
    #:handle-key
+   #:handle-enter
+   #:send-chat-note
+   #:send-repl-form
    #:resize-panes
 
    ;; --- entry point (main.lisp, T05) ---
-   #:main))
+   #:main
+   #:parse-args
+   #:print-usage
+   #:*default-swank-port*))

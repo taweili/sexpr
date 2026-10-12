@@ -111,6 +111,11 @@ recent error, if any.")
                     :documentation "Whether the wire reader thread was started. When
 NIL on a connected model, the status bar says readers are off — a silent freeze is the
 one failure this UI must never produce.")
+   (note :initform nil :accessor model-note
+         :documentation "The last operator-facing note (an input-path error such as a
+NIL handle), or NIL. `note-error` writes here rather than straight to status-text
+because `refresh-status` rebuilds status-text from connection stats at the end of
+every update and would otherwise drop the note before the operator could see it.")
    (quitting :initform nil :accessor model-quitting)))
 
 ;;;; --- bounded scrollback ----------------------------------------------
@@ -283,9 +288,9 @@ one supersedes it — clearing it on the next healthy tick would hide the failur
                   (when swank (list (client-stats-get swank :last-error)
                                      (client-stats-get swank :packets-read)
                                      (client-stats-get swank :connection-closed)))))
-    (let ((errors (loop for c in (remove nil (list push swank))
-                        for err = (connection-error-text c)
-                        when err collect err))
+    (let* ((errors (loop for c in (remove nil (list push swank))
+                         for err = (connection-error-text c)
+                         when err collect err))
           (push-state (cond
                         ((null push) "push: none")
                         ((eq 0 (client-stats-get push :connection-closed)) "push: connected")
@@ -295,12 +300,14 @@ one supersedes it — clearing it on the next healthy tick would hide the failur
                          ((eq 0 (client-stats-get swank :connection-closed)) "swank: connected")
                          (t "swank: closed")))
           (readers (if (model-readers-running model) "readers: on" "readers: off"))
-          (picked (or (model-picked-agent model) "no agent")))
+          (picked (or (model-picked-agent model) "no agent"))
+          (notes (append (remove nil (list (model-note model)))
+                         errors)))
       (setf (model-status-text model)
             (one-line
              (format nil "~A | ~A | ~A | agent: ~A~@[ | ~A~]"
                      swank-state push-state readers picked
-                     (when errors (last-error-of errors)))))))
+                     (when notes (last-error-of notes)))))))
   model)
 
 (defun last-error-of (errors)
@@ -309,10 +316,12 @@ one supersedes it — clearing it on the next healthy tick would hide the failur
 (export 'last-error-of)
 
 (defun note-error (model error)
-  "Record ERROR as the pending status text, without dropping the previous one if ERROR
-is empty."
+  "Record ERROR as the operator-facing note, without dropping the previous one if
+ERROR is empty. The note is stored on the model so `refresh-status` (which runs at
+the end of every update and rebuilds status-text from connection stats) still shows
+it — writing status-text directly here would be overwritten before the next render."
   (when (and error (not (string= error "")))
-    (setf (model-status-text model) (one-line error)))
+    (setf (model-note model) (one-line error)))
   model)
 
 ;;;; --- panes -----------------------------------------------------------
@@ -397,9 +406,8 @@ Nothing here signals: every failure is recorded and the last good state is kept.
 
 (defun handle-key (model msg)
   "Route one key message.
-Enter in a textarea is T05's job: chat Enter becomes `inject-note` and REPL Enter
-becomes a wrapped eval. Until then Enter is passed through to the textarea (which
-inserts a newline), so a test can prove the routing reaches the right component.
+Enter in the chat textarea sends `inject-note` with the picked agent's handle;
+Enter in the REPL textarea evals the form with `sexpr.repl:*agent*` bound.
 Ctrl+C and Escape quit; Tab cycles focus between chat and repl."
   (let ((key (tui:key-msg-key msg))
         (ctrl (tui:key-msg-ctrl msg)))
@@ -417,6 +425,8 @@ Ctrl+C and Escape quit; Tab cycles focus between chat and repl."
                      (model-repl-textarea model))))
          (when ta (tui.textarea:textarea-focus ta)))
        (values model nil))
+      ((eq key :enter)
+       (handle-enter model))
       (t
        (let* ((ta (if (eq (model-focused model) :chat)
                       (model-chat-textarea model)
@@ -432,6 +442,95 @@ Ctrl+C and Escape quit; Tab cycles focus between chat and repl."
                  (model-repl-textarea model)
                  (if (eq (model-focused model) :chat) ta other))))
          (values model cmd)))))
+
+(defun handle-enter (model)
+  "Handle Enter in the focused textarea.
+Chat Enter sends `inject-note` with the picked agent's handle and renders a
+local confirmation. REPL Enter evals the form with `sexpr.repl:*agent*` bound
+to the picked agent and renders the result. The textarea is reset after
+either. A NIL handle produces a status-bar error, not a crash."
+  (if (eq (model-focused model) :chat)
+      (send-chat-note model)
+      (send-repl-form model)))
+(export 'handle-enter)
+
+(defun send-chat-note (model)
+  "Send a chat note to the picked agent via `sexpr.tui:inject-note`.
+Uses the agent's :handle (never its name). Fire-and-forget: the confirmation
+is rendered locally; a reply only appears if the agent is actually running.
+`subagent-note` appends a user event and does not drive a model turn."
+  (let* ((ta (model-chat-textarea model))
+         (text (and ta (tui.textarea:textarea-value ta))))
+    (cond
+      ((or (null text) (string= text ""))
+       (values model nil))
+      (t
+       (let ((conn (model-swank-connection model))
+             (picked (model-picked-agent model)))
+         (cond
+           ((null conn)
+            (note-error model "no swank connection — cannot send note")
+            (values model nil))
+           ((null picked)
+            (note-error model "no agent picked — cannot send note")
+            (values model nil))
+           (t
+            (let* ((agent (find picked (model-agents model)
+                                 :key (lambda (a) (getf a :name))
+                                 :test #'string=))
+                   (handle (and agent (getf agent :handle))))
+              (cond
+                ((null handle)
+                 (note-error model
+                             (format nil "no handle for agent ~A — cannot send note" picked))
+                 (values model nil))
+                (t
+                 (let* ((form-text (format nil "(sexpr.tui:inject-note ~A ~A)"
+                                           (swank-escape-string handle)
+                                           (swank-escape-string text)))
+                        (id (swank-next-id conn)))
+                   (handler-case
+                       (write-packet conn (rpc-payload form-text :id id))
+                     (error (e)
+                       (handler-case (client-note-error! conn e) (error () nil))
+                       (note-error model (format nil "note failed: ~A" e))))
+                   (model-append-chat-line model
+                                           (format nil "noted ~A: ~A" handle text))
+                   (when ta (tui.textarea:textarea-reset ta))
+                   (values model nil))))))))))))
+(export 'send-chat-note)
+
+(defun send-repl-form (model)
+  "Send a REPL form to the image, wrapped in a let that binds
+`sexpr.repl:*agent*` to the picked agent. The form is eval'd synchronously
+and the result is rendered into the REPL pane."
+  (let* ((ta (model-repl-textarea model))
+         (text (and ta (tui.textarea:textarea-value ta))))
+    (cond
+      ((or (null text) (string= text ""))
+       (values model nil))
+      (t
+       (let ((conn (model-swank-connection model))
+             (name (model-picked-agent model)))
+         (cond
+           ((null conn)
+            (note-error model "no swank connection — cannot eval")
+            (values model nil))
+           (t
+            (let ((form-text (format nil "(let ((sexpr.repl:*agent* (gethash ~A sexpr.agents:*agent-table*))) ~A)"
+                                    (swank-escape-string (or name ""))
+                                    text)))
+              (multiple-value-bind (value error)
+                  (swank-rpc conn form-text)
+                (model-append-repl-line model
+                                        (format nil "~A=> ~A" text
+                                                (if error
+                                                    (format nil "ERR: ~A" error)
+                                                    (format nil "~A" value))))
+                (note-error model (when error (format nil "eval: ~A" error))))
+              (when ta (tui.textarea:textarea-reset ta))
+              (values model nil)))))))))
+(export 'send-repl-form)
 
 (defun resize-panes (model)
   "Re-derive the pane dimensions from the new window size. The chat and REPL columns

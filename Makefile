@@ -10,8 +10,9 @@ SBCL      ?= sbcl
 SBCLINIT  ?= $(HOME)/.sbclinit
 SYSTEM    := sexpr
 CHAT_ARGS ?= --goal "pair programmer"
+TUI_ARGS  ?=
 
-.PHONY: hello test load build chat verify verify-wrapper diagnostic-tool-call diagnostic-live-round test-live clean help
+.PHONY: hello test load build chat tui verify verify-wrapper diagnostic-tool-call diagnostic-live-round test-live clean help
 
 hello:
 	$(SBCL) --non-interactive \
@@ -38,6 +39,13 @@ build: test
 
 chat: build
 	./sexpr $(CHAT_ARGS)
+
+tui:
+	$(SBCL) --non-interactive \
+		--load $(SBCLINIT) \
+		--eval '(push (uiop:getcwd) asdf:*central-registry*)' \
+		--eval '(ql:quickload :sexpr-tui :print t)' \
+		--eval '(sb-ext:exit :code (sexpr-tui:main (remove "" (uiop:split-string "$(TUI_ARGS)" :separator " ") :test (function string=))))'
 
 diagnostic-tool-call:
 	SEXPR_PROVIDER=openai-compatible \
@@ -114,6 +122,7 @@ help:
 	@echo "  load    Load the system interactively"
 	@echo "  build   Produce ./sexpr via save-lisp-and-die (depends on test)"
 	@echo "  chat    Run ./sexpr (override with CHAT_ARGS='--goal \"...\"')"
+	@echo "  tui     Run the sexpr-tui client (pass args via TUI_ARGS)"
 	@echo "  verify  Run binary probes: --help, scripted session, --capability,
 	         cross-process load, R015 seam"
 	@echo "  diagnostic-tool-call  Probe a live local server for a usable :tool-calls node"

@@ -593,8 +593,10 @@ write. Replies are placed in continuation-id order; swank-read-reply matches by 
            "src/tui-client/package.lisp"
            "src/tui-client/messages.lisp"
            "src/tui-client/wire.lisp"
+           "src/tui-client/swank-rpc.lisp"
            "src/tui-client/view.lisp"
            "src/tui-client/model.lisp"
+           "src/tui-client/main.lisp"
            "tests/test-tui-client.lisp")))
 
 (test "R015: the client never names the provider transport"
@@ -611,7 +613,138 @@ write. Replies are placed in continuation-id order; swank-read-reply matches by 
   (every (lambda (name)
            (probe-file (merge-pathnames (format nil "src/tui-client/~A.lisp" name)
                                         (uiop:getcwd))))
-         '("package" "messages" "wire")))
+         '("package" "messages" "wire" "swank-rpc" "view" "model" "main")))
+
+;;;; --- 8c. T05: input paths, entry point, and make tui -------------------
+;;;
+;;; Chat note and REPL eval tests. Each test creates a model over a canned
+;;; swank connection with a visible output stream, types text into the
+;;; textarea, presses Enter, and asserts on the packet text, the scrollback,
+;;; and the textarea state.
+
+(defun canned-swank-with-output (&rest replies)
+  "Like canned-swank, but returns (values connection output-stream) so a test
+can assert on the packet text the model wrote."
+  (let ((in (make-string-input-stream (apply #'concatenate 'string replies)))
+        (out (make-string-output-stream)))
+    (values (new-swank-connection :port 0 :stream (make-two-way-stream in out))
+            out)))
+
+(defun make-enter-msg ()
+  "An :enter key message."
+  (make-key-msg :key :enter))
+
+(test "T05: chat note packet contains the handle id and not the agent name"
+  (multiple-value-bind (conn out)
+      (canned-swank-with-output (swank-reply :ok nil 1)
+                                (swank-reply :ok '(nil . 0) 2))
+    (let ((model (make-instance 'tui-model
+                                :swank-connection conn
+                                :picked-agent "Alpha")))
+      (tui:init model)
+      ;; drain the two init request packets (agent-snapshot, transcript-delta) so
+      ;; the assertion below sees ONLY the note packet (the transcript-delta packet
+      ;; contains "Alpha", which would otherwise defeat the not-search check)
+      (get-output-stream-string out)
+      (setf (model-agents model)
+            (list (list :name "Alpha" :status :running :handle "subagent-1")))
+      (let ((ta (model-chat-textarea model)))
+        (tui.textarea:textarea-set-value ta "hello agent")
+        (tui:update model (make-enter-msg))
+        (let ((packet-text (get-output-stream-string out)))
+          (and (search "subagent-1" packet-text)
+               (not (search "Alpha" packet-text))
+               (search "inject-note" packet-text)
+               (search "hello agent" packet-text)
+               (string= "" (tui.textarea:textarea-value ta))
+               ;; model-scrollback is a LIST of lines; `search` on a list compares
+               ;; elements by EQL, not substrings, so join first.
+               (search "noted" (lines-to-string (model-scrollback model)))))))))
+
+(test "T05: REPL packet contains the let wrapper with the picked name"
+  (multiple-value-bind (conn out)
+      (canned-swank-with-output (swank-reply :ok nil 1)
+                                (swank-reply :ok '(nil . 0) 2)
+                                (swank-reply :ok "result" 3))
+    (let ((model (make-instance 'tui-model
+                                :swank-connection conn
+                                :picked-agent "Alpha")))
+      (tui:init model)
+      ;; drain the two init request packets so packet-text is ONLY the REPL request
+      (get-output-stream-string out)
+      (setf (model-focused model) :repl)
+      (let ((ta (model-repl-textarea model)))
+        (tui.textarea:textarea-set-value ta "(+ 1 2)")
+        (tui:update model (make-enter-msg))
+        (let ((packet-text (get-output-stream-string out)))
+          (and (search "let" packet-text)
+               (search "sexpr.repl:*agent*" packet-text)
+               (search "Alpha" packet-text)
+               (search "sexpr.agents:*agent-table*" packet-text)
+               (search "(+ 1 2)" packet-text)
+               (string= "" (tui.textarea:textarea-value ta))
+               ;; model-repl-lines is a LIST of lines; join before searching.
+               (search "result" (lines-to-string (model-repl-lines model)))))))))
+
+(test "T05: a NIL handle yields a status-bar error, not a crash"
+  (multiple-value-bind (conn out)
+      (canned-swank-with-output (swank-reply :ok nil 1)
+                                (swank-reply :ok '(nil . 0) 2))
+    (let ((model (make-instance 'tui-model
+                                :swank-connection conn
+                                :picked-agent "Alpha")))
+      (tui:init model)
+      ;; drain the init request packets so the no-packet assertion is meaningful
+      (get-output-stream-string out)
+      (setf (model-agents model)
+            (list (list :name "Alpha" :status :running :handle nil)))
+      (let ((ta (model-chat-textarea model)))
+        (tui.textarea:textarea-set-value ta "hello")
+        (tui:update model (make-enter-msg))
+        (and (search "no handle" (model-status-text model))
+             (string= "" (get-output-stream-string out))
+             (string= "hello" (tui.textarea:textarea-value ta)))))))
+
+(test "T05: parse-args defaults resolve correctly"
+  (multiple-value-bind (options help-p)
+      (parse-args '())
+    (and (null help-p)
+         (string= "127.0.0.1" (getf options :host))
+         (= 4004 (getf options :swank-port))
+         (null (getf options :push-port))
+         (null (getf options :agent)))))
+
+(test "T05: parse-args overrides resolve correctly"
+  (multiple-value-bind (options help-p)
+      (parse-args '("--host" "192.168.1.1"
+                   "--swank-port" "5000"
+                   "--push-port" "6000"
+                   "--agent" "Beta"))
+    (and (null help-p)
+         (string= "192.168.1.1" (getf options :host))
+         (= 5000 (getf options :swank-port))
+         (= 6000 (getf options :push-port))
+         (string= "Beta" (getf options :agent)))))
+
+(test "T05: parse-args --help returns help-p"
+  (multiple-value-bind (options help-p)
+      (parse-args '("--help"))
+    (and help-p
+         (string= "127.0.0.1" (getf options :host)))))
+
+(test "T05: the make tui target registers the project and propagates main's exit code"
+  ;; `ql:quickload :sexpr-tui` on its own fails with SYSTEM-NOT-FOUND: quicklisp caches
+  ;; its local-projects scan in ~/quicklisp/local-projects/system-index.txt, which does
+  ;; not learn about sexpr-tui.asd when it lands after the project was symlinked. The
+  ;; target must put the repo root on asdf:*central-registry* first (the same pattern
+  ;; tests/test-tui-client.lisp uses), and must exit with main's own code so a refused
+  ;; connection is a non-zero `make tui`.
+  (let ((mk (source-text "Makefile")))
+    (and (search "tui:" mk)
+         (search "asdf:*central-registry*" mk)
+         (search ":sexpr-tui" mk)
+         (search "sb-ext:exit :code (sexpr-tui:main" mk)
+         (search "TUI_ARGS" mk))))
 
 ;;;; --- summary -------------------------------------------------------------
 
