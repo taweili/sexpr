@@ -59,13 +59,48 @@
    (content :initarg :content :accessor fake-content
             :documentation "The string stream-accumulated-content returns.")
    (tool-calls :initarg :tool-calls :initform nil :accessor fake-tool-calls
-               :documentation "Canned cl-llm-provider:tool-call instances.")))
+               :documentation "Canned cl-llm-provider:tool-call instances.")
+   (state :initarg :state :initform :open :accessor fake-state
+          :documentation "Mirrors cl-llm-provider:stream-state so the kernel's
+budget abort (setf stream-state :closed) and stream-closed-p are observable.")))
+
+;; stream-state is an accessor generic on cl-llm-provider:completion-stream; we
+;; add methods specialized on fake-stream rather than subclassing completion-
+;; stream, so the fake keeps its own slot layout and no initargs need plumbing.
+(defmethod cl-llm-provider:stream-state ((stream fake-stream))
+  (fake-state stream))
+
+(defmethod (setf cl-llm-provider:stream-state) (value (stream fake-stream))
+  (setf (fake-state stream) value))
 
 (defmethod cl-llm-provider:read-stream-chunk ((stream fake-stream) &key timeout)
   (declare (ignore timeout))
+  (when (cl-llm-provider:stream-closed-p stream)
+    (return-from cl-llm-provider:read-stream-chunk nil))
   (if (fake-chunks stream)
       (pop (fake-chunks stream))
       nil))
+
+(defclass interrupting-fake-stream (fake-stream)
+  ((signaled :initform nil :accessor interrupting-signaled))
+  (:documentation "A fake whose first pull signals cl-llm-provider:stream-
+interrupted-error inside a restart-case named cl-llm-provider:abort-stream,
+the same shape the provider's real readers establish."))
+
+(defmethod cl-llm-provider:read-stream-chunk ((stream interrupting-fake-stream)
+                                               &key timeout)
+  (declare (ignore timeout))
+  (when (cl-llm-provider:stream-closed-p stream)
+    (return-from cl-llm-provider:read-stream-chunk nil))
+  (if (interrupting-signaled stream)
+      nil
+      (progn
+        (setf (interrupting-signaled stream) t)
+        (restart-case
+            (error 'cl-llm-provider:stream-interrupted-error)
+          (cl-llm-provider:abort-stream ()
+            (setf (cl-llm-provider:stream-state stream) :closed)
+            nil)))))
 
 (defmethod cl-llm-provider:stream-accumulated-content ((stream fake-stream))
   (fake-content stream))
@@ -224,6 +259,89 @@ fake-stream. Real providers are untouched for everything else."
           (spawn :goal "g" :name "streamer" :endpoint :ollama))
          (and (consp *last-tools*)
               (typep (first *last-tools*) 'cl-llm-provider:tool-definition))))
+
+       (test "7. a :total-tokens budget trip closes the stream and marks the event"
+         (clrhash *event-bus*)
+         (let ((received nil)
+               (agent (spawn :goal "g" :name "streamer" :endpoint :ollama
+                             :budget (make-budget :tokens 5))))
+           (subscribe-event-bus "streamer" (lambda (e) (push e received)))
+           (setf *fake-stream*
+                 (make-instance 'fake-stream
+                                :chunks (list (make-fake-chunk "aaaa" :usage (list :total-tokens 3))
+                                              (make-fake-chunk "bbbb" :usage (list :total-tokens 6))
+                                              (make-fake-chunk "cccc" :usage (list :total-tokens 9))
+                                              (make-fake-chunk "" :finish-reason :stop))
+                                :content "aaaabbbb"
+                                :tool-calls nil))
+           (let* ((event (model-step-streaming agent))
+                  (bus (find :budget-exceeded received
+                             :key (lambda (e) (getf e :type)))))
+             (and (getf event :budget-exceeded)
+                  (cl-llm-provider:stream-closed-p *fake-stream*)
+                  bus
+                  (= (getf bus :tokens-used) 6)
+                  (= (getf bus :limit) 5)
+                  (string= (getf bus :agent-id) "streamer")
+                  ;; the loop stopped at the ceiling: the last two chunks are unread
+                  (= (length (fake-chunks *fake-stream*)) 2)))))
+
+       (test "8. an unlimited budget runs every chunk with no abort or bus event"
+         (clrhash *event-bus*)
+         (let ((received nil)
+               (agent (spawn :goal "g" :name "streamer" :endpoint :ollama
+                             :budget (make-budget))))
+           (subscribe-event-bus "streamer" (lambda (e) (push e received)))
+           (setf *fake-stream*
+                 (make-instance 'fake-stream
+                                :chunks (list (make-fake-chunk "aaaa" :usage (list :total-tokens 1000))
+                                              (make-fake-chunk "bbbb" :usage (list :total-tokens 2000))
+                                              (make-fake-chunk "" :finish-reason :stop))
+                                :content "aaaabbbb"
+                                :tool-calls nil))
+           (let ((event (model-step-streaming agent)))
+             (and (null (getf event :budget-exceeded))
+                  (null (find :budget-exceeded received
+                              :key (lambda (e) (getf e :type))))
+                  (= (length received) 3)
+                  (not (cl-llm-provider:stream-closed-p *fake-stream*))))))
+
+       (test "9. the delta-character proxy trips a budget with no usage reported"
+         (clrhash *event-bus*)
+         (let ((received nil)
+               (agent (spawn :goal "g" :name "streamer" :endpoint :ollama
+                             :budget (make-budget :tokens 3))))
+           (subscribe-event-bus "streamer" (lambda (e) (push e received)))
+           (setf *fake-stream*
+                 (make-instance 'fake-stream
+                                ;; 8 chars -> 2 tokens per chunk by the proxy
+                                :chunks (list (make-fake-chunk "aaaaaaaa")
+                                              (make-fake-chunk "bbbbbbbb")
+                                              (make-fake-chunk "" :finish-reason :stop))
+                                :content "aaaaaaaabbbbbbbb"
+                                :tool-calls nil))
+           (let* ((event (model-step-streaming agent))
+                  (bus (find :budget-exceeded received
+                             :key (lambda (e) (getf e :type)))))
+             (and (getf event :budget-exceeded)
+                  bus
+                  (= (getf bus :tokens-used) 4)
+                  (= (length (fake-chunks *fake-stream*)) 1)))))
+
+       (test "10. a provider interruption is converted to a clean abort via the restart"
+         (clrhash *event-bus*)
+         (let ((received nil)
+               (agent (spawn :goal "g" :name "streamer" :endpoint :ollama)))
+           (subscribe-event-bus "streamer" (lambda (e) (push e received)))
+           (setf *fake-stream*
+                 (make-instance 'interrupting-fake-stream
+                                :chunks nil :content "partial" :tool-calls nil))
+           (let ((event (model-step-streaming agent)))
+             ;; if the condition escaped, the TEST macro records a CRASH
+             (and (getf event :interrupted)
+                  (cl-llm-provider:stream-closed-p *fake-stream*)
+                  (string= (event-content event) "partial")
+                  (null (getf event :budget-exceeded))))))
 
   (restore-streaming-api))
 

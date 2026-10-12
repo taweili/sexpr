@@ -296,10 +296,26 @@ calls the model returns is run-until-finished's job, not this one's."
 ;;;; :model is NIL here because the transport's stream-model reader is not
 ;;;; exported; :finish and :usage come from the final chunk.
 
+(defun %stream-chunk-tokens (chunk tokens-used)
+  "Return TOKENS-USED advanced by CHUNK's token contribution.
+
+Reads cl-llm-provider:chunk-usage: when it carries a positive :total-tokens
+(the provider's cumulative count) the larger of that and TOKENS-USED wins.
+Otherwise falls back to a character proxy — one token per four delta
+characters, at least one — because usage typically arrives only on the final
+chunk (F2), so a usage-only check would never trip mid-stream. The proxy is
+approximate and documented, not silent."
+  (let ((reported (getf (cl-llm-provider:chunk-usage chunk) :total-tokens)))
+    (if (and (integerp reported) (plusp reported))
+        (max tokens-used reported)
+        (let ((delta (cl-llm-provider:chunk-delta chunk)))
+          (+ tokens-used (max 1 (floor (length (or delta "")) 4)))))))
+
 (defun model-step-streaming (agent)
   "Streaming variant of model-step (D017): call the transport's streaming
-endpoint, emit each chunk to the event bus as a :delta event, and return a
-model event with the same shape as model-step.
+endpoint, emit each chunk to the event bus as a :delta event, enforce the
+agent's token budget, and return a model event with the same shape as
+model-step.
 
 The kernel is the only package that calls cl-llm-provider:complete-stream
 (D017); provider-call stays the only NON-streaming entry point. Each chunk's
@@ -311,7 +327,16 @@ returns. Tool schemas are translated through sexpr.provider:translate-tool-
 schemas; the endpoint resolves through sexpr.provider:*model-endpoint*,
 both by qualified call so the transport's types stay behind the provider
 seam. :model is NIL (the transport's stream-model reader is not exported);
-:finish and :usage come from the final chunk."
+:finish and :usage come from the final chunk.
+
+BUDGET: cumulative tokens are compared against (agent-budget agent) after
+each chunk. When the ceiling is crossed the stream is closed through the
+provider's own state machine and the loop stops, emitting a :budget-exceeded
+bus event and marking the returned event with :budget-exceeded t. A
+provider-side interruption (cl-llm-provider:stream-interrupted-error) is
+converted into the same clean abort by invoking the provider's exported
+ABORT-STREAM restart; that path marks the returned event with :interrupted t.
+ABORT-STREAM is a RESTART NAME, not a function — never call it."
   (let* ((endpoint (or (agent-endpoint agent)
                        sexpr.provider:*model-endpoint*
                        (setf sexpr.provider:*model-endpoint*
@@ -319,29 +344,61 @@ seam. :model is NIL (the transport's stream-model reader is not exported);
          (tools (sexpr.provider:translate-tool-schemas
                  (sexpr.tools:tool-schema-list)))
          (agent-id (agent-name agent))
+         (budget (agent-budget agent))
          (stream (cl-llm-provider:complete-stream
                    (transcript-to-messages (agent-transcript agent))
                    :provider endpoint
                    :system (or (agent-system agent) (agent-goal agent))
                    :tools tools))
-         (last-chunk nil))
-    (loop :for chunk = (cl-llm-provider:read-stream-chunk stream)
-          :while chunk
-          :do (setf last-chunk chunk)
-              (emit-event agent-id
-                          (list :type :delta
-                                :agent-id agent-id
-                                :chunk-delta (cl-llm-provider:chunk-delta chunk))))
-    (make-model-event
-     (cl-llm-provider:stream-accumulated-content stream)
-     :tool-calls (mapcar (lambda (tc)
-                           (list :id (cl-llm-provider:tool-call-id tc)
-                                 :name (cl-llm-provider:tool-call-name tc)
-                                 :arguments (cl-llm-provider:tool-call-arguments tc)))
-                         (cl-llm-provider:stream-tool-calls stream))
-     :model nil
-     :usage (when last-chunk (cl-llm-provider:chunk-usage last-chunk))
-     :finish (when last-chunk (cl-llm-provider:chunk-finish-reason last-chunk)))))
+         (last-chunk nil)
+         (tokens-used 0)
+         (budget-exceeded-p nil)
+         (interrupted-p nil))
+    ;; A provider-detected interruption is converted to the provider's own
+    ;; clean abort: the restart is established by read-stream-chunk's
+    ;; restart-case while the condition propagates, so this caller-bound
+    ;; handler is in scope, and invoking it unwinds to the restart body, which
+    ;; sets stream-state :closed and returns NIL so the loop ends cleanly.
+    (handler-bind ((cl-llm-provider:stream-interrupted-error
+                    (lambda (c)
+                      (declare (ignore c))
+                      (setf interrupted-p t)
+                      (invoke-restart 'cl-llm-provider:abort-stream))))
+      (loop :for chunk = (cl-llm-provider:read-stream-chunk stream)
+            :while chunk
+            :do (setf last-chunk chunk)
+                (setf tokens-used (%stream-chunk-tokens chunk tokens-used))
+                (emit-event agent-id
+                            (list :type :delta
+                                  :agent-id agent-id
+                                  :chunk-delta (cl-llm-provider:chunk-delta chunk)))
+                (when (and (not (unlimited-p budget :kind :tokens))
+                           (> tokens-used (budget-tokens budget)))
+                  ;; Budget abort (F1 half 1): close the stream through the
+                  ;; provider's state machine and break explicitly, so the abort
+                  ;; does not depend on the stream honoring stream-state on the
+                  ;; next pull.
+                  (setf budget-exceeded-p t)
+                  (setf (cl-llm-provider:stream-state stream) :closed)
+                  (emit-event agent-id
+                              (list :type :budget-exceeded
+                                    :agent-id agent-id
+                                    :tokens-used tokens-used
+                                    :limit (budget-tokens budget)))
+                  (return))))
+    (append
+     (make-model-event
+      (cl-llm-provider:stream-accumulated-content stream)
+      :tool-calls (mapcar (lambda (tc)
+                            (list :id (cl-llm-provider:tool-call-id tc)
+                                  :name (cl-llm-provider:tool-call-name tc)
+                                  :arguments (cl-llm-provider:tool-call-arguments tc)))
+                          (cl-llm-provider:stream-tool-calls stream))
+      :model nil
+      :usage (when last-chunk (cl-llm-provider:chunk-usage last-chunk))
+      :finish (when last-chunk (cl-llm-provider:chunk-finish-reason last-chunk)))
+     (when budget-exceeded-p (list :budget-exceeded t))
+     (when interrupted-p (list :interrupted t)))))
 (export 'model-step-streaming)
 
 (defun integrate (agent event)
