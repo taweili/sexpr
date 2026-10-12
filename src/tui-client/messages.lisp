@@ -46,6 +46,21 @@
    (error :initarg :error :initform nil :reader rpc-result-msg-error))
   :documentation "One swank RPC reply: the form text that was sent, and either the returned value or the condition. Built by T02's swank client; carried here so the decoder surface is complete.")
 
+(defmessage status-msg
+  ((agent :initarg :agent :initform nil :reader status-msg-agent)
+   (status :initarg :status :initform nil :reader status-msg-status)
+   (pending-approval :initarg :pending-approval :initform nil
+                     :reader status-msg-pending-approval))
+  :documentation "A per-agent status update: (status :agent A :status S :pending-approval P). S is the agent's status keyword (e.g. :running, :idle) and P is truthy when an approval is outstanding for A. Thin data: the T04 model turns it into a green/red/yellow light.")
+
+(defmessage approval-needed-msg
+  ((agent :initarg :agent :initform nil :reader approval-needed-msg-agent)
+   (capability :initarg :capability :initform nil :reader approval-needed-msg-capability)
+   (target :initarg :target :initform nil :reader approval-needed-msg-target)
+   (description :initarg :description :initform nil :reader approval-needed-msg-description)
+   (restarts :initarg :restarts :initform nil :reader approval-needed-msg-restarts))
+  :documentation "An agent is blocked on an approval: (approval-needed :agent A :capability C :target T :description D :restarts R). RESTARTS is the list of restarts the image offered (kept as data; the client never invokes them directly).")
+
 ;;;; --- constructors and predicates (tuition compat-name style) ----------
 
 (defun make-delta-msg (&key agent content)
@@ -107,3 +122,26 @@
   "Return true if OBJ is an rpc-result-msg."
   (typep obj 'rpc-result-msg))
 (export 'rpc-result-msg-p)
+
+(defun make-status-msg (&key agent status pending-approval)
+  "Construct a status-msg carrying AGENT, STATUS and PENDING-APPROVAL."
+  (make-instance 'status-msg :agent agent :status status
+                             :pending-approval pending-approval))
+(export 'make-status-msg)
+
+(defun status-msg-p (obj)
+  "Return true if OBJ is a status-msg."
+  (typep obj 'status-msg))
+(export 'status-msg-p)
+
+(defun make-approval-needed-msg (&key agent capability target description restarts)
+  "Construct an approval-needed-msg carrying the blocked agent's request data."
+  (make-instance 'approval-needed-msg :agent agent :capability capability
+                                      :target target :description description
+                                      :restarts restarts))
+(export 'make-approval-needed-msg)
+
+(defun approval-needed-msg-p (obj)
+  "Return true if OBJ is an approval-needed-msg."
+  (typep obj 'approval-needed-msg))
+(export 'approval-needed-msg-p)

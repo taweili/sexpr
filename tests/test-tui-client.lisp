@@ -232,6 +232,151 @@ Normalizing to names is what makes the boundary assertion testable."
     (decode-wire conn '(resync :agent "A" :cursor 2))
     (= 1 (stats-get conn :resyncs-handled))))
 
+;;;; --- 3b. T03: status / approval-needed decode (S04) -------------------
+;;;
+;;; S04 extends the client's wire vocabulary with the two unsolicited forms the
+;;; push server (S04/T02) now translates from the bus: (status :agent A :status S
+;;; :pending-approval P) and (approval-needed :agent A :capability C :target T
+;;; :description D :restarts R). These are pure decoder tests over string streams
+;;; and direct decode-wire calls: no network, no TTY, no model. Assertions are on
+;;; the message class and the readers, never on interned-symbol EQ, because the
+;;; reader interns the wire's first token in whatever package the stream used
+;;; (MEM101) — the same reason the decoder dispatches by SYMBOL-NAME.
+
+(test "T03: a STATUS form decodes to a status-msg with all three fields"
+  (let ((conn (test-connection)))
+    (let ((msg (decode-wire conn '(status :agent "Alpha" :status :running
+                                   :pending-approval t))))
+      (and (status-msg-p msg)
+           (equal (status-msg-agent msg) "Alpha")
+           (eq (status-msg-status msg) :running)
+           (eq (status-msg-pending-approval msg) t)
+           (= 0 (stats-get conn :malformed))
+           (= 0 (stats-get conn :decode-unknown))))))
+
+(test "T03: an APPROVAL-NEEDED form decodes to an approval-needed-msg with all five fields"
+  (let ((conn (test-connection)))
+    (let ((msg (decode-wire conn '(approval-needed :agent "Alpha"
+                                   :capability :fs-write
+                                   :target "/tmp/x"
+                                   :description "write file"
+                                   :restarts (:skip :abort)))))
+      (and (approval-needed-msg-p msg)
+           (equal (approval-needed-msg-agent msg) "Alpha")
+           (eq (approval-needed-msg-capability msg) :fs-write)
+           (equal (approval-needed-msg-target msg) "/tmp/x")
+           (equal (approval-needed-msg-description msg) "write file")
+           (equal (approval-needed-msg-restarts msg) '(:skip :abort))
+           (= 0 (stats-get conn :malformed))
+           (= 0 (stats-get conn :decode-unknown))))))
+
+(test "T03: a nil pending-approval decodes as NIL, not as a missing field"
+  (let ((conn (test-connection)))
+    (let ((msg (decode-wire conn '(status :agent "A" :status :idle :pending-approval nil))))
+      (and (status-msg-p msg)
+           (null (status-msg-pending-approval msg))
+           (eq (status-msg-status msg) :idle)))))
+
+(test "T03: the new operators dispatch by SYMBOL-NAME, not EQ (foreign package, lowercase)"
+  ;; A real socket read interns the operator in the reading package, so EQ against a
+  ;; client-side symbol would fail for the wrong reason. The upcased-name dispatch
+  ;; must resolve both new operators from a foreign, lowercase symbol.
+  (let ((conn (test-connection)))
+    (let ((s (decode-wire conn (list (intern "status" :cl-user)
+                                     :agent "A" :status :idle :pending-approval nil)))
+          (a (decode-wire conn (list (intern "approval-needed" :cl-user)
+                                     :agent "A" :capability :c :target "t"
+                                     :description "d" :restarts nil))))
+      (and (status-msg-p s)
+           (approval-needed-msg-p a)
+           (= 0 (stats-get conn :malformed))))))
+
+(test "T03: a server-shaped status frame round-trips through read-wire and decode-wire"
+  ;; The exact bytes the S04/T02 listener enqueues (src/tui/server.lisp
+  ;; %delta-listener): the frame is the prin1 of the whole list, so the decoder is
+  ;; driven from a real string stream, not a hand-built form.
+  (let ((conn (test-connection
+               :stream (make-string-input-stream
+                        (wire-line "status :agent \"A\" :status :running :pending-approval nil")))))
+    (let ((msg (decode-wire conn (read-wire conn))))
+      (and (status-msg-p msg)
+           (equal (status-msg-agent msg) "A")
+           (eq (status-msg-status msg) :running)
+           (null (status-msg-pending-approval msg))))))
+
+(test "T03: a server-shaped approval-needed frame round-trips through read-wire and decode-wire"
+  (let ((conn (test-connection
+               :stream (make-string-input-stream
+                        (wire-line "approval-needed :agent \"A\" :capability :fs-write :target \"/tmp/x\" :description \"write\" :restarts (:skip)")))))
+    (let ((msg (decode-wire conn (read-wire conn))))
+      (and (approval-needed-msg-p msg)
+           (equal (approval-needed-msg-agent msg) "A")
+           (eq (approval-needed-msg-capability msg) :fs-write)
+           (equal (approval-needed-msg-target msg) "/tmp/x")
+           (equal (approval-needed-msg-description msg) "write")
+           (equal (approval-needed-msg-restarts msg) '(:skip))))))
+
+(test "T03: an operator outside the extended vocabulary is still a wire-ignored-msg"
+  ;; Forward compatibility is preserved: extending the vocabulary with two names must
+  ;; not turn every other unknown operator into an error. tool-start is S05's name.
+  (let ((conn (test-connection)))
+    (let ((msg (decode-wire conn '(tool-start :agent "A"))))
+      (and (wire-ignored-msg-p msg)
+           (equal (wire-ignored-msg-op msg) "TOOL-START")
+           (= 1 (stats-get conn :decode-unknown))
+           (= 0 (stats-get conn :malformed))))))
+
+(test "T03: a status with an odd-length tail stays a counted malformed wire-ignored-msg"
+  (let ((conn (test-connection)))
+    (let ((msg (decode-wire conn '(status :agent "A" :status))))
+      (and (wire-ignored-msg-p msg)
+           (null (wire-ignored-msg-op msg))
+           (= 1 (stats-get conn :malformed))
+           (= 0 (stats-get conn :decode-unknown))))))
+
+(test "T03: a status with an improper tail stays malformed and does not signal"
+  (let ((conn (test-connection)))
+    (let ((msg (decode-wire conn '(status :agent . 5))))
+      (and (wire-ignored-msg-p msg)
+           (= 1 (stats-get conn :malformed))
+           (= 0 (stats-get conn :decode-unknown))))))
+
+(test "T03: an approval-needed with an empty payload stays malformed"
+  (let ((conn (test-connection)))
+    (let ((msg (decode-wire conn '(approval-needed))))
+      (and (wire-ignored-msg-p msg)
+           (= 1 (stats-get conn :malformed))))))
+
+(test "T03: make-status-msg / make-approval-needed-msg round-trip their slots"
+  (let ((s (make-status-msg :agent "A" :status :idle :pending-approval :x))
+        (a (make-approval-needed-msg :agent "A" :capability :c :target "t"
+                                     :description "d" :restarts '(:r))))
+    (and (equal "A" (status-msg-agent s))
+         (eq :idle (status-msg-status s))
+         (eq :x (status-msg-pending-approval s))
+         (equal "A" (approval-needed-msg-agent a))
+         (eq :c (approval-needed-msg-capability a))
+         (equal "t" (approval-needed-msg-target a))
+         (equal "d" (approval-needed-msg-description a))
+         (equal '(:r) (approval-needed-msg-restarts a)))))
+
+(test "T03: the new message classes default every slot to NIL"
+  (let ((s (make-status-msg)) (a (make-approval-needed-msg)))
+    (and (null (status-msg-agent s)) (null (status-msg-status s))
+         (null (status-msg-pending-approval s))
+         (null (approval-needed-msg-agent a)) (null (approval-needed-msg-capability a))
+         (null (approval-needed-msg-target a)) (null (approval-needed-msg-description a))
+         (null (approval-needed-msg-restarts a)))))
+
+(test "T03: the client package exports the new classes, constructors, predicates and readers"
+  (every (lambda (name) (find-symbol name :sexpr-tui))
+         '("STATUS-MSG" "MAKE-STATUS-MSG" "STATUS-MSG-P"
+           "STATUS-MSG-AGENT" "STATUS-MSG-STATUS" "STATUS-MSG-PENDING-APPROVAL"
+           "APPROVAL-NEEDED-MSG" "MAKE-APPROVAL-NEEDED-MSG" "APPROVAL-NEEDED-MSG-P"
+           "APPROVAL-NEEDED-MSG-AGENT" "APPROVAL-NEEDED-MSG-CAPABILITY"
+           "APPROVAL-NEEDED-MSG-TARGET" "APPROVAL-NEEDED-MSG-DESCRIPTION"
+           "APPROVAL-NEEDED-MSG-RESTARTS")))
+
 ;;;; --- 4. *read-eval* discipline -----------------------------------------
 
 (test "#. in a wire payload is not evaluated (the sentinel stays unbound) and is counted, not fatal"

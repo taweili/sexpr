@@ -289,8 +289,9 @@ package the reader happened to use, so name comparison is the only sound test."
   "Decode one wire form into a client message object.
 Dispatch is by upcased SYMBOL-NAME (never EQ) and fields are read from the CDR
 because the operator occupies the first slot. S02's vocabulary is
-subscribe/subscribed/unsubscribe/delta/resync; this client understands the three
-that arrive unsolicited (delta, resync, subscribed). Everything else — an unknown
+subscribe/subscribed/unsubscribe/delta/resync; S04 adds status/approval-needed.
+This client understands the five that arrive unsolicited (delta, resync,
+subscribed, status, approval-needed). Everything else — an unknown
 operator, a non-list, an improper plist — becomes a wire-ignored-msg and is counted
 (:decode-unknown or :malformed) rather than signalled, mirroring the server's
 forward-compatible dispatch. A dropped message must stay observable: the status bar
@@ -322,6 +323,16 @@ shows the last error and the counters."
       ((string= op "SUBSCRIBED")
        (make-subscribed-msg :agent (getf (cdr form) :agent)
                             :cursor (getf (cdr form) :cursor 0)))
+      ((string= op "STATUS")
+       (make-status-msg :agent (getf (cdr form) :agent)
+                        :status (getf (cdr form) :status)
+                        :pending-approval (getf (cdr form) :pending-approval)))
+      ((string= op "APPROVAL-NEEDED")
+       (make-approval-needed-msg :agent (getf (cdr form) :agent)
+                                 :capability (getf (cdr form) :capability)
+                                 :target (getf (cdr form) :target)
+                                 :description (getf (cdr form) :description)
+                                 :restarts (getf (cdr form) :restarts)))
       (t
        (%count! connection :decode-unknown)
        (%log connection "unknown operator" op)

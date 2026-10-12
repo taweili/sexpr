@@ -73,6 +73,20 @@
    #:rpc-result-msg-form
    #:rpc-result-msg-value
    #:rpc-result-msg-error
+   #:status-msg
+   #:make-status-msg
+   #:status-msg-p
+   #:status-msg-agent
+   #:status-msg-status
+   #:status-msg-pending-approval
+   #:approval-needed-msg
+   #:make-approval-needed-msg
+   #:approval-needed-msg-p
+   #:approval-needed-msg-agent
+   #:approval-needed-msg-capability
+   #:approval-needed-msg-target
+   #:approval-needed-msg-description
+   #:approval-needed-msg-restarts
 
    ;; --- swank RPC client (swank-rpc.lisp, T02) ---
    #:swank-connection
