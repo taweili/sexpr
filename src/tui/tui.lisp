@@ -36,12 +36,15 @@ the wire, never the live handle object."
 
 Every field is either a keyword, a symbol, a string, a number, a list
 of those, or NIL. The status is the kernel's agent-status keyword
-(:running, :finished, :failed, :killed). The budget is either the
-sentinel :unlimited (both ceilings are the max-fixnum default) or a
-two-key plist (:tokens N :seconds N). The endpoint is NIL (meaning
-'fall back to the global default provider') or a keyword. The handle is
-a string or NIL — never the live subagent-handle object — so the
-print/read round-trip still holds.
+(:running, :finished, :failed, :killed). The pending-approval is NIL or
+a data-only plist (:agent N :capability C :target T :description D
+:restarts R) from the approval registry — never a live condition or
+restart object, so the print/read round-trip still holds (R023). The
+budget is either the sentinel :unlimited (both ceilings are the
+max-fixnum default) or a two-key plist (:tokens N :seconds N). The
+endpoint is NIL (meaning 'fall back to the global default provider') or
+a keyword. The handle is a string or NIL — never the live
+subagent-handle object — so the print/read round-trip still holds.
 
 HANDLE-INDEX is the agent -> handle-ID map built by `agent-snapshot`; when
 called directly it builds its own."
@@ -50,6 +53,7 @@ called directly it builds its own."
     `(:name ,(agent-name agent)
              :handle ,(gethash agent handle-index)
              :status ,(agent-status agent)
+             :pending-approval ,(pending-approval-for (agent-name agent))
              :thread-alive-p
                ,(and thread (sb-thread:thread-alive-p thread))
              :transcript-length
@@ -77,6 +81,10 @@ plists, one per registered agent. Each plist has:
       the agent has no subagent handle). inject-note and kill take handle IDs,
       not agent names, so the client needs this field to route chat input.
     :status KEYWORD (:running | :finished | :failed | :killed),
+    :pending-approval NIL or a data-only plist
+      (:agent N :capability C :target T :description D :restarts R) from
+      the approval registry. NIL means no approval is pending; the client
+      renders a yellow light when it is non-NIL.
     :thread-alive-p BOOLEAN (T only when the agent has a live thread),
     :transcript-length INTEGER,
     :capabilities LIST-OF-KEYWORDS,

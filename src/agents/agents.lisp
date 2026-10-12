@@ -116,19 +116,25 @@ Returns a list of agent-name strings (model-passable)."
 ;;;; endpoint from the parent by default (D014, D017).
 
 (defun %spawn-subagent (goal &key capabilities endpoint parent)
-  "Core spawn logic. Returns the subagent-handle (not the ID)."
+  "Core spawn logic. Returns the subagent-handle (not the ID).
+
+The generated handle ID is also the agent's NAME (e.g. "subagent-1"), so
+register-agent! keys *agent-table* by a distinct string per spawn and
+agent-snapshot can list the whole society. Without this, make-agent's
+default name "agent" makes every spawn overwrite the previous table entry."
   (let* ((parent-agent (or parent sexpr.kernel:*current-agent*))
          (caps (or capabilities
                    (and parent-agent (sexpr.kernel:agent-capabilities parent-agent))
                    '(:fs-read)))
          (ep (or endpoint
                  (and parent-agent (sexpr.kernel:agent-endpoint parent-agent))))
+         (id (%next-handle-id))
          (agent (sexpr.kernel:spawn
+                 :name id
                  :goal goal
                  :capabilities caps
                  :endpoint ep
                  :parent parent-agent))
-         (id (%next-handle-id))
          (handle (make-instance 'subagent-handle
                                 :id id
                                 :agent agent

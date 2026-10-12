@@ -33,6 +33,10 @@
    #:inject-note
    #:kill
    #:spawn
+   #:pending-approvals
+   #:request-approval
+   #:resolve-approval
+   #:*pending-approvals*
    #:push-server
    #:push-server-port
    #:push-server-stats

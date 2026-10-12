@@ -68,6 +68,7 @@
       (:module "tui" :depends-on ("kernel" "agents")
         :components
         ((:file "package")
+         (:file "approval" :depends-on ("package"))
          (:file "tui" :depends-on ("package"))
          (:file "server" :depends-on ("package" "tui"))))
       ;; :sexpr.repl is an aggregating dev package (:use transcript/kernel/

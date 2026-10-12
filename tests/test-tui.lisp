@@ -15,6 +15,7 @@
 
 ;; Load the tui module by path — T04 wires it into sexpr.asd.
 (load "src/tui/package.lisp")
+(load "src/tui/approval.lisp")
 (load "src/tui/tui.lisp")
 
 (defpackage :sexpr-test-tui
@@ -65,7 +66,11 @@
 
 (defun reset! ()
   (clrhash sexpr.agents:*agent-table*)
-  (sexpr.agents:clear-subagent-registry!))
+  (sexpr.agents:clear-subagent-registry!)
+  ;; The approval registry is name-keyed state independent of the agent
+  ;; table, so a test that leaves an approval registered would leak into
+  ;; the next test unless we clear it here too.
+  (clrhash sexpr.tui:*pending-approvals*))
 
 ;;; --- unlock sexpr.kernel for fdefinition redefinition --------------
 ;; SBCL's package-lock check refuses (SETF (FDEFINITION <sym>) <fn>)
@@ -357,9 +362,13 @@ object isn't data-only the round-trip raises."
 
 (test "23. negative: :handle is resolved by agent identity, not by name — an agent NAMED like a handle ID still reads NIL"
   (with-stubbed-agent-loop
-    (make-agent! "subagent-1")
+    ;; The spawned agent's NAME is now its handle ID ("subagent-1"), so the
+    ;; table-only agent must use a non-colliding id-like name or the spawn
+    ;; would overwrite it in *agent-table* and this test would fail for the
+    ;; wrong reason.
+    (make-agent! "subagent-99")
     (let* ((id (spawn "worker"))
-           (named (snapshot-of "subagent-1"))
+           (named (snapshot-of "subagent-99"))
            (spawned (snapshot-of-handle id)))
       (and (string= id "subagent-1")
            named
@@ -414,6 +423,111 @@ object isn't data-only the round-trip raises."
                   ids)
            ;; Every snapshot row that exists carries a string handle.
            (every (lambda (row) (stringp (getf row :handle))) (agent-snapshot))))))
+
+;;;; --- T01: society naming and the pending-approval registry --------
+
+(test "28. society naming: spawning 3 subagents lists 3 distinct agents in the snapshot"
+  (with-stubbed-agent-loop
+    (let ((ids (loop for i from 1 to 3 collect (spawn (format nil "goal-~d" i)))))
+      (let* ((snap (agent-snapshot))
+             (names (mapcar (lambda (e) (getf e :name)) snap)))
+        (and (= (length ids) 3)
+             (= (length snap) 3)
+             (= (length (remove-duplicates names :test #'string=)) 3)
+             ;; The agent name IS the handle id, so the society is addressable
+             ;; by the IDs spawn returned.
+             (every (lambda (id) (member id names :test #'string=)) ids))))))
+
+(test "29. request-approval stores a pending plist and emits :status :waiting plus :approval-needed"
+  (with-stubbed-agent-loop
+    (let* ((ids (loop for i from 1 to 3 collect (spawn (format nil "goal-~d" i))))
+           (target (second ids))
+           (events '()))
+      ;; Join the stubbed worker threads so the agent status is stable.
+      (dolist (id ids)
+        (sb-thread:join-thread
+         (sexpr.agents:handle-thread (sexpr.agents:find-handle id))))
+      (sexpr.kernel:subscribe-event-bus target (lambda (e) (push e events)))
+      (let ((plist (request-approval target :fs-write "/tmp/x" "write it"
+                                     '(:grant-once :deny))))
+        (and (equal (getf plist :agent) target)
+             (eq (getf plist :capability) :fs-write)
+             (string= (getf plist :target) "/tmp/x")
+             (string= (getf plist :description) "write it")
+             (equal (getf plist :restarts) '(:grant-once :deny))
+             ;; The snapshot row carries the same data-only plist.
+             (equal (getf (snapshot-of target) :pending-approval) plist)
+             ;; Two events fired under the agent id.
+             (= (length events) 2)
+             (let ((status (find :status events :key (lambda (e) (getf e :type))))
+                   (approval (find :approval-needed events
+                                   :key (lambda (e) (getf e :type)))))
+               (and status
+                    (eq (getf status :status) :waiting)
+                    (equal (getf status :pending-approval) plist)
+                    (string= (getf status :agent-id) target)
+                    approval
+                    (eq (getf approval :capability) :fs-write)
+                    (string= (getf approval :target) "/tmp/x")
+                    (string= (getf approval :description) "write it")
+                    (equal (getf approval :restarts) '(:grant-once :deny)))))))))
+
+(test "30. resolve-approval clears the pending field and emits a :status carrying the agent's kernel status"
+  (let ((agent (make-agent! "root-1"))
+        (events '()))
+    (request-approval "root-1" :fs-write "/tmp/x" "write it" '(:grant-once :deny))
+    (sexpr.kernel:subscribe-event-bus "root-1" (lambda (e) (push e events)))
+    (let ((confirmation (resolve-approval "root-1" :grant-once)))
+      (and (string= confirmation "resolved root-1: GRANT-ONCE")
+           (null (getf (snapshot-of "root-1") :pending-approval))
+           (= (length events) 1)
+           (let ((status (first events)))
+             (and (eq (getf status :type) :status)
+                  (null (getf status :pending-approval))
+                  (string= (getf status :agent-id) "root-1")
+                  (eq (getf status :status) (sexpr.kernel:agent-status agent))))))))
+
+(test-signals "31. negative: resolve-approval signals on an unknown decision"
+  (lambda () (resolve-approval "root-1" :maybe)))
+
+(test "32. boundary: resolve-approval on an unknown agent emits :finished and does not error"
+  (let ((events '()))
+    (sexpr.kernel:subscribe-event-bus "ghost" (lambda (e) (push e events)))
+    (let ((confirmation (resolve-approval "ghost" :deny)))
+      (and (string= confirmation "resolved ghost: DENY")
+           (= (length events) 1)
+           (eq (getf (first events) :status) :finished)
+           (null (getf (first events) :pending-approval))))))
+
+(test "33. pending-approvals returns every pending row, or one agent's row, or NIL"
+  (make-agent! "root-1")
+  (make-agent! "root-2")
+  (request-approval "root-1" :fs-write "/a" "a" '(:grant-once))
+  (request-approval "root-2" :net "b" "b" '(:deny))
+  (let ((all (pending-approvals)))
+    (and (= (length all) 2)
+         (every (lambda (plist)
+                  (member (getf plist :agent) '("root-1" "root-2")
+                          :test #'string=))
+                all)
+         (let ((one (pending-approvals "root-1")))
+           (and (equal (getf one :agent) "root-1")
+                (eq (getf one :capability) :fs-write)))
+         (null (pending-approvals "nobody")))))
+
+(test "34. boundary: the snapshot with :pending-approval still survives a print/read round-trip"
+  (make-agent! "root-1")
+  (request-approval "root-1" :fs-write "/tmp/x" "write it" '(:grant-once :deny))
+  (let ((snap (agent-snapshot))
+        (copy (serialize-round-trip (agent-snapshot))))
+    (and (equal snap copy)
+         (equal (getf (getf (first snap) :pending-approval) :target) "/tmp/x"))))
+
+(test "35. boundary: request-approval with no restarts stores NIL restarts"
+  (make-agent! "root-1")
+  (let ((plist (request-approval "root-1" :fs-write "/a" "a")))
+    (and (null (getf plist :restarts))
+         (null (getf (getf (snapshot-of "root-1") :pending-approval) :restarts)))))
 
 ;;; --- Summary --------------------------------------------------------
 
