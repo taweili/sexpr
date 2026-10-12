@@ -36,7 +36,11 @@ the wire, never the live handle object."
 
 Every field is either a keyword, a symbol, a string, a number, a list
 of those, or NIL. The status is the kernel's agent-status keyword
-(:running, :finished, :failed, :killed). The pending-approval is NIL or
+(:running, :finished, :failed, :killed). The streaming flag is a
+data-only boolean — T exactly while a model stream is in flight (F6, the
+red-light busy signal) — never the raw slot value or a live stream
+object, so the print/read round-trip still holds (R023). The
+pending-approval is NIL or
 a data-only plist (:agent N :capability C :target T :description D
 :restarts R) from the approval registry — never a live condition or
 restart object, so the print/read round-trip still holds (R023). The
@@ -53,6 +57,7 @@ called directly it builds its own."
     `(:name ,(agent-name agent)
              :handle ,(gethash agent handle-index)
              :status ,(agent-status agent)
+             :streaming ,(and (sexpr.kernel:agent-streaming-p agent) t)
              :pending-approval ,(pending-approval-for (agent-name agent))
              :thread-alive-p
                ,(and thread (sb-thread:thread-alive-p thread))
@@ -81,6 +86,8 @@ plists, one per registered agent. Each plist has:
       the agent has no subagent handle). inject-note and kill take handle IDs,
       not agent names, so the client needs this field to route chat input.
     :status KEYWORD (:running | :finished | :failed | :killed),
+    :streaming BOOLEAN (T exactly while a model stream is in flight — the
+      red-light busy signal; NIL otherwise, never a live stream object),
     :pending-approval NIL or a data-only plist
       (:agent N :capability C :target T :description D :restarts R) from
       the approval registry. NIL means no approval is pending; the client

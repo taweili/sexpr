@@ -76,22 +76,32 @@
 ;; SBCL's package-lock check refuses (SETF (FDEFINITION <sym>) <fn>)
 ;; when the symbol's home package is locked AND the current package is
 ;; different. :sexpr.kernel is locked (defpackage default); tests that
-;; stub agent-loop (T03 tests 13/15/17) need to unlock it first.
+;; stub agent-loop / agent-loop-streaming (T03 tests 13/15/17 and the
+;; with-stubbed-agent-loop seam) need to unlock it first.
 ;; test-streaming gets away with the same trick because
 ;; cl-llm-provider's package is unlocked (quickload behavior).
 
 (sb-ext:unlock-package (find-package :sexpr.kernel))
 
 (defmacro with-stubbed-agent-loop (&body body)
-  "Run BODY with sexpr.kernel:agent-loop replaced by a no-op, so tests that
-  call spawn do not start real worker threads. Same trick tests 13/15/17 use
-  inline; :sexpr.kernel is unlocked above so fdefinition redefinition is legal."
-  `(let ((real-agent-loop (fdefinition 'sexpr.kernel:agent-loop)))
+  "Run BODY with sexpr.kernel:agent-loop AND sexpr.kernel:agent-loop-streaming
+  replaced by no-ops, so tests that call spawn do not start real worker
+  threads. S05/T03 routes the subagent worker through agent-loop-streaming, so
+  the seam must stub BOTH entry points; the non-streaming agent-loop stub is
+  kept for the other tests. Same trick tests 13/15/17 use inline; :sexpr.kernel
+  is unlocked above so fdefinition redefinition is legal."
+  `(let ((real-agent-loop (fdefinition 'sexpr.kernel:agent-loop))
+         (real-agent-loop-streaming
+           (fdefinition 'sexpr.kernel:agent-loop-streaming)))
      (setf (fdefinition 'sexpr.kernel:agent-loop)
+           (lambda (agent) (declare (ignore agent))))
+     (setf (fdefinition 'sexpr.kernel:agent-loop-streaming)
            (lambda (agent) (declare (ignore agent))))
      (unwind-protect
          (progn ,@body)
-       (setf (fdefinition 'sexpr.kernel:agent-loop) real-agent-loop))))
+       (setf (fdefinition 'sexpr.kernel:agent-loop) real-agent-loop)
+       (setf (fdefinition 'sexpr.kernel:agent-loop-streaming)
+             real-agent-loop-streaming))))
 
 ;;; --- helpers ---------------------------------------------------------
 
@@ -242,8 +252,13 @@ object isn't data-only the round-trip raises."
   (lambda () (transcript-delta "nope" 0)))
 
 (test "13. inject-note delegates to subagent-note and appends a user event to the subagent's transcript"
-  (let ((real-agent-loop (fdefinition 'sexpr.kernel:agent-loop)))
+  (let ((real-agent-loop (fdefinition 'sexpr.kernel:agent-loop))
+        (real-agent-loop-streaming
+          (fdefinition 'sexpr.kernel:agent-loop-streaming)))
     (setf (fdefinition 'sexpr.kernel:agent-loop)
+          (lambda (agent) (declare (ignore agent))))
+    ;; S05/T03: the worker now calls agent-loop-streaming, so stub it too.
+    (setf (fdefinition 'sexpr.kernel:agent-loop-streaming)
           (lambda (agent) (declare (ignore agent))))
     (unwind-protect
          (let* ((id (spawn-subagent "test goal"))
@@ -258,7 +273,9 @@ object isn't data-only the round-trip raises."
                      (car (sexpr.transcript:events-list
                            (sexpr.kernel:agent-transcript agent))))
                     :user)))
-      (setf (fdefinition 'sexpr.kernel:agent-loop) real-agent-loop))))
+      (setf (fdefinition 'sexpr.kernel:agent-loop) real-agent-loop)
+      (setf (fdefinition 'sexpr.kernel:agent-loop-streaming)
+            real-agent-loop-streaming))))
 
 (test "14. inject-note signals on an unknown handle"
   (handler-case
@@ -266,11 +283,20 @@ object isn't data-only the round-trip raises."
     (error () t)))
 
 (test "15. kill delegates to subagent-kill and terminates a real thread"
-  (let ((real-agent-loop (fdefinition 'sexpr.kernel:agent-loop)))
+  (let ((real-agent-loop (fdefinition 'sexpr.kernel:agent-loop))
+        (real-agent-loop-streaming
+          (fdefinition 'sexpr.kernel:agent-loop-streaming)))
     (setf (fdefinition 'sexpr.kernel:agent-loop)
           (lambda (agent)
             (declare (ignore agent))
             ;; Block long enough to be killed before waking.
+            (sleep 300)))
+    ;; S05/T03: the worker calls agent-loop-streaming, so THAT is the stub
+    ;; that must block — otherwise the worker exits before the kill and the
+    ;; alive-before check races. Keep the agent-loop stub too (seam parity).
+    (setf (fdefinition 'sexpr.kernel:agent-loop-streaming)
+          (lambda (agent)
+            (declare (ignore agent))
             (sleep 300)))
     (unwind-protect
          (let* ((id (spawn-subagent "test goal"))
@@ -291,7 +317,9 @@ object isn't data-only the round-trip raises."
                 (not (sb-thread:thread-alive-p thread))
                 (string= result (format nil "killed ~a" id))
                 (eq (sexpr.kernel:agent-status agent) :killed)))
-      (setf (fdefinition 'sexpr.kernel:agent-loop) real-agent-loop))))
+      (setf (fdefinition 'sexpr.kernel:agent-loop) real-agent-loop)
+      (setf (fdefinition 'sexpr.kernel:agent-loop-streaming)
+            real-agent-loop-streaming))))
 
 (test "16. kill signals on an unknown handle"
   (handler-case
@@ -299,10 +327,15 @@ object isn't data-only the round-trip raises."
     (error () t)))
 
 (test "17. spawn returns a handle ID string and registers the agent in the global table"
-  ;; We don't want a real agent-loop thread; stub agent-loop via fdefinition
-  ;; redefinition (it is a plain defun, not generic) for the duration.
-  (let ((real-agent-loop (fdefinition 'sexpr.kernel:agent-loop)))
+  ;; We don't want a real agent-loop thread; stub agent-loop (and, since
+  ;; S05/T03, agent-loop-streaming — the function the worker actually calls)
+  ;; via fdefinition redefinition (they are plain defuns, not generics).
+  (let ((real-agent-loop (fdefinition 'sexpr.kernel:agent-loop))
+        (real-agent-loop-streaming
+          (fdefinition 'sexpr.kernel:agent-loop-streaming)))
     (setf (fdefinition 'sexpr.kernel:agent-loop)
+          (lambda (agent) (declare (ignore agent))))
+    (setf (fdefinition 'sexpr.kernel:agent-loop-streaming)
           (lambda (agent) (declare (ignore agent))))
     (unwind-protect
          (let ((id (spawn "test goal" :capabilities '(:fs-read))))
@@ -313,7 +346,9 @@ object isn't data-only the round-trip raises."
                        (let ((agent (sexpr.agents:handle-agent handle)))
                          (gethash (sexpr.kernel:agent-name agent)
                                   sexpr.agents:*agent-table*))))))
-      (setf (fdefinition 'sexpr.kernel:agent-loop) real-agent-loop))))
+      (setf (fdefinition 'sexpr.kernel:agent-loop) real-agent-loop)
+      (setf (fdefinition 'sexpr.kernel:agent-loop-streaming)
+            real-agent-loop-streaming))))
 
 (test "18. agent-snapshot is entirely serializable — no live objects cross the boundary"
   (make-agent! "root-1")
@@ -528,6 +563,59 @@ object isn't data-only the round-trip raises."
   (let ((plist (request-approval "root-1" :fs-write "/a" "a")))
     (and (null (getf plist :restarts))
          (null (getf (getf (snapshot-of "root-1") :pending-approval) :restarts)))))
+
+;;;; --- S05/T03: the :streaming field and the streaming spawn seam ---
+
+(test "36. agent-snapshot entries carry :streaming as a data-only boolean (NIL for a non-streaming agent)"
+  (make-agent! "root-1")
+  (let ((entry (snapshot-of "root-1")))
+    (and entry
+         ;; The key is PRESENT, not merely absent-and-read-as-NIL.
+         (not (eq (getf entry :streaming :absent) :absent))
+         (typep (getf entry :streaming) 'boolean)
+         (null (getf entry :streaming)))))
+
+(test "37. agent-snapshot :streaming is T when the agent's streaming-p slot is set"
+  (let ((agent (make-agent! "root-1")))
+    (setf (sexpr.kernel:agent-streaming-p agent) t)
+    (let ((entry (snapshot-of "root-1")))
+      (and entry
+           (eq (getf entry :streaming) t)))))
+
+(test "38. boundary: the snapshot with :streaming present still survives a print/read round-trip"
+  (let ((agent (make-agent! "root-1")))
+    (setf (sexpr.kernel:agent-streaming-p agent) t)
+    (let ((snap (agent-snapshot))
+          (copy (serialize-round-trip (agent-snapshot))))
+      (and (equal snap copy)
+           (eq (getf (first snap) :streaming) t)))))
+
+(test "39. the subagent worker thread runs agent-loop-streaming, not agent-loop"
+  (let ((real-agent-loop (fdefinition 'sexpr.kernel:agent-loop))
+        (real-agent-loop-streaming
+          (fdefinition 'sexpr.kernel:agent-loop-streaming))
+        (calls '()))
+    ;; agent-loop records nothing, so if the worker regresses to it the
+    ;; CALLS list stays empty and the assertion below fails for the right
+    ;; reason.
+    (setf (fdefinition 'sexpr.kernel:agent-loop)
+          (lambda (agent) (declare (ignore agent))))
+    (setf (fdefinition 'sexpr.kernel:agent-loop-streaming)
+          (lambda (agent)
+            (declare (ignore agent))
+            (push :streaming calls)))
+    (unwind-protect
+         (let* ((id (spawn "test goal"))
+                (handle (sexpr.agents:find-handle id)))
+           (sb-thread:join-thread (sexpr.agents:handle-thread handle))
+           (and (= (length calls) 1)
+                (eq (first calls) :streaming)
+                (eq (sexpr.kernel:agent-status
+                     (sexpr.agents:handle-agent handle))
+                    :finished)))
+      (setf (fdefinition 'sexpr.kernel:agent-loop) real-agent-loop)
+      (setf (fdefinition 'sexpr.kernel:agent-loop-streaming)
+            real-agent-loop-streaming))))
 
 ;;; --- Summary --------------------------------------------------------
 

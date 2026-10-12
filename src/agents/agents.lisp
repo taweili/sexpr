@@ -121,7 +121,11 @@ Returns a list of agent-name strings (model-passable)."
 The generated handle ID is also the agent's NAME (e.g. "subagent-1"), so
 register-agent! keys *agent-table* by a distinct string per spawn and
 agent-snapshot can list the whole society. Without this, make-agent's
-default name "agent" makes every spawn overwrite the previous table entry."
+default name "agent" makes every spawn overwrite the previous table entry.
+
+The worker thread runs sexpr.kernel:agent-loop-streaming (S05/T03), not the
+non-streaming agent-loop, so the subagent's model turn streams onto the event
+bus. A provider failure still lands in handle-error with status :failed."
   (let* ((parent-agent (or parent sexpr.kernel:*current-agent*))
          (caps (or capabilities
                    (and parent-agent (sexpr.kernel:agent-capabilities parent-agent))
@@ -145,7 +149,14 @@ default name "agent" makes every spawn overwrite the previous table entry."
            (lambda ()
              (handler-case
                  (progn
-                   (sexpr.kernel:agent-loop agent)
+                   ;; S05/T03: the worker runs the STREAMING loop, so a
+                   ;; subagent's model turn emits :delta/:finalize/
+                   ;; :tool-start/:tool-result onto the event bus and
+                   ;; :streaming is true in agent-snapshot while the model
+                   ;; stream is in flight. The finished/failed status
+                   ;; handling below is unchanged: agent-loop and
+                   ;; agent-loop-streaming share the same error contract.
+                   (sexpr.kernel:agent-loop-streaming agent)
                    (setf (sexpr.kernel:agent-status agent) :finished))
                (error (err)
                  (setf (handle-error handle) err)
