@@ -18,8 +18,12 @@
 
 (defmessage delta-msg
   ((agent :initarg :agent :initform nil :reader delta-msg-agent)
-   (content :initarg :content :initform nil :reader delta-msg-content))
-  :documentation "A streamed fragment from the push channel: (delta :agent A :content S).")
+   (content :initarg :content :initform nil :reader delta-msg-content)
+   ;; KIND separates model prose (:model) from a tool's streamed output (:tool) on the
+   ;; same wire operator. It defaults to :model so a kind-less frame from an older
+   ;; server (S04 or earlier) still decodes as model prose rather than an unknown kind.
+   (kind :initarg :kind :initform :model :reader delta-msg-kind))
+  :documentation "A streamed fragment from the push channel: (delta :agent A :content S :kind K). K is :model for model prose (the default) or :tool for a tool's streamed output.")
 
 (defmessage resync-msg
   ((agent :initarg :agent :initform nil :reader resync-msg-agent)
@@ -61,11 +65,36 @@
    (restarts :initarg :restarts :initform nil :reader approval-needed-msg-restarts))
   :documentation "An agent is blocked on an approval: (approval-needed :agent A :capability C :target T :description D :restarts R). RESTARTS is the list of restarts the image offered (kept as data; the client never invokes them directly).")
 
+(defmessage finalize-msg
+  ((agent :initarg :agent :initform nil :reader finalize-msg-agent)
+   (event-index :initarg :event-index :initform nil :reader finalize-msg-event-index))
+  :documentation "A streaming turn ended: (finalize :agent A :event-index N). N is the transcript length at the moment the stream began, so the client can confirm every fragment landed before moving the turn to scrollback.")
+
+(defmessage tool-start-msg
+  ((agent :initarg :agent :initform nil :reader tool-start-msg-agent)
+   (call-id :initarg :call-id :initform nil :reader tool-start-msg-call-id)
+   (name :initarg :name :initform nil :reader tool-start-msg-name))
+  :documentation "A tool call began: (tool-start :agent A :call-id C :name N). The viewport shows progress from the start until the matching tool-result.")
+
+(defmessage tool-result-msg
+  ((agent :initarg :agent :initform nil :reader tool-result-msg-agent)
+   (call-id :initarg :call-id :initform nil :reader tool-result-msg-call-id)
+   (value :initarg :value :initform nil :reader tool-result-msg-value)
+   (text :initarg :text :initform nil :reader tool-result-msg-text))
+  :documentation "A tool call finished: (tool-result :agent A :call-id C :value V :text T). VALUE is the tool's structured result and TEXT its rendered form (both kept as data; the client renders, never re-evaluates).")
+
+(defmessage budget-exceeded-msg
+  ((agent :initarg :agent :initform nil :reader budget-exceeded-msg-agent)
+   (tokens-used :initarg :tokens-used :initform nil :reader budget-exceeded-msg-tokens-used)
+   (limit :initarg :limit :initform nil :reader budget-exceeded-msg-limit))
+  :documentation "The agent's token budget was hit and the stream was aborted mid-turn: (budget-exceeded :agent A :tokens-used U :limit L). The viewport shows it so a truncated turn is never mistaken for a finished one.")
+
 ;;;; --- constructors and predicates (tuition compat-name style) ----------
 
-(defun make-delta-msg (&key agent content)
-  "Construct a delta-msg carrying AGENT and CONTENT."
-  (make-instance 'delta-msg :agent agent :content content))
+(defun make-delta-msg (&key agent content (kind :model))
+  "Construct a delta-msg carrying AGENT, CONTENT and KIND (default :model, so an older
+kind-less server decodes as model prose)."
+  (make-instance 'delta-msg :agent agent :content content :kind kind))
 (export 'make-delta-msg)
 
 (defun delta-msg-p (obj)
@@ -145,3 +174,45 @@
   "Return true if OBJ is an approval-needed-msg."
   (typep obj 'approval-needed-msg))
 (export 'approval-needed-msg-p)
+
+(defun make-finalize-msg (&key agent event-index)
+  "Construct a finalize-msg carrying AGENT and EVENT-INDEX."
+  (make-instance 'finalize-msg :agent agent :event-index event-index))
+(export 'make-finalize-msg)
+
+(defun finalize-msg-p (obj)
+  "Return true if OBJ is a finalize-msg."
+  (typep obj 'finalize-msg))
+(export 'finalize-msg-p)
+
+(defun make-tool-start-msg (&key agent call-id name)
+  "Construct a tool-start-msg carrying AGENT, CALL-ID and NAME."
+  (make-instance 'tool-start-msg :agent agent :call-id call-id :name name))
+(export 'make-tool-start-msg)
+
+(defun tool-start-msg-p (obj)
+  "Return true if OBJ is a tool-start-msg."
+  (typep obj 'tool-start-msg))
+(export 'tool-start-msg-p)
+
+(defun make-tool-result-msg (&key agent call-id value text)
+  "Construct a tool-result-msg carrying AGENT, CALL-ID, VALUE and TEXT."
+  (make-instance 'tool-result-msg :agent agent :call-id call-id
+                                  :value value :text text))
+(export 'make-tool-result-msg)
+
+(defun tool-result-msg-p (obj)
+  "Return true if OBJ is a tool-result-msg."
+  (typep obj 'tool-result-msg))
+(export 'tool-result-msg-p)
+
+(defun make-budget-exceeded-msg (&key agent tokens-used limit)
+  "Construct a budget-exceeded-msg carrying AGENT, TOKENS-USED and LIMIT."
+  (make-instance 'budget-exceeded-msg :agent agent :tokens-used tokens-used
+                                      :limit limit))
+(export 'make-budget-exceeded-msg)
+
+(defun budget-exceeded-msg-p (obj)
+  "Return true if OBJ is a budget-exceeded-msg."
+  (typep obj 'budget-exceeded-msg))
+(export 'budget-exceeded-msg-p)

@@ -289,9 +289,11 @@ package the reader happened to use, so name comparison is the only sound test."
   "Decode one wire form into a client message object.
 Dispatch is by upcased SYMBOL-NAME (never EQ) and fields are read from the CDR
 because the operator occupies the first slot. S02's vocabulary is
-subscribe/subscribed/unsubscribe/delta/resync; S04 adds status/approval-needed.
-This client understands the five that arrive unsolicited (delta, resync,
-subscribed, status, approval-needed). Everything else — an unknown
+subscribe/subscribed/unsubscribe/delta/resync; S04 adds status/approval-needed;
+S05 adds finalize/tool-start/tool-result/budget-exceeded and a :kind on delta.
+This client understands the forms that arrive unsolicited (delta, resync,
+subscribed, status, approval-needed, finalize, tool-start, tool-result,
+budget-exceeded). Everything else — an unknown
 operator, a non-list, an improper plist — becomes a wire-ignored-msg and is counted
 (:decode-unknown or :malformed) rather than signalled, mirroring the server's
 forward-compatible dispatch. A dropped message must stay observable: the status bar
@@ -314,8 +316,11 @@ shows the last error and the counters."
       (return-from decode-wire (make-wire-ignored-msg :op nil :form form)))
     (cond
       ((string= op "DELTA")
+       ;; KIND is optional on the wire: an older/S04 server sends no :kind, and the
+       ;; contract is that it decodes as :model prose, never as an unknown kind.
        (make-delta-msg :agent (getf (cdr form) :agent)
-                       :content (getf (cdr form) :content)))
+                       :content (getf (cdr form) :content)
+                       :kind (or (getf (cdr form) :kind) :model)))
       ((string= op "RESYNC")
        (%count! connection :resyncs-handled)
        (make-resync-msg :agent (getf (cdr form) :agent)
@@ -333,6 +338,25 @@ shows the last error and the counters."
                                  :target (getf (cdr form) :target)
                                  :description (getf (cdr form) :description)
                                  :restarts (getf (cdr form) :restarts)))
+      ;; S05 vocabulary: the streaming-turn lifecycle. Every branch sits after the
+      ;; shared well-formed-payload-p guard, so an odd or improper tail on any of
+      ;; these operators is counted :malformed and never signals.
+      ((string= op "FINALIZE")
+       (make-finalize-msg :agent (getf (cdr form) :agent)
+                          :event-index (getf (cdr form) :event-index)))
+      ((string= op "TOOL-START")
+       (make-tool-start-msg :agent (getf (cdr form) :agent)
+                            :call-id (getf (cdr form) :call-id)
+                            :name (getf (cdr form) :name)))
+      ((string= op "TOOL-RESULT")
+       (make-tool-result-msg :agent (getf (cdr form) :agent)
+                             :call-id (getf (cdr form) :call-id)
+                             :value (getf (cdr form) :value)
+                             :text (getf (cdr form) :text)))
+      ((string= op "BUDGET-EXCEEDED")
+       (make-budget-exceeded-msg :agent (getf (cdr form) :agent)
+                                 :tokens-used (getf (cdr form) :tokens-used)
+                                 :limit (getf (cdr form) :limit)))
       (t
        (%count! connection :decode-unknown)
        (%log connection "unknown operator" op)

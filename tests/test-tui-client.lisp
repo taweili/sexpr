@@ -221,9 +221,9 @@ Normalizing to names is what makes the boundary assertion testable."
 
 (test "an unknown operator is ignored, not rejected — forward compatibility with a newer server"
   (let ((conn (test-connection)))
-    (let ((msg (decode-wire conn '(finalize :agent "A"))))
+    (let ((msg (decode-wire conn '(future-unknown :agent "A"))))
       (and (wire-ignored-msg-p msg)
-           (equal (wire-ignored-msg-op msg) "FINALIZE")
+           (equal (wire-ignored-msg-op msg) "FUTURE-UNKNOWN")
            (= 1 (stats-get conn :decode-unknown))
            (= 0 (stats-get conn :malformed))))))
 
@@ -318,11 +318,12 @@ Normalizing to names is what makes the boundary assertion testable."
 
 (test "T03: an operator outside the extended vocabulary is still a wire-ignored-msg"
   ;; Forward compatibility is preserved: extending the vocabulary with two names must
-  ;; not turn every other unknown operator into an error. tool-start is S05's name.
+  ;; not turn every other unknown operator into an error. FUTURE-UNKNOWN is genuinely
+  ;; outside the vocabulary (finalize/tool-start are S05 names and now decode).
   (let ((conn (test-connection)))
-    (let ((msg (decode-wire conn '(tool-start :agent "A"))))
+    (let ((msg (decode-wire conn '(future-unknown :agent "A"))))
       (and (wire-ignored-msg-p msg)
-           (equal (wire-ignored-msg-op msg) "TOOL-START")
+           (equal (wire-ignored-msg-op msg) "FUTURE-UNKNOWN")
            (= 1 (stats-get conn :decode-unknown))
            (= 0 (stats-get conn :malformed))))))
 
@@ -376,6 +377,171 @@ Normalizing to names is what makes the boundary assertion testable."
            "APPROVAL-NEEDED-MSG-AGENT" "APPROVAL-NEEDED-MSG-CAPABILITY"
            "APPROVAL-NEEDED-MSG-TARGET" "APPROVAL-NEEDED-MSG-DESCRIPTION"
            "APPROVAL-NEEDED-MSG-RESTARTS")))
+
+;;;; --- 3c. T05: finalize / tool-progress / budget vocabulary (S05) -------
+;;;
+;;; S05 extends the wire vocabulary with the streaming-turn lifecycle the push
+;;; server (S05/T04) now forwards: (finalize :agent A :event-index N),
+;;; (tool-start :agent A :call-id C :name N), (tool-result :agent A :call-id C
+;;; :value V :text T) and (budget-exceeded :agent A :tokens-used U :limit L).
+;;; DELTA also gains an optional :kind so model prose and a tool's streamed output
+;;; on the same operator are distinguishable. Every operator dispatches by upcased
+;;; SYMBOL-NAME and reads fields from the CDR, and every one sits after the shared
+;;; well-formed-payload-p guard, so an odd or improper tail stays a counted
+;;; :malformed wire-ignored-msg rather than signalling.
+
+(test "T05: a FINALIZE form decodes to a finalize-msg with agent and event-index"
+  (let ((conn (test-connection)))
+    (let ((msg (decode-wire conn '(finalize :agent "Alpha" :event-index 7))))
+      (and (finalize-msg-p msg)
+           (equal (finalize-msg-agent msg) "Alpha")
+           (= 7 (finalize-msg-event-index msg))
+           (= 0 (stats-get conn :malformed))
+           (= 0 (stats-get conn :decode-unknown))))))
+
+(test "T05: a TOOL-START form decodes to a tool-start-msg with all three fields"
+  (let ((conn (test-connection)))
+    (let ((msg (decode-wire conn '(tool-start :agent "Alpha" :call-id "c1" :name "get_weather"))))
+      (and (tool-start-msg-p msg)
+           (equal (tool-start-msg-agent msg) "Alpha")
+           (equal (tool-start-msg-call-id msg) "c1")
+           (equal (tool-start-msg-name msg) "get_weather")
+           (= 0 (stats-get conn :malformed))
+           (= 0 (stats-get conn :decode-unknown))))))
+
+(test "T05: a TOOL-RESULT form decodes to a tool-result-msg with all four fields"
+  (let ((conn (test-connection)))
+    (let ((msg (decode-wire conn '(tool-result :agent "Alpha" :call-id "c1"
+                                    :value (:temperature 18) :text "18C"))))
+      (and (tool-result-msg-p msg)
+           (equal (tool-result-msg-agent msg) "Alpha")
+           (equal (tool-result-msg-call-id msg) "c1")
+           (equal (tool-result-msg-value msg) '(:temperature 18))
+           (equal (tool-result-msg-text msg) "18C")
+           (= 0 (stats-get conn :malformed))
+           (= 0 (stats-get conn :decode-unknown))))))
+
+(test "T05: a BUDGET-EXCEEDED form decodes to a budget-exceeded-msg with all three fields"
+  (let ((conn (test-connection)))
+    (let ((msg (decode-wire conn '(budget-exceeded :agent "Alpha" :tokens-used 4096 :limit 4000))))
+      (and (budget-exceeded-msg-p msg)
+           (equal (budget-exceeded-msg-agent msg) "Alpha")
+           (= 4096 (budget-exceeded-msg-tokens-used msg))
+           (= 4000 (budget-exceeded-msg-limit msg))
+           (= 0 (stats-get conn :malformed))
+           (= 0 (stats-get conn :decode-unknown))))))
+
+(test "T05: a delta with :kind :tool decodes with kind :tool"
+  (let ((conn (test-connection)))
+    (let ((msg (decode-wire conn '(delta :agent "A" :content "partial" :kind :tool))))
+      (and (delta-msg-p msg)
+           (eq :tool (delta-msg-kind msg))
+           (equal "partial" (delta-msg-content msg))))))
+
+(test "T05: a kind-less delta decodes as :model (an older server is still model prose)"
+  (let ((conn (test-connection)))
+    (let ((msg (decode-wire conn '(delta :agent "A" :content "hi"))))
+      (and (delta-msg-p msg)
+           (eq :model (delta-msg-kind msg))))))
+
+(test "T05: the new operators dispatch by SYMBOL-NAME, not EQ (foreign package, lowercase)"
+  (let ((conn (test-connection)))
+    (let ((f (decode-wire conn (list (intern "finalize" :cl-user) :agent "A" :event-index 1)))
+          (ts (decode-wire conn (list (intern "tool-start" :cl-user)
+                                      :agent "A" :call-id "c" :name "n")))
+          (tr (decode-wire conn (list (intern "tool-result" :cl-user)
+                                      :agent "A" :call-id "c" :value 1 :text "t")))
+          (b (decode-wire conn (list (intern "budget-exceeded" :cl-user)
+                                     :agent "A" :tokens-used 1 :limit 0))))
+      (and (finalize-msg-p f)
+           (tool-start-msg-p ts)
+           (tool-result-msg-p tr)
+           (budget-exceeded-msg-p b)
+           (= 0 (stats-get conn :malformed))))))
+
+(test "T05: a server-shaped finalize frame round-trips through read-wire and decode-wire"
+  (let ((conn (test-connection
+               :stream (make-string-input-stream
+                        (wire-line "finalize :agent \"A\" :event-index 3")))))
+    (let ((msg (decode-wire conn (read-wire conn))))
+      (and (finalize-msg-p msg)
+           (equal (finalize-msg-agent msg) "A")
+           (= 3 (finalize-msg-event-index msg))))))
+
+(test "T05: a server-shaped tool-result frame round-trips through read-wire and decode-wire"
+  (let ((conn (test-connection
+               :stream (make-string-input-stream
+                        (wire-line "tool-result :agent \"A\" :call-id \"c1\" :value :ok :text \"done\"")))))
+    (let ((msg (decode-wire conn (read-wire conn))))
+      (and (tool-result-msg-p msg)
+           (equal (tool-result-msg-call-id msg) "c1")
+           (eq :ok (tool-result-msg-value msg))
+           (equal "done" (tool-result-msg-text msg))))))
+
+(test "T05: a malformed finalize (odd tail) is a counted :malformed wire-ignored-msg, not a signal"
+  (let ((conn (test-connection)))
+    (let ((msg (decode-wire conn '(finalize :agent "A" :event-index))))
+      (and (wire-ignored-msg-p msg)
+           (null (wire-ignored-msg-op msg))
+           (= 1 (stats-get conn :malformed))
+           (= 0 (stats-get conn :decode-unknown))))))
+
+(test "T05: an improper tool-result tail stays malformed and does not signal"
+  (let ((conn (test-connection)))
+    (let ((msg (decode-wire conn '(tool-result :agent . 5))))
+      (and (wire-ignored-msg-p msg)
+           (= 1 (stats-get conn :malformed))
+           (= 0 (stats-get conn :decode-unknown))))))
+
+(test "T05: an empty budget-exceeded payload stays malformed"
+  (let ((conn (test-connection)))
+    (let ((msg (decode-wire conn '(budget-exceeded))))
+      (and (wire-ignored-msg-p msg)
+           (= 1 (stats-get conn :malformed))))))
+
+(test "T05: an unknown operator is still counted :decode-unknown, not malformed"
+  (let ((conn (test-connection)))
+    (let ((msg (decode-wire conn '(future-unknown :agent "A" :x 1))))
+      (and (wire-ignored-msg-p msg)
+           (equal (wire-ignored-msg-op msg) "FUTURE-UNKNOWN")
+           (= 1 (stats-get conn :decode-unknown))
+           (= 0 (stats-get conn :malformed))))))
+
+(test "T05: make- constructors round-trip the new slots and default to NIL"
+  (let ((f (make-finalize-msg :agent "A" :event-index 2))
+        (ts (make-tool-start-msg :agent "A" :call-id "c" :name "n"))
+        (tr (make-tool-result-msg :agent "A" :call-id "c" :value :v :text "t"))
+        (b (make-budget-exceeded-msg :agent "A" :tokens-used 5 :limit 4))
+        (f0 (make-finalize-msg)) (ts0 (make-tool-start-msg))
+        (tr0 (make-tool-result-msg)) (b0 (make-budget-exceeded-msg)))
+    (and (equal "A" (finalize-msg-agent f)) (= 2 (finalize-msg-event-index f))
+         (equal "c" (tool-start-msg-call-id ts)) (equal "n" (tool-start-msg-name ts))
+         (eq :v (tool-result-msg-value tr)) (equal "t" (tool-result-msg-text tr))
+         (= 5 (budget-exceeded-msg-tokens-used b)) (= 4 (budget-exceeded-msg-limit b))
+         (null (finalize-msg-agent f0)) (null (finalize-msg-event-index f0))
+         (null (tool-start-msg-agent ts0)) (null (tool-start-msg-call-id ts0))
+         (null (tool-start-msg-name ts0))
+         (null (tool-result-msg-value tr0)) (null (tool-result-msg-text tr0))
+         (null (budget-exceeded-msg-tokens-used b0)) (null (budget-exceeded-msg-limit b0))
+         ;; make-delta-msg still defaults to :model, and accepts an explicit kind
+         (eq :model (delta-msg-kind (make-delta-msg :agent "A" :content "x")))
+         (eq :tool (delta-msg-kind (make-delta-msg :agent "A" :content "x" :kind :tool))))))
+
+(test "T05: the client package exports the new classes, constructors, predicates and readers"
+  (every (lambda (name)
+           (multiple-value-bind (sym status) (find-symbol name :sexpr-tui)
+             (and sym (eq status :external))))
+         '("DELTA-MSG-KIND"
+           "FINALIZE-MSG" "MAKE-FINALIZE-MSG" "FINALIZE-MSG-P"
+           "FINALIZE-MSG-AGENT" "FINALIZE-MSG-EVENT-INDEX"
+           "TOOL-START-MSG" "MAKE-TOOL-START-MSG" "TOOL-START-MSG-P"
+           "TOOL-START-MSG-AGENT" "TOOL-START-MSG-CALL-ID" "TOOL-START-MSG-NAME"
+           "TOOL-RESULT-MSG" "MAKE-TOOL-RESULT-MSG" "TOOL-RESULT-MSG-P"
+           "TOOL-RESULT-MSG-AGENT" "TOOL-RESULT-MSG-CALL-ID"
+           "TOOL-RESULT-MSG-VALUE" "TOOL-RESULT-MSG-TEXT"
+           "BUDGET-EXCEEDED-MSG" "MAKE-BUDGET-EXCEEDED-MSG" "BUDGET-EXCEEDED-MSG-P"
+           "BUDGET-EXCEEDED-MSG-AGENT" "BUDGET-EXCEEDED-MSG-TOKENS-USED"
+           "BUDGET-EXCEEDED-MSG-LIMIT")))
 
 ;;;; --- 4. *read-eval* discipline -----------------------------------------
 

@@ -53,6 +53,7 @@
    #:make-delta-msg
    #:delta-msg-agent
    #:delta-msg-content
+   #:delta-msg-kind
    #:resync-msg
    #:make-resync-msg
    #:resync-msg-agent
@@ -87,6 +88,30 @@
    #:approval-needed-msg-target
    #:approval-needed-msg-description
    #:approval-needed-msg-restarts
+   #:finalize-msg
+   #:make-finalize-msg
+   #:finalize-msg-p
+   #:finalize-msg-agent
+   #:finalize-msg-event-index
+   #:tool-start-msg
+   #:make-tool-start-msg
+   #:tool-start-msg-p
+   #:tool-start-msg-agent
+   #:tool-start-msg-call-id
+   #:tool-start-msg-name
+   #:tool-result-msg
+   #:make-tool-result-msg
+   #:tool-result-msg-p
+   #:tool-result-msg-agent
+   #:tool-result-msg-call-id
+   #:tool-result-msg-value
+   #:tool-result-msg-text
+   #:budget-exceeded-msg
+   #:make-budget-exceeded-msg
+   #:budget-exceeded-msg-p
+   #:budget-exceeded-msg-agent
+   #:budget-exceeded-msg-tokens-used
+   #:budget-exceeded-msg-limit
 
    ;; --- swank RPC client (swank-rpc.lisp, T02) ---
    #:swank-connection
