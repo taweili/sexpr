@@ -167,6 +167,21 @@
    #:render-status-bar
    #:compose-layout
    #:border
+   #:focus-color
+   #:layout-dimensions
+   #:block-width
+   #:pad-block
+   #:section-overhead
+   #:chrome-rows
+   #:chat-min-width
+   #:agent-min-width
+   #:agent-max-width
+   #:agent-width-share
+   #:chat-min-height
+   #:repl-min-height
+   #:agent-min-height
+   #:layout-min-width
+   #:layout-min-height
    #:chat-width
    #:agent-width
    #:agent-pane-height
@@ -225,6 +240,10 @@
    #:last-error-of
    #:build-panes
    #:refresh-agent-viewport
+   #:set-focus
+   #:focused-textarea
+   #:update-focused-textarea
+   #:set-pane-dimensions
    #:handle-key
    #:handle-enter
    #:send-chat-note

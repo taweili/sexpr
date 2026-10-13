@@ -373,14 +373,68 @@ it — writing status-text directly here would be overwritten before the next re
 
 ;;;; --- panes -----------------------------------------------------------
 
+(defun set-focus (model where)
+  "Give key input to the text area named WHERE (:chat or :repl) and take it away
+from the other one. Returns MODEL.
+cl-tuition has no global focus register: textarea-focused is a per-object slot
+that textarea-focus sets and textarea-blur clears, so both text areas can hold T
+at once and both draw a cursor. Nothing but this function touches either slot, so
+the invariant that exactly one text area is focused holds by construction rather
+than by convention. Any value other than :repl is treated as :chat."
+  (setf (model-focused model) (if (eq where :repl) :repl :chat))
+  (when (model-chat-textarea model)
+    (if (eq where :repl)
+        (tui.textarea:textarea-blur (model-chat-textarea model))
+        (tui.textarea:textarea-focus (model-chat-textarea model))))
+  (when (model-repl-textarea model)
+    (if (eq where :repl)
+        (tui.textarea:textarea-focus (model-repl-textarea model))
+        (tui.textarea:textarea-blur (model-repl-textarea model))))
+  model)
+(export 'set-focus)
+
+(defun focused-textarea (model)
+  "The text area that owns key input, as (VALUES textarea key). KEY is :chat or
+:repl. Returns NIL for the textarea when the slot has never been built, so a
+caller can degrade instead of signalling."
+  (if (eq (model-focused model) :repl)
+      (values (model-repl-textarea model) :repl)
+      (values (model-chat-textarea model) :chat)))
+(export 'focused-textarea)
+
+(defun update-focused-textarea (model msg)
+  "Feed MSG to whichever text area owns key input and store the result back in that
+same slot. Returns (VALUES model nil).
+Returning the updated component to the slot it came from is the whole point: the
+old form wrote both slots at once and, when the REPL was focused, left the chat
+slot pointing at the REPL text area, so the next Tab landed on the wrong input.
+Nothing here signals: a NIL focused textarea is a no-op that still returns the
+model, and textarea-update's command value is always NIL for a key message so it
+is discarded by binding only the first return value."
+  (if (eq (model-focused model) :repl)
+      (when (model-repl-textarea model)
+        (multiple-value-bind (next)
+            (tui.textarea:textarea-update (model-repl-textarea model) msg)
+          (setf (model-repl-textarea model) next)))
+      (when (model-chat-textarea model)
+        (multiple-value-bind (next)
+            (tui.textarea:textarea-update (model-chat-textarea model) msg)
+          (setf (model-chat-textarea model) next))))
+  (values model nil))
+(export 'update-focused-textarea)
+
 (defun build-panes (model)
-  "Build the five pane components. Idempotent: rebuilding is cheap and lets init be
-re-entered after a resize."
+  "Build the five pane components and size them for the current terminal. Idempotent:
+rebuilding is cheap and lets init be re-entered after a resize. Focus is reset to
+chat — the demo is a chat client, so the first key press should land in chat and
+not in the REPL."
   (setf (model-chat-viewport model) (make-chat-viewport)
         (model-chat-textarea model) (make-chat-textarea)
         (model-repl-viewport model) (make-repl-viewport)
         (model-repl-textarea model) (make-repl-textarea)
         (model-agent-viewport model) (make-agent-viewport))
+  (set-pane-dimensions model)
+  (set-focus model :chat)
   model)
 (export 'build-panes)
 
@@ -655,10 +709,13 @@ Nothing here signals: every failure is recorded and the last good state is kept.
 (export '%quit-cmd)
 
 (defun handle-key (model msg)
-  "Route one key message.
-Enter in the chat textarea sends `inject-note` with the picked agent's handle;
-Enter in the REPL textarea evals the form with `sexpr.repl:*agent*` bound.
-Ctrl+C and Escape quit; Tab cycles focus between chat and repl."
+  "Route one key message. Returns (VALUES model cmd).
+Ctrl+C and Escape quit. Tab moves key input between the chat and REPL text areas
+through set-focus, so exactly one of them owns the next key. Enter submits the
+focused input: chat sends `inject-note` with the picked agent's handle, REPL evals
+the form with `sexpr.repl:*agent*` bound. Everything else goes to the focused text
+area through update-focused-textarea.
+The cmd is NIL except for the two quit keys. Nothing here signals."
   (let ((key (tui:key-msg-key msg))
         (ctrl (tui:key-msg-ctrl msg)))
     (cond
@@ -669,11 +726,7 @@ Ctrl+C and Escape quit; Tab cycles focus between chat and repl."
        (setf (model-quitting model) t)
        (values model (%quit-cmd)))
       ((eq key :tab)
-       (setf (model-focused model) (if (eq (model-focused model) :chat) :repl :chat))
-       (let ((ta (if (eq (model-focused model) :chat)
-                     (model-chat-textarea model)
-                     (model-repl-textarea model))))
-         (when ta (tui.textarea:textarea-focus ta)))
+       (set-focus model (if (eq (model-focused model) :chat) :repl :chat))
        (values model nil))
       ((eq key :enter)
        (handle-enter model))
@@ -686,21 +739,8 @@ Ctrl+C and Escape quit; Tab cycles focus between chat and repl."
             (or (char-equal key #\g) (char-equal key #\d)))
        (resolve-pending-approval model (if (char-equal key #\g) :grant-once :deny))
        (values model nil))
-      (t
-       (let* ((ta (if (eq (model-focused model) :chat)
-                      (model-chat-textarea model)
-                      (model-repl-textarea model)))
-              (other (if (eq (model-focused model) :chat)
-                         (model-repl-textarea model)
-                         (model-chat-textarea model)))
-              (cmd nil))
-         (when ta
-           (multiple-value-setq (ta cmd)
-             (tui.textarea:textarea-update ta msg))
-           (setf (model-chat-textarea model) ta
-                 (model-repl-textarea model)
-                 (if (eq (model-focused model) :chat) ta other))))
-         (values model cmd)))))
+      (t (update-focused-textarea model msg)))))
+(export 'handle-key)
 
 (defun handle-enter (model)
   "Handle Enter in the focused textarea.
@@ -791,24 +831,35 @@ and the result is rendered into the REPL pane."
               (values model nil)))))))))
 (export 'send-repl-form)
 
-(defun resize-panes (model)
-  "Re-derive the pane dimensions from the new window size. The chat and REPL columns
-share one width, leaving *agent-width* plus padding for the right column."
-  (setf (model-term-width model) (max 20 (model-term-width model))
-        (model-term-height model) (max 8 (model-term-height model)))
-  (let ((w (min *chat-width*
-                (max 20 (- (model-term-width model) *agent-width* 8)))))
+(defun set-pane-dimensions (model)
+  "Size every pane from (layout-dimensions term-width term-height). Returns MODEL.
+This is the ONLY place pane sizes change after construction, and it sets widths
+AND heights: the agent pane is unbordered so it takes its width outright, while
+the chat and REPL viewports and their text areas share one width. A NIL pane is
+skipped rather than signalled, so calling this before build-panes is a no-op."
+  (multiple-value-bind (chat-w agent-w chat-h repl-h agent-h)
+      (layout-dimensions (model-term-width model)
+                         (model-term-height model))
     (when (model-chat-viewport model)
-      (setf (tui.viewport:viewport-width (model-chat-viewport model)) w))
+      (setf (tui.viewport:viewport-width (model-chat-viewport model)) chat-w
+            (tui.viewport:viewport-height (model-chat-viewport model)) chat-h))
     (when (model-chat-textarea model)
-      (setf (tui.textarea:textarea-width (model-chat-textarea model)) w))
+      (setf (tui.textarea:textarea-width (model-chat-textarea model)) chat-w))
     (when (model-repl-viewport model)
-      (setf (tui.viewport:viewport-width (model-repl-viewport model)) w))
+      (setf (tui.viewport:viewport-width (model-repl-viewport model)) chat-w
+            (tui.viewport:viewport-height (model-repl-viewport model)) repl-h))
     (when (model-repl-textarea model)
-      (setf (tui.textarea:textarea-width (model-repl-textarea model)) w))
+      (setf (tui.textarea:textarea-width (model-repl-textarea model)) chat-w))
     (when (model-agent-viewport model)
-      (setf (tui.viewport:viewport-width (model-agent-viewport model)) *agent-width*)))
+      (setf (tui.viewport:viewport-width (model-agent-viewport model)) agent-w
+            (tui.viewport:viewport-height (model-agent-viewport model)) agent-h)))
   model)
+(export 'set-pane-dimensions)
+
+(defun resize-panes (model)
+  "Re-derive the pane dimensions from the window size in MODEL. Delegates to
+set-pane-dimensions; kept as the name the window-size branch and the tests call."
+  (set-pane-dimensions model))
 (export 'resize-panes)
 
 (defmethod tui:update ((model tui-model) msg)
@@ -1033,5 +1084,12 @@ as its own line between the body and the status bar."
     (when (model-agent-viewport model)
       (tui.viewport:viewport-view (model-agent-viewport model)))
     (model-status-text model)
-    (render-approval-strip (model-pending-approval model)))))
+    (render-approval-strip (model-pending-approval model))
+    :chat-focused (eq (model-focused model) :chat)
+    :repl-focused (eq (model-focused model) :repl)
+    ;; The frame is sized from the terminal, not from the content: without these two
+    ;; compose-layout pads nothing and the pane would render at the width of its
+    ;; longest transcript line instead of the width of the screen.
+    :width (model-term-width model)
+    :height (model-term-height model))))
 (export 'tui:view)

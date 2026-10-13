@@ -1527,6 +1527,376 @@ can assert on the packet text the model wrote."
     (and (null (model-in-flight model))
          (not (search "partial" (tui:view model))))))
 
+;;;; --- 8f. responsive layout and input focus (quick task 11) ---------------
+;;;
+;;; Four real bugs, all found by reading the render path rather than the model:
+;;;
+;;; 1. THE FRAME NEVER REACHED THE SCREEN. The pane widths and heights were
+;;;    defparameters; resize-panes touched only widths, and only of the chat and REPL
+;;;    panes — the agent pane stayed 30 columns and every viewport stayed at its
+;;;    first-paint height. At 200x45 the frame still rendered 31x22. Worse, the
+;;;    panes were sized but never PADDED: cl-tuition's viewport-view prints each line
+;;;    bare, render-border measures its box from the widest content line, and
+;;;    textarea-view does the same, so a 54-column chat viewport rendered 12
+;;;    columns wide. layout-dimensions derives every size from the terminal; pad-block
+;;;    widens each rendered line to it.
+;;; 2. BOTH INPUTS WERE FOCUSED AT ONCE. cl-tuition has no global focus register —
+;;;    textarea-focused is a per-object slot — and the Tab handler focused the new
+;;;    textarea without blurring the old, so after one Tab both held T and both drew
+;;;    a cursor. A textarea holding no text renders its placeholder without a cursor,
+;;;    so the operator could not even see it.
+;;; 3. TYPING ANY PRINTABLE CHARACTER CRASHED THE TUI. handle-key's fallthrough
+;;;    branch ended with (values model cmd) after a close paren that had already
+;;;    closed the let* binding cmd, so every letter, space and digit signalled
+;;;    UNBOUND-VARIABLE. cl-tuition's event loop catches it with handle-error and
+;;;    continues, so the character was silently dropped: the TUI looked frozen.
+;;; 4. THE REPL TEXTAREA WAS WRITTEN TO THE WRONG SLOT. The same branch stored the
+;;;    updated component in both slots, so when the REPL was focused the chat slot
+;;;    ended up pointing at the REPL textarea; the next Tab landed on the wrong input.
+;;;
+;;; These tests assert the contract, not the helper: exact frame dimensions,
+;;; exactly-one-focused, and no-signal on input.
+
+(defun frame-dims (text)
+  "(VALUES width height) of the rendered frame TEXT, in columns and rows. Width is
+measured with visible-length so the ANSI escapes in the borders are not counted."
+  (let ((lines (tui:split-string-by-newline text)))
+    (values (if lines (apply #'max (mapcar #'tui:visible-length lines)) 0)
+            (length lines))))
+
+(defun focused-textareas (model)
+  "How many of the two text areas currently hold focus. Must always be 1 when both
+slots are built; 0 when one is NIL, because a NIL slot is not a focused text area
+and the accessor must not be called on it."
+  (+ (if (and (model-chat-textarea model)
+              (tui.textarea:textarea-focused (model-chat-textarea model))) 1 0)
+     (if (and (model-repl-textarea model)
+              (tui.textarea:textarea-focused (model-repl-textarea model))) 1 0)))
+
+(defun sized-model (width height)
+  "An initialised model whose panes have been laid out for WIDTH x HEIGHT."
+  (let ((model (init-two-agent-model)))
+    (setf (model-term-width model) width
+          (model-term-height model) height)
+    (resize-panes model)
+    model))
+
+(defun count-occurrence (needle haystack)
+  "How many times NEEDLE occurs in HAYSTACK (non-overlapping)."
+  (let ((count 0) (start 0))
+    (loop for pos = (search needle haystack :start2 start)
+          while pos
+          do (incf count) (setf start (+ pos (length needle))))
+    count))
+
+(test "layout-dimensions fits a terminal exactly across a size matrix"
+  ;; loop ... finally returns the conjunction: dolist always returns NIL, which would
+  ;; make a per-size assertion vacuously pass.
+  (loop for size in '((80 24) (120 32) (200 45) (100 30) (60 16) (150 38) (72 20))
+        always
+        (multiple-value-bind (chat-w agent-w chat-h repl-h agent-h)
+            (layout-dimensions (first size) (second size))
+          (and (plusp chat-w)
+               (plusp agent-w)
+               (plusp chat-h)
+               (plusp repl-h)
+               (plusp agent-h)
+               ;; frame width: the chat section's border plus the unbordered agent pane
+               (= (+ chat-w 2 agent-w) (first size))
+               ;; frame height: both sections plus the two chrome rows
+               (= (+ chat-h repl-h (* 2 *section-overhead*) *chrome-rows*) (second size))
+               ;; the two left-column sections are exactly as tall as the agent pane spans
+               (= (+ chat-h repl-h (* 2 *section-overhead*)) agent-h)))))
+
+(test "layout-dimensions degrades total on a degenerate window instead of signalling"
+  ;; A 0x0 or 1x1 resize event is a thing that happens (a terminal closed mid-reflow).
+  ;; The layout must answer with a usable smallest layout, never a zero-sized pane
+  ;; (a zero-height viewport renders NOTHING, research F2) and never a signal.
+  (loop for size in '((0 0) (1 1) (-40 -9) (0 24) (80 0))
+        always
+        (multiple-value-bind (chat-w agent-w chat-h repl-h agent-h)
+            (layout-dimensions (first size) (second size))
+          (and (integerp chat-w) (integerp agent-w) (integerp chat-h)
+               (integerp repl-h) (integerp agent-h)
+               (plusp chat-w) (plusp agent-w) (plusp chat-h)
+               (plusp repl-h) (plusp agent-h))))
+
+(test "layout-dimensions clamps the agent pane to its min and max and hands the rest to chat"
+  ;; 80 columns: the share lands mid-range and both columns are above their minimums
+  (multiple-value-bind (chat-w agent-w chat-h repl-h agent-h)
+      (layout-dimensions 80 24)
+    (declare (ignore chat-h repl-h agent-h))
+    (and (eql agent-w 24)
+         (eql chat-w 54)
+         (eql (+ chat-w 2 agent-w) 80)))
+  ;; a wide monitor: the agent pane stops growing at the cap, chat takes the rest
+  (multiple-value-bind (chat-w agent-w chat-h repl-h agent-h)
+      (layout-dimensions 200 45)
+    (declare (ignore chat-h repl-h agent-h))
+    (and (eql agent-w *agent-max-width*)
+         (> chat-w 100)
+         (eql (+ chat-w 2 agent-w) 200)))
+  ;; a narrow terminal: both columns hold their minimums
+  (multiple-value-bind (chat-w agent-w chat-h repl-h agent-h)
+      (layout-dimensions 42 14)
+    (declare (ignore chat-h repl-h agent-h))
+    (and (eql chat-w *chat-min-width*)
+         (eql agent-w *agent-min-width*)
+         (eql (+ chat-w 2 agent-w) 42))))
+
+(test "layout-dimensions gives the chat viewport the rows the REPL leaves over"
+  ;; the REPL gets about a quarter of the viewport rows and the chat gets the rest, so
+  ;; on a tall terminal the transcript pane grows far more than the console pane does.
+  ;; multiple-value-list order is chat-width agent-width chat-height repl-height
+  ;; agent-height, so index 2 is the chat viewport and index 3 the REPL viewport.
+  (let* ((tall (multiple-value-list (layout-dimensions 100 60)))
+         (short (multiple-value-list (layout-dimensions 100 24))))
+    (and (< (nth 3 tall) (nth 2 tall))
+         (< (nth 3 short) (nth 2 short))
+         (> (nth 2 tall) (nth 2 short))
+         (> (nth 4 tall) (nth 4 short))
+         (>= (nth 0 tall) (nth 0 short)))))
+
+(test "the pane constructor defaults are layout-dimensions of an 80x24 terminal"
+  ;; The first frame is drawn before the first window-size-msg is drained, so the
+  ;; constructor defaults and the first reflow must agree or the UI jumps on start.
+  (multiple-value-bind (chat-w agent-w chat-h repl-h agent-h)
+      (layout-dimensions 80 24)
+    (and (eql *chat-width* chat-w)
+         (eql *agent-width* agent-w)
+         (eql *chat-viewport-height* chat-h)
+         (eql *repl-viewport-height* repl-h)
+         (eql *agent-pane-height* agent-h)
+         ;; and the constructors actually use them
+         (eql chat-w (tui.viewport:viewport-width (make-chat-viewport)))
+         (eql chat-h (tui.viewport:viewport-height (make-chat-viewport)))
+         (eql repl-h (tui.viewport:viewport-height (make-repl-viewport)))
+         (eql agent-w (tui.viewport:viewport-width (make-agent-viewport)))
+         (eql agent-h (tui.viewport:viewport-height (make-agent-viewport))))))
+
+(test "the composed frame is exactly the terminal size at every size in the matrix"
+  ;; loop ... always, not dolist: dolist returns NIL and would pass vacuously.
+  (loop for size in '((80 24) (120 32) (200 45) (100 30) (60 16) (150 38))
+        always
+        (let ((model (sized-model (first size) (second size))))
+          (multiple-value-bind (w h) (frame-dims (tui:view model))
+            (and (eql w (first size))
+                 (eql h (second size))))))))
+
+(test "a wider terminal makes the panes wider and a taller one makes them taller"
+  ;; the point of the whole change: the UI uses the screen it is given
+  (let* ((small (sized-model 80 24))
+         (big (sized-model 200 45)))
+    (and (> (tui.viewport:viewport-width (model-chat-viewport big))
+            (tui.viewport:viewport-width (model-chat-viewport small)))
+         (> (tui.viewport:viewport-height (model-chat-viewport big))
+            (tui.viewport:viewport-height (model-chat-viewport small)))
+         (> (tui.viewport:viewport-height (model-repl-viewport big))
+            (tui.viewport:viewport-height (model-repl-viewport small)))
+         (> (tui.viewport:viewport-width (model-agent-viewport big))
+            (tui.viewport:viewport-width (model-agent-viewport small)))
+         (> (tui.viewport:viewport-height (model-agent-viewport big))
+            (tui.viewport:viewport-height (model-agent-viewport small))))))
+
+(test "a window-size-msg resizes, and a later resize shrinks back"
+  ;; growing is the headline; shrinking is the half that is just as easy to get
+  ;; wrong, because a viewport that keeps its old (larger) height silently clips.
+  (let ((model (sized-model 200 45)))
+    (setf model (car (multiple-value-list
+                    (tui:update model (make-window-size-msg :width 60 :height 16)))))
+    (and (eql 60 (model-term-width model))
+         (eql 16 (model-term-height model))
+         (let ((vp (model-chat-viewport model)))
+           (and (eql 38 (tui.viewport:viewport-width vp))
+                (eql 5 (tui.viewport:viewport-height vp))))
+         (let ((vp (model-repl-viewport model)))
+           (and (eql 38 (tui.viewport:viewport-width vp))
+                (eql 1 (tui.viewport:viewport-height vp))))
+         (let ((vp (model-agent-viewport model)))
+           (and (eql 20 (tui.viewport:viewport-width vp))
+                (eql 14 (tui.viewport:viewport-height vp))))
+         (eql 38 (tui.textarea:textarea-width (model-chat-textarea model)))
+         (eql 38 (tui.textarea:textarea-width (model-repl-textarea model)))
+         (multiple-value-bind (w h) (frame-dims (tui:view model))
+           (and (eql w 60) (eql h 16))))))
+
+(test "the approval strip keeps its row whether or not an approval is pending"
+  ;; *chrome-rows* reserves the strip unconditionally, so an approval arriving or
+  ;; clearing does not move the status bar or change the frame height.
+  (let* ((model (sized-model 80 24))
+         (before (multiple-value-list (frame-dims (tui:view model)))))
+    (tui:update model (make-approval-needed-msg :agent "Alpha" :capability "net"
+                                                :target "http://x" :description "d"))
+    (let ((after (multiple-value-list (frame-dims (tui:view model)))))
+      (and (eql (first before) (first after))
+           (eql (second before) (second after))
+           (search "grant-once" (tui:view model))))))
+
+(test "pad-block widens every line to the width and leaves the escapes alone"
+  (let* ((ansi (concatenate 'string (string #\ESC) "[36m" "hi" (string #\ESC) "[0m"))
+         (padded (pad-block ansi 8)))
+    (and (eql 8 (tui:visible-length padded))
+         ;; the escape sequences survive padding, so the ANSI that was already in
+         ;; the line is neither counted nor disturbed
+         (search (string #\ESC) padded)
+         ;; padding appends, never truncates
+         (let ((long (pad-block "x" 3)))
+           (and (eql 3 (tui:visible-length long))
+                (search "x" long))))))
+
+(test "render-section with :width draws a border box exactly that wide"
+  (let ((narrow (render-section "chat" "" :width 20))
+        (wide (render-section "chat" "" :width 60)))
+    (multiple-value-bind (nw nh) (frame-dims narrow)
+      (multiple-value-bind (ww wh) (frame-dims wide)
+        (and (eql nw 20) (eql nh 4)      ;; title + 2 border rows, empty body
+             (eql ww 60) (eql wh 4)
+             ;; and the body's own padding puts text at the right column
+             (let ((body-line (nth 2 (tui:split-string-by-newline wide))))
+               (eql 60 (tui:visible-length body-line))))))))
+
+(test "set-focus leaves exactly one textarea focused and never signals on a NIL slot"
+  (let ((model (init-two-agent-model)))
+    (setf (model-chat-viewport model) (make-chat-viewport)
+          (model-chat-textarea model) (make-chat-textarea)
+          (model-repl-viewport model) (make-repl-viewport)
+          (model-repl-textarea model) (make-repl-textarea))
+    (and (eql 1 (focused-textareas model))
+         (tui.textarea:textarea-focused (model-chat-textarea model))
+         ;; a NIL slot must degrade, not signal. The setf is wrapped in progn
+         ;; because setf returns the value it stored — NIL here — which would
+         ;; otherwise short-circuit the and.
+         (progn (setf (model-repl-textarea model) nil) t)
+         (set-focus model :repl)
+         (eql 0 (focused-textareas model))
+         (set-focus model :chat)
+         (eql 1 (focused-textareas model)))))
+
+(test "exactly one input owns the keys at every step: init, and every Tab"
+  (let ((model (init-two-agent-model)))
+    (build-panes model)
+    (and (eql 1 (focused-textareas model))
+         (tui.textarea:textarea-focused (model-chat-textarea model))
+         (null (tui.textarea:textarea-focused (model-repl-textarea model)))
+         ;; Tab hands the input to the REPL and TAKES it away from the chat
+         (setf model (car (multiple-value-list (tui:update model (make-key-msg :key :tab)))))
+         (and (eql 1 (focused-textareas model))
+              (null (tui.textarea:textarea-focused (model-chat-textarea model)))
+              (tui.textarea:textarea-focused (model-repl-textarea model))
+              (eq :repl (model-focused model)))
+         ;; and back, repeatedly, so the invariant holds under repetition: two Tabs
+         ;; from any state return to the same owner, so after six more the REPL still
+         ;; holds it. The dotimes result is discarded on purpose (it returns NIL,
+         ;; which would short-circuit the and), so the loop is wrapped in progn.
+         (progn (dotimes (i 6)
+                  (setf model (car (multiple-value-list
+                                  (tui:update model (make-key-msg :key :tab))))))
+                t)
+         (and (eql 1 (focused-textareas model))
+              (tui.textarea:textarea-focused (model-repl-textarea model))
+              (eq :repl (model-focused model)))
+         ;; and an odd number of further Tabs hands it back to the chat
+         (setf model (car (multiple-value-list
+                         (tui:update model (make-key-msg :key :tab)))))
+         (and (eql 1 (focused-textareas model))
+              (tui.textarea:textarea-focused (model-chat-textarea model))
+              (eq :chat (model-focused model))))))
+
+(test "a printable key no longer signals — the TUI could not be typed into at all"
+  ;; handle-key's fallthrough branch returned (values model cmd) AFTER a paren that
+  ;; had already closed the let* binding cmd, so every letter, space and digit
+  ;; signalled UNBOUND-VARIABLE. cl-tuition's event loop catches the condition and
+  ;; continues, so the keystroke was silently dropped and the TUI looked frozen.
+  ;;
+  ;; handler-case returns the model on success and the formatted error string on
+  ;; failure, so the two cases are told apart by the type of what came back.
+  (let ((model (init-two-agent-model)))
+    (build-panes model)
+    (dolist (k '(#\h #\space #\! #\9 #\z) t)
+      (let ((reply (handler-case
+                       (multiple-value-list (handle-key model (make-key-msg :key k)))
+                     (error (e) (format nil "SIGNALLED: ~A" e)))))
+        (and (consp reply)
+             (typep (car reply) 'tui-model)
+             (null (cadr reply)))))))
+
+
+(test "a key typed with the REPL focused lands in the REPL textarea only"
+  ;; the old branch wrote the updated component into BOTH slots, so with the REPL
+  ;; focused the chat slot ended up pointing at the REPL textarea and the next Tab
+  ;; landed on the wrong input.
+  (let ((model (init-two-agent-model)))
+    (build-panes model)
+    (setf model (car (multiple-value-list (tui:update model (make-key-msg :key :tab)))))
+    (dolist (k '(#\a #\b #\c))
+      (setf model (car (multiple-value-list (handle-key model (make-key-msg :key k))))))
+    (and (string= "" (tui.textarea:textarea-value (model-chat-textarea model)))
+         (string= "abc" (tui.textarea:textarea-value (model-repl-textarea model)))
+         ;; and the two slots are distinct objects, not one shared textarea
+         (not (eq (model-chat-textarea model) (model-repl-textarea model))))))
+
+(test "cursor movement and deletion keys stay inside the focused input"
+  (let ((model (init-two-agent-model)))
+    (build-panes model)
+    (dolist (k (list :up :down :left :right :home :end :backspace :delete))
+      (let ((reply (handler-case
+                       (multiple-value-list (handle-key model (make-key-msg :key k)))
+                     (error (e) (format nil "SIGNALLED: ~A" e)))))
+        (and (consp reply)
+             (typep (car reply) 'tui-model))))
+    ;; typing then moving then deleting leaves the value where it should be
+    (dolist (k '(#\x #\y))
+      (setf model (car (multiple-value-list (handle-key model (make-key-msg :key k))))))
+    (setf model (car (multiple-value-list (handle-key model (make-key-msg :key :backspace)))))
+    (and (string= "x" (tui.textarea:textarea-value (model-chat-textarea model)))
+         (string= "" (tui.textarea:textarea-value (model-repl-textarea model))))))
+
+(test "the focused input's border is drawn in the focus color, and only that one"
+  ;; a textarea holding no text renders its placeholder without a cursor, so the
+  ;; coloured border is the only cue about which input takes the next key.
+  ;;
+  ;; The colour reaches the frame as an ANSI SGR sequence, which cl-tuition's colored
+  ;; emits as ESC [ <code> m — so the needle is built that way rather than by
+  ;; concatenating the raw code string. The assertion is on WHICH section is coloured,
+  ;; not on how many times the sequence appears: render-border colours each border
+  ;; character separately, so a coloured border emits the sequence many times.
+  (flet ((section-border-coloured-p (view title)
+           "True when the top border line under TITLE in VIEW carries the focus colour."
+           (let* ((lines (tui:split-string-by-newline view))
+                  (pos (position title lines :test #'search)))
+             (and pos
+                  (< (1+ pos) (length lines))
+                  (search (concatenate 'string (string #\ESC) "["
+                                        (format nil "~A" *focus-color*) "m")
+                          (nth (1+ pos) lines))))))
+    (let* ((chat-view (tui:view (init-two-agent-model)))
+           (repl-model (init-two-agent-model))
+           (repl-view (progn
+                        (setf repl-model
+                              (car (multiple-value-list
+                                    (tui:update repl-model (make-key-msg :key :tab)))))
+                        (tui:view repl-model))))
+      ;; chat focused: the chat border is cyan, the repl border is not
+      (and (section-border-coloured-p chat-view "chat")
+           (not (section-border-coloured-p chat-view "repl"))
+           ;; repl focused: the repl border is cyan, the chat border is not
+           (section-border-coloured-p repl-view "repl")
+           (not (section-border-coloured-p repl-view "chat"))))))
+
+(test "build-panes sizes the new panes and resets focus to chat"
+  (let ((model (init-two-agent-model)))
+    (build-panes model)
+    (multiple-value-bind (chat-w agent-w chat-h repl-h agent-h)
+        (layout-dimensions (model-term-width model) (model-term-height model))
+      (and (eql chat-w (tui.viewport:viewport-width (model-chat-viewport model)))
+           (eql chat-h (tui.viewport:viewport-height (model-chat-viewport model)))
+           (eql repl-h (tui.viewport:viewport-height (model-repl-viewport model)))
+           (eql agent-w (tui.viewport:viewport-width (model-agent-viewport model)))
+           (eql agent-h (tui.viewport:viewport-height (model-agent-viewport model)))
+           (eql 1 (focused-textareas model))
+           (tui.textarea:textarea-focused (model-chat-textarea model))))))
+
+
 ;;;; --- summary -------------------------------------------------------------
 
 (format t "~%~D tests, ~D passed, ~D failed~%" *tests-run* *tests-passed* *tests-failed*)

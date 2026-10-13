@@ -489,6 +489,34 @@ can never point the image at a stale checkout, and the image log lands at
 itself. `make sexpr-tui` is the same wrapper; `make verify-wrapper` runs
 the launcher checks without starting a single process.
 
+### Layout
+
+The frame is laid out from the terminal size, not from fixed pane dimensions.
+`layout-dimensions` (in `src/tui-client/view.lisp`) derives every pane's
+width and height from the window, so the frame comes out exactly as wide
+and as tall as the screen at any size — a 200x45 terminal is used
+completely, and a 60x16 one fits without overflow.
+
+| size | chat viewport | REPL viewport | agent pane |
+| --- | --- | --- | --- |
+| 80x24 | 54 x 11 | 54 x 3 | 24 x 22 |
+| 120x32 | 82 x 17 | 82 x 5 | 36 x 30 |
+| 200x45 | 150 x 27 | 150 x 8 | 48 x 43 |
+| 60x16 | 38 x 5 | 38 x 1 | 20 x 14 |
+
+A resize event reflows every pane, growing or shrinking. The layout is
+total: a 0x0 or negative window degrades to the smallest usable panes
+rather than signalling.
+
+### Input focus
+
+`Tab` moves key input between the chat and REPL inputs, and exactly one
+of them owns the keys at a time — the other is explicitly blurred. A
+textarea holding no text renders its placeholder without a cursor, so the
+focused input's border is drawn in cyan (`*focus-color*`) as the visible
+cue. `Enter` submits the focused input; `Ctrl+C` and `Escape` quit;
+while an approval is pending, `Ctrl+G` grants once and `Ctrl+D` denies.
+
 ## Building the binary
 
 `make build` produces a self-contained `./sexpr` executable via

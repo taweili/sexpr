@@ -65,38 +65,187 @@ break the layout."
 *border-rounded*). One variable so the whole UI can be reskinned in one place.")
 (export '*border*)
 
-(defparameter *chat-width* 56
-  "The chat column width. The agent pane sits beside it, so this plus *agent-width*
-must stay under a common terminal width.")
+(defparameter *focus-color* tui:*fg-cyan*
+  "The border color of the section that owns key input.
+A cl-tuition textarea draws its cursor only when it holds text: with the input
+empty the placeholder branch of textarea-view returns before the cursor is
+rendered, so an empty focused input looks identical to an empty unfocused one.
+The colored border is therefore the operator's only cue about which of the two
+inputs will take the next key.")
+(export '*focus-color*)
+
+;;;; --- responsive layout -------------------------------------------------
+;;;
+;;; Every pane size is DERIVED from the terminal size by LAYOUT-DIMENSIONS. The
+;;; pane constructors below keep fixed first-paint defaults only so the panes are
+;;; usable when built standalone in a headless test; tui:init and resize-panes
+;;; overwrite them from layout-dimensions. *chat-width*, *agent-width* and the
+;;; three *-height parameters are the 80x24 answers to the same question, so the
+;;; first frame and the first reflow agree and the UI does not jump on start.
+
+(defparameter *section-overhead* 4
+  "Rows one bordered section costs beyond its viewport rows: the title line, the
+border row above and below the content, and the one-line textarea with no border of
+its own. render-section emits title, top border, content, textarea, bottom border,
+so a section is viewport-rows + 4 rows tall. Getting this number right is what makes
+the left column exactly as tall as the agent pane; at 2 the left column came out
+four rows short and the frame showed two blank rows above the status bar.")
+(export '*section-overhead*)
+
+(defparameter *chrome-rows* 2
+  "Rows the bottom chrome costs: the approval strip and the status bar, one row
+each. The approval row is reserved whether or not an approval is pending, so the
+frame height never changes when an approval arrives.")
+(export '*chrome-rows*)
+
+(defparameter *chat-min-width* 20
+  "The narrowest chat column layout-dimensions will produce.")
+(export '*chat-min-width*)
+
+(defparameter *agent-min-width* 20
+  "The narrowest agent pane. The rows render as \"* ● Name STATUS\", about 20
+columns for a short name.")
+(export '*agent-min-width*)
+
+(defparameter *agent-max-width* 48
+  "The widest agent pane. Without a cap a 250-column monitor would hand the agent
+list 75 columns and leave the rows staring at an empty second half.")
+(export '*agent-max-width*)
+
+(defparameter *agent-width-share* 0.30
+  "The fraction of the terminal width the agent pane takes, before the min and
+max clamps. Everything left over goes to the chat column.")
+(export '*agent-width-share*)
+
+(defparameter *chat-min-height* 3
+  "The shortest chat viewport; below this a transcript cannot be read at all.")
+(export '*chat-min-height*)
+
+(defparameter *repl-min-height* 1
+  "The shortest REPL viewport.")
+(export '*repl-min-height*)
+
+(defparameter *agent-min-height* 3
+  "The shortest agent pane.")
+(export '*agent-min-height*)
+
+(defparameter *layout-min-width* 42
+  "Below this many columns the layout cannot hold both columns at their minimums.")
+(export '*layout-min-width*)
+
+(defparameter *layout-min-height* 14
+  "The smallest height at which the frame fits exactly: *chat-min-height* +
+*repl-min-height* + 2 * *section-overhead* + *chrome-rows*. Below it the section
+minimums push the left column past the bottom of the terminal, which is unavoidable
+— the panes have to show something.")
+(export '*layout-min-height*)
+
+(defun layout-dimensions (width height)
+  "Every pane size for a terminal of WIDTH columns and HEIGHT rows.
+Returns (VALUES chat-width agent-width chat-height repl-height agent-height) as
+plain non-negative integers.
+
+The frame is join-horizontal(chat section, agent pane) sitting over the chrome
+rows, so it is chat-width + 2 (its border) + agent-width wide, and left-column +
+chrome-rows tall, where the left column is chat-height + repl-height +
+2 * section-overhead. Solving both equations instead of hardcoding either gives an
+exact fit: a terminal of at least *layout-min-width* x *layout-min-height* is used
+completely, no more and no less, with no blank rows anywhere in the frame.
+
+The agent pane takes *agent-width-share* of the width, clamped to
+[*agent-min-width*, *agent-max-width*]; the REPL viewport takes a quarter of the
+rows left for the viewports, clamped to [*repl-min-height*, one third of them];
+the chat viewport takes the remainder.
+
+PURE and total: a zero, negative or non-integer window degrades to the smallest
+usable layout rather than signalling, so a 1x1 resize event cannot take the UI
+down or produce a zero-sized pane. Nothing here returns zero either: a
+zero-height viewport renders NOTHING at all (research F2)."
+  (let ((width (max *layout-min-width* (if (integerp width) width 0)))
+        (height (max *layout-min-height* (if (integerp height) height 0))))
+    (let* ((agent-width (min *agent-max-width*
+                             (max *agent-min-width*
+                                  (floor (* width *agent-width-share*)))))
+           ;; join-horizontal adds no gap, so the left column is exactly what the
+           ;; agent pane leaves behind.
+           (chat-width (max *chat-min-width* (- width 2 agent-width)))
+           ;; the viewports share what the chrome and the two section boxes leave.
+           (rows (max 0 (- height *chrome-rows* (* 2 *section-overhead*))))
+           (repl-height (max *repl-min-height*
+                            (min (floor rows 4)
+                                 (max *repl-min-height* (ceiling rows 3)))))
+           (chat-height (max *chat-min-height* (- rows repl-height)))
+           ;; the agent pane is unbordered, so it spans the whole body.
+           (agent-height (max *agent-min-height* (+ rows (* 2 *section-overhead*)))))
+      (values chat-width agent-width chat-height repl-height agent-height))))
+(export 'layout-dimensions)
+
+(defun block-width (text)
+  "The widest visible line of the rendered block TEXT, in columns.
+cl-tuition has the same helper but does not export it, so it is named here; the
+status bar is clipped to the width it sits under rather than a fixed 240."
+  (let ((lines (tui:split-string-by-newline text)))
+    (if lines (apply #'max (mapcar #'tui:visible-length lines)) 0)))
+(export 'block-width)
+
+(defun pad-block (text width)
+  "Every line of the rendered block TEXT padded with spaces to exactly WIDTH
+columns, and no shorter block is widened below its own widest line.
+cl-tuition's viewport-view, textarea-view and render-border all size themselves to
+the content, never to a requested width: render-border measures its box from the
+widest line and viewport-view prints each line bare. Without this the chat and REPL
+sections render at the width of their longest transcript line, the frame comes out
+29 columns wide on an 80-column terminal, and the agent pane hugs a 60-column gap
+on the right. Padding here is what makes layout-dimensions actually reach the
+screen. Padding is measured with visible-length, so ANSI escapes already in the
+text are neither counted nor disturbed."
+  (let ((lines (mapcar (lambda (line)
+                         (let* ((n (tui:visible-length line))
+                                (pad (max 0 (- width n))))
+                           (if (plusp pad)
+                               (concatenate 'string line
+                                             (make-string pad :initial-element #\Space))
+                               line)))
+                       (tui:split-string-by-newline (or text "")))))
+    (lines-to-string lines)))
+(export 'pad-block)
+
+;;;; --- panes -------------------------------------------------------------
+;;;
+;;; The five fixed numbers below are layout-dimensions of an 80x24 terminal: the
+;;; constructor defaults. They exist so the first frame (drawn before the first
+;;; window-size-msg is drained) and the first reflow agree. A test pins them to
+;;; (layout-dimensions 80 24) so the two cannot drift apart.
+
+(defparameter *chat-width* 54
+  "First-paint chat column width: (layout-dimensions 80 24).")
 (export '*chat-width*)
 
-(defparameter *agent-width* 30
-  "The agent pane width.")
+(defparameter *agent-width* 24
+  "First-paint agent pane width: (layout-dimensions 80 24).")
 (export '*agent-width*)
 
-(defparameter *agent-pane-height* 12
-  "The agent pane height in lines. Before S04 the viewport was height 0, so the pane
-rendered NOTHING even with rows present (research F2). 12 rows fit a useful society
-and leave room for the chat/repl column in a 24-line terminal.")
+(defparameter *agent-pane-height* 22
+  "First-paint agent pane height: (layout-dimensions 80 24). It has to be
+positive, not 0 — a zero-height viewport renders NOTHING even with rows present
+(research F2).")
 (export '*agent-pane-height*)
 
-(defparameter *chat-viewport-height* 10
-  "Chat viewport height in lines.")
+(defparameter *chat-viewport-height* 11
+  "First-paint chat viewport height: (layout-dimensions 80 24).")
 (export '*chat-viewport-height*)
 
 (defparameter *repl-viewport-height* 3
-  "REPL viewport height in lines.")
+  "First-paint REPL viewport height: (layout-dimensions 80 24).")
 (export '*repl-viewport-height*)
 
 (defparameter *textarea-height* 1
   "Both textareas are one line: chat input and a REPL prompt, not editors.")
 (export '*textarea-height*)
 
-;;;; --- panes -------------------------------------------------------------
-
-(defun make-chat-viewport (&optional (width *chat-width*))
+(defun make-chat-viewport (&optional (width *chat-width*) (height *chat-viewport-height*))
   "The chat scrollback pane. Empty on construction; the model sets its content."
-  (tui.viewport:make-viewport :width width :height *chat-viewport-height*))
+  (tui.viewport:make-viewport :width width :height height))
 (export 'make-chat-viewport)
 
 (defun make-chat-textarea (&optional (width *chat-width*))
@@ -114,9 +263,9 @@ press should land in chat and not in the REPL."
     ta))
 (export 'make-chat-textarea)
 
-(defun make-repl-viewport (&optional (width *chat-width*))
+(defun make-repl-viewport (&optional (width *chat-width*) (height *repl-viewport-height*))
   "The REPL output pane."
-  (tui.viewport:make-viewport :width width :height *repl-viewport-height*))
+  (tui.viewport:make-viewport :width width :height height))
 (export 'make-repl-viewport)
 
 (defun make-repl-textarea (&optional (width *chat-width*))
@@ -130,13 +279,13 @@ press should land in chat and not in the REPL."
     ta))
 (export 'make-repl-textarea)
 
-(defun make-agent-viewport ()
+(defun make-agent-viewport (&optional (width *agent-width*) (height *agent-pane-height*))
   "The agent pane. A VIEWPORT, not a table component: `table-render` is a one-shot
 string function with no TEA protocol, so composing it inside a viewport keeps the
 pane scrollable when the society is larger than the pane. The rows themselves are
-rendered by RENDER-AGENT-ROWS. The height is *agent-pane-height*, never 0: a
-zero-height viewport clips every row away (research F2)."
-  (tui.viewport:make-viewport :width *agent-width* :height *agent-pane-height*))
+rendered by RENDER-AGENT-ROWS. The height is positive, never 0: a zero-height
+viewport clips every row away (research F2)."
+  (tui.viewport:make-viewport :width width :height height))
 (export 'make-agent-viewport)
 
 (defun agent-row (agent)
@@ -212,20 +361,34 @@ never polluted with zone markers (research open question 2)."
               (tui:zone-mark "approval:deny" "[deny]")))))
 (export 'render-approval-strip)
 
-(defun render-section (title body)
-  "A bordered block with a TITLE line above BODY, per notes/tui.md §4."
-  (tui:render-border (lines-to-string (list title (or body ""))) *border*))
+(defun render-section (title body &key focused (width nil width-p))
+  "A bordered block with a TITLE line above BODY, per notes/tui.md §4.
+When FOCUSED is true the border is drawn in *focus-color*. That is the operator's
+only cue about which input owns the next key: a textarea holding no text renders
+its placeholder without a cursor, so an empty focused input would otherwise look
+identical to an empty unfocused one.
+WIDTH, when given, is the OUTER width in columns including both border columns:
+the title and body are padded to WIDTH minus 2 so render-border draws a box that
+exactly fills it. Without it the box sizes to its widest line, which is what the
+standalone callers want."
+  (let ((inner (if width-p
+                   (pad-block (lines-to-string (list title (or body ""))) (- width 2))
+                   (lines-to-string (list title (or body ""))))))
+    (tui:render-border inner *border* :fg-color (when focused *focus-color*))))
 (export 'render-section)
 
-(defun render-status-bar (text)
+(defun render-status-bar (text &optional (width 240))
   "The one-line status bar: connection state and the last error. It is deliberately
-plain — no border — so an error is never hidden behind layout decoration."
-  (one-line (or text "")))
+plain — no border — so an error is never hidden behind layout decoration.
+CLIPPED to WIDTH columns so the bar cannot outgrow the frame it sits in."
+  (one-line (or text "") width))
 (export 'render-status-bar)
 
 ;;;; --- layout ------------------------------------------------------------
 
-(defun compose-layout (chat-body repl-body agent-body status-line &optional approval-line)
+(defun compose-layout (chat-body repl-body agent-body status-line
+                       &optional approval-line
+                       &key chat-focused repl-focused (width 80) (height 24))
   "The full frame, per notes/tui.md §4 master-detail:
   +-------------------------------------+--------------------+
   | chat viewport                       | agent rows         |
@@ -233,19 +396,39 @@ plain — no border — so an error is never hidden behind layout decoration."
   | repl viewport                       |                    |
   | repl textarea                       |                    |
   +-------------------------------------+--------------------+
+  approval strip
   status bar
-The left column is chat over repl; the agent pane spans the right; the status bar is
-the last line. APPROVAL-LINE, when non-NIL, is inserted between the joined body and
-the status bar — its own line, so an approval affordance never lands inside stored
-scrollback. Borderless strings are passed through unchanged. The 4-argument call is
-still valid: APPROVAL-LINE is optional."
-  (let* ((left (tui:join-vertical :left (render-section "chat" chat-body)
-                                    (render-section "repl" repl-body)))
-         (body (tui:join-horizontal :top left (or agent-body
-                                                   (render-agent-rows nil))))
-         (frame (if approval-line
-                    (tui:join-vertical :left body approval-line
-                                       (render-status-bar status-line))
-                    (tui:join-vertical :left body (render-status-bar status-line)))))
-    frame))
+The left column is chat over repl; the agent pane spans the right; the approval
+strip and the status bar are the last two lines. APPROVAL-LINE, when non-NIL,
+occupies the strip; when nil the strip still takes its row (see *chrome-rows*), so
+the frame height does not move when an approval arrives or clears.
+CHAT-FOCUSED and REPL-FOCUSED color the matching section's border in *focus-color,
+so the operator can see which input takes the next key even with both inputs
+empty. Both false is valid: nothing is highlighted.
+WIDTH and HEIGHT are the terminal size in columns and rows. Every pane size is
+derived from them by layout-dimensions, and every block is padded to its allotted
+width with pad-block, so the frame comes out exactly WIDTH by HEIGHT. This is the
+whole point of the section: cl-tuition sizes every block to its content, so a frame
+left to its own devices renders as a 29-column strip on an 80-column screen.
+Borderless strings are passed through unchanged. The 4-argument call is still
+valid: APPROVAL-LINE, both focus flags and both sizes are optional."
+  (multiple-value-bind (chat-w agent-w chat-h repl-h agent-h)
+      (layout-dimensions width height)
+    (declare (ignore chat-h repl-h agent-h))
+    (let* ((left-width (+ chat-w 2))
+           (left (tui:join-vertical :left
+                                     (render-section "chat" chat-body :focused chat-focused
+                                                     :width left-width)
+                                     (render-section "repl" repl-body :focused repl-focused
+                                                     :width left-width)))
+           (body (tui:join-horizontal :top left
+                                      (pad-block (or agent-body
+                                                     (render-agent-rows nil))
+                                                 agent-w)))
+           (frame (tui:join-vertical :left body
+                                     (pad-block (or approval-line " ")
+                                                left-width)
+                                     (render-status-bar status-line
+                                                        (block-width body)))))
+      frame)))
 (export 'compose-layout)
