@@ -54,7 +54,14 @@
   ((agent :initarg :agent :initform nil :reader status-msg-agent)
    (status :initarg :status :initform nil :reader status-msg-status)
    (pending-approval :initarg :pending-approval :initform nil
-                     :reader status-msg-pending-approval))
+                     :reader status-msg-pending-approval)
+   ;; T when the wire frame carried :pending-approval EXPLICITLY (the approval
+   ;; path: request-approval / resolve-approval). Worker start/finish frames
+   ;; omit the key, and the model then preserves the row's pending-approval
+   ;; instead of clearing it — a finish announcement must not silently
+   ;; resolve an outstanding approval.
+   (pending-approval-p :initarg :pending-approval-p :initform nil
+                       :reader status-msg-pending-approval-p))
   :documentation "A per-agent status update: (status :agent A :status S :pending-approval P). S is the agent's status keyword (e.g. :running, :idle) and P is truthy when an approval is outstanding for A. Thin data: the T04 model turns it into a green/red/yellow light.")
 
 (defmessage approval-needed-msg
@@ -152,10 +159,13 @@ kind-less server decodes as model prose)."
   (typep obj 'rpc-result-msg))
 (export 'rpc-result-msg-p)
 
-(defun make-status-msg (&key agent status pending-approval)
-  "Construct a status-msg carrying AGENT, STATUS and PENDING-APPROVAL."
+(defun make-status-msg (&key agent status pending-approval pending-approval-p)
+  "Construct a status-msg carrying AGENT, STATUS, PENDING-APPROVAL and
+PENDING-APPROVAL-P (T when the wire frame carried :pending-approval
+explicitly — the approval path; the worker announcements omit it)."
   (make-instance 'status-msg :agent agent :status status
-                             :pending-approval pending-approval))
+                             :pending-approval pending-approval
+                             :pending-approval-p pending-approval-p))
 (export 'make-status-msg)
 
 (defun status-msg-p (obj)

@@ -252,7 +252,9 @@ write_server_boot() {
 ;;;; thread's first model round. It runs like any subagent — a worker
 ;;;; thread, a handle, a transcript — and with no provider configured it
 ;;;; simply finishes as :failed; the spawn is fire-and-forget, so the boot
-;;;; is never blocked or failed by it.
+;;;; is never blocked or failed by it. The worker announces its status on
+;;;; the push channel as it starts and finishes, so the TUI's agent pane
+;;;; shows IDLE (not a stale RUNNING) once the greeter's turn is done.
 (let ((greeter (sexpr.tui:spawn "hello world")))
   (sexpr.tui:inject-note greeter "hello world"))
 EOF

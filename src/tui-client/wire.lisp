@@ -329,9 +329,15 @@ shows the last error and the counters."
        (make-subscribed-msg :agent (getf (cdr form) :agent)
                             :cursor (getf (cdr form) :cursor 0)))
       ((string= op "STATUS")
-       (make-status-msg :agent (getf (cdr form) :agent)
-                        :status (getf (cdr form) :status)
-                        :pending-approval (getf (cdr form) :pending-approval)))
+       ;; :pending-approval is read for PRESENCE, not just value: the worker
+       ;; start/finish announcements omit the key, and the model must then
+       ;; preserve the row's pending-approval rather than clear it.
+       (let* ((payload (cdr form))
+              (pending-p (member :pending-approval payload)))
+         (make-status-msg :agent (getf payload :agent)
+                          :status (getf payload :status)
+                          :pending-approval (getf payload :pending-approval)
+                          :pending-approval-p pending-p)))
       ((string= op "APPROVAL-NEEDED")
        (make-approval-needed-msg :agent (getf (cdr form) :agent)
                                  :capability (getf (cdr form) :capability)

@@ -26,6 +26,7 @@
    #:handle-error
    #:handle-summary
    #:spawn-subagent
+   #:ensure-subagent-running
    #:subagent-summary
    #:subagent-error
    #:subagent-kill

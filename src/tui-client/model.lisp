@@ -495,6 +495,19 @@ cannot clobber a status."
                       copy))))
 (export '%set-agent-status)
 
+(defun %set-agent-status-keeping-pending (model name status)
+  "Set only :status to STATUS on the row named NAME, preserving any
+:pending-approval the row already carries. Returns the updated model-agents
+list. Used by the status-msg branch for frames that do NOT carry
+:pending-approval (the worker start/finish announcements): a finish
+announcement must not silently resolve an outstanding approval."
+  (%map-agent-row model name
+                  (lambda (a)
+                    (let ((copy (copy-list a)))
+                      (setf (getf copy :status) status)
+                      copy))))
+(export '%set-agent-status-keeping-pending)
+
 (defun %set-agent-pending (model name pending)
   "Set only :pending-approval to PENDING on the row named NAME, preserving :status.
 Returns the updated model-agents list."
@@ -993,10 +1006,21 @@ the single `update` method owns the dispatch."
            (status (status-msg-status msg))
            (pending (status-msg-pending-approval msg)))
        (when agent
-         (%set-agent-status model agent status pending)
+         ;; A frame that carries :pending-approval explicitly (the approval
+         ;; path) sets it; a frame WITHOUT the key (the worker start/finish
+         ;; announcements) preserves the row's pending-approval.
+         (if (status-msg-pending-approval-p msg)
+             (%set-agent-status model agent status pending)
+             (%set-agent-status-keeping-pending model agent status))
+         ;; The model's pending-approval slot mirrors the PICKED row, so it is
+         ;; re-synced from the row after either update.
          (when (and (model-picked-agent model)
                     (string= agent (model-picked-agent model)))
-           (setf (model-pending-approval model) pending))
+           (let ((row (find agent (model-agents model)
+                              :key (lambda (a) (getf a :name)) :test #'string=)))
+             (when row
+               (setf (model-pending-approval model)
+                     (getf row :pending-approval)))))
          (refresh-agent-viewport model)))
      (values model nil))
     ;; push channel: an agent blocked on an approval (S04)

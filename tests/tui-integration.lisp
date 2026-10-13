@@ -643,6 +643,79 @@ mirror zone-in-bounds-p's own (1- x) / (- y 2) mapping."
       (clrhash sexpr.kernel:*event-bus*)
       (clrhash sexpr.agents:*agent-table*))))
 
+(rove:deftest m004-a-keyless-status-frame-round-trips-and-preserves-pending-approval
+  ;; The worker start/finish announcements carry no :pending-approval key (the
+  ;; kernel worker cannot see the approval registry in :sexpr.tui). The frame
+  ;; must still round-trip through the REAL push server as a status-msg, and
+  ;; the model must then PRESERVE the row's pending-approval — a finish
+  ;; announcement must not silently resolve an outstanding approval.
+  (clrhash sexpr.kernel:*event-bus*)
+  (clrhash sexpr.agents:*agent-table*)
+  (let* ((a-name "int-s04-fin")
+         (server (sexpr.tui:start-server :port 0))
+         (conn nil)
+         (model nil))
+    (unwind-protect
+         (progn
+           (sexpr.agents:register-agent!
+            (sexpr.kernel:spawn :goal "g" :name a-name :endpoint :ollama))
+           (setf conn (sexpr-tui:connect-push
+                       "127.0.0.1" (sexpr.tui:push-server-port server)))
+           (sexpr-tui:write-wire conn (list 'subscribe :agent a-name))
+           (bounded-tui-read conn) ; the subscribe reply; not asserted here
+           (setf model (make-instance 'sexpr-tui:tui-model
+                                      :swank-connection
+                                      (sexpr-tui:new-swank-connection
+                                       :port 0
+                                       :stream (make-string-input-stream ""))
+                                      :picked-agent a-name))
+           (sexpr-tui:build-panes model)
+           ;; the picked agent's row starts with an outstanding approval
+           (let ((pending (list :agent a-name :capability :fs-write
+                                :target "/tmp/x" :description "write it"
+                                :restarts '(:grant-once :deny))))
+             (setf (sexpr-tui:model-agents model)
+                   (list (list :name a-name :handle nil :status :running
+                               :thread-alive-p t
+                               :pending-approval pending)))
+             (ok (eq :yellow (sexpr-tui:agent-light (first (sexpr-tui:model-agents model))))
+                 "the row starts yellow with a pending approval"))
+           ;; the worker finish announcement: a :status frame with NO
+           ;; :pending-approval key
+           (sexpr.kernel:emit-event
+            a-name
+            (list :type :status :agent-id a-name :status :finished))
+           (let* ((raw (bounded-tui-read conn))
+                  (msg (sexpr-tui:decode-wire conn raw)))
+             (ok (consp raw) "a frame came off the socket")
+             (ok (null (getf (cdr raw) :pending-approval))
+                 "the finish frame carries no :pending-approval key")
+             (ok (sexpr-tui:status-msg-p msg)
+                 "the key-less finish frame decodes as a status-msg")
+             (ok (null (sexpr-tui:status-msg-pending-approval-p msg))
+                 "the decoded msg records the key's absence")
+             (ok (null (sexpr-tui:status-msg-pending-approval msg))
+                 "the decoded msg carries no pending value")
+             (tui:update model msg)
+             (let ((row (first (sexpr-tui:model-agents model))))
+               (and (ok (eq :finished (getf row :status))
+                        "the row status becomes :finished")
+                    (ok (equal (getf row :pending-approval)
+                               (list :agent a-name :capability :fs-write
+                                     :target "/tmp/x" :description "write it"
+                                     :restarts '(:grant-once :deny)))
+                        "the row's pending-approval is preserved")
+                    (ok (eq :yellow (sexpr-tui:agent-light row))
+                        "the row stays yellow — the approval is still outstanding")
+                    (ok (equal (sexpr-tui:model-pending-approval model)
+                               (getf row :pending-approval))
+                        "the model's picked pending mirrors the row")))))
+      (when conn (sexpr-tui:close-connection conn))
+      (sexpr.tui:stop-server server)
+      (clrhash sexpr.kernel:*event-bus*)
+      (clrhash sexpr.agents:*agent-table*))))
+
+
 ;;; --- (8) the M004/S05 full streaming + budget round trip -----------
 ;;;;
 ;;;; T07's integration closure. Every hop between the kernel and the pane is REAL:

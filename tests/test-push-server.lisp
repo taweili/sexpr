@@ -701,10 +701,16 @@ Returns the last value of PRED."
                   (send-sexpr stream '(subscribe :agent 42))  ; wrong type
                   (send-sexpr stream '(unsubscribe))          ; no :agent
                   (send-sexpr stream 42)                      ; not a list at all
+                  ;; odd-length tails after the operator: GETF on these signals
+                  ;; a SIMPLE-TYPE-ERROR (expected CONS) unless the well-
+                  ;; formedness guard catches them first — the guard is what
+                  ;; keeps the handler thread (and the connection) alive
+                  (send-sexpr stream '(subscribe "x"))
+                  (send-sexpr stream '(unsubscribe "y"))
                   (wait-for (lambda ()
-                              (>= (stats-value (push-server-diagnostics server) :malformed) 4))
+                              (>= (stats-value (push-server-diagnostics server) :malformed) 6))
                             3.0)
-                  (and (= (stats-value (push-server-diagnostics server) :malformed) 4)
+                  (and (= (stats-value (push-server-diagnostics server) :malformed) 6)
                        ;; nothing was replied to any of them
                        (eq (read-or-eof stream 0.5) 'timeout)
                        ;; and the connection is still usable

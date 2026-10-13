@@ -971,13 +971,17 @@ model. The transcript-delta reply is id 2 (an empty refetch)."
 
 (test "S04/T04: a status-msg updates the matching row and sets model-pending-approval only for the picked agent"
   (let ((model (init-two-agent-model :picked "Alpha")))
+    ;; Both frames carry :pending-approval explicitly (the approval path), so
+    ;; pending-approval-p is T and the pending state is SET, not preserved.
     (tui:update model (make-status-msg :agent "Alpha" :status :running
-                                       :pending-approval :x))
+                                       :pending-approval :x
+                                       :pending-approval-p t))
     (let ((alpha-status (getf (model-agent-row model "Alpha") :status))
           (alpha-pending (getf (model-agent-row model "Alpha") :pending-approval))
           (picked-pending (model-pending-approval model)))
       (tui:update model (make-status-msg :agent "Beta" :status :running
-                                         :pending-approval :y))
+                                         :pending-approval :y
+                                         :pending-approval-p t))
       (and (eq :running alpha-status)
            (eq :x alpha-pending)
            (eq :x picked-pending)
@@ -986,6 +990,19 @@ model. The transcript-delta reply is id 2 (an empty refetch)."
            (eq :running (getf (model-agent-row model "Beta") :status))
            (eq :y (getf (model-agent-row model "Beta") :pending-approval))
            (eq :x (model-pending-approval model))))))
+
+(test "S04/T04: a status-msg WITHOUT :pending-approval preserves the row's pending state"
+  ;; The worker start/finish announcements omit the key; a finish announcement
+  ;; must not silently resolve an outstanding approval.
+  (let ((model (init-two-agent-model :picked "Alpha")))
+    (tui:update model (make-status-msg :agent "Alpha" :status :running
+                                       :pending-approval :x
+                                       :pending-approval-p t))
+    (tui:update model (make-status-msg :agent "Alpha" :status :finished))
+    (and (eq :finished (getf (model-agent-row model "Alpha") :status))
+         (eq :x (getf (model-agent-row model "Alpha") :pending-approval))
+         (eq :x (model-pending-approval model))
+         (eq :yellow (agent-light (model-agent-row model "Alpha"))))))
 
 (test "S04/T04: an approval-needed-msg builds the pending plist on the row and the picked state, preserving status"
   (let ((model (init-two-agent-model :picked "Alpha")))
@@ -1341,6 +1358,22 @@ can assert on the packet text the model wrote."
          (search "? UNKNOWN" bare)
          ;; ANSI-free: no escape character in the plain row text
          (null (find #\Escape picked)))))
+
+(test "S04/T05: agent-status-label maps kernel statuses to operator labels"
+  ;; :finished reads IDLE — the turn is done and the agent is available again —
+  ;; so a finished agent is never mistaken for a busy one; :failed and :killed
+  ;; keep their names so a dead agent is never mistaken for an idle one.
+  (and (string= "RUNNING" (agent-status-label :running))
+       (string= "IDLE" (agent-status-label :finished))
+       (string= "FAILED" (agent-status-label :failed))
+       (string= "KILLED" (agent-status-label :killed))
+       ;; the test vocabulary's :idle and a non-symbol degrade, NIL to UNKNOWN
+       (string= "IDLE" (agent-status-label :idle))
+       (string= "UNKNOWN" (agent-status-label nil))
+       (string= "UNKNOWN" (agent-status-label "running"))
+       ;; a finished agent renders IDLE in the row text, not FINISHED
+       (search "Alpha IDLE" (agent-row-text (list :name "Alpha" :status :finished)))
+       (search "Alpha FAILED" (agent-row-text (list :name "Alpha" :status :failed)))))
 
 (test "S04/T05: render-agent-rows highlights exactly the picked row and keeps both headers"
   (let ((rows (render-agent-rows (list (list :name "Alpha" :status :running)

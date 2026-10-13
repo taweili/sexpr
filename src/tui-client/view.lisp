@@ -297,15 +297,38 @@ NIL cell, which `table-render` would pad as an empty string anyway."
         (symbol-name (or (getf agent :status) :unknown))))
 (export 'agent-row)
 
+(defun agent-status-label (status)
+  "The display label for one agent status value.
+
+The kernel's terminal states collapse to the operator-facing vocabulary:
+:finished reads IDLE — the turn is done and the agent is available again,
+the green-light state — so a finished agent is never mistaken for a busy
+one (the bug this fixes: a pane that kept the initform :running forever).
+:failed and :killed keep their names, so a dead agent is never mistaken
+for an idle one. Any other value — including the :idle of the test
+vocabulary and a non-symbol — degrades to the upcased name, and NIL to
+UNKNOWN. PURE and total: nothing here signals."
+  ;; The label helper guards against NIL (a symbol whose name would be
+  ;; "NIL") and non-symbols: both degrade to UNKNOWN.
+  (flet ((label (s) (if (and s (symbolp s)) s :unknown)))
+    (case (label status)
+      (:running "RUNNING")
+      (:finished "IDLE")
+      (:failed "FAILED")
+      (:killed "KILLED")
+      (otherwise (string-upcase
+                  (symbol-name (label status)))))))
+(export 'agent-status-label)
+
 (defun agent-row-text (agent &key picked)
   "The PLAIN, ANSI-free, zone-free text of one agent row: a picked marker (\"*\" when
 PICKED names this agent, else a space), the light glyph \"●\", the agent name, and
-the UPPERCASED status symbol-name — e.g. \"* ● Alpha RUNNING\".
+the display label of the status (agent-status-label) — e.g. \"* ● Alpha RUNNING\", and \"* ● Alpha IDLE\" for a finished agent.
 PURE and total: a missing :name/:status degrades to \"?\"/\"UNKNOWN\" and nothing here
 signals. This is the string the headless tests assert on, so it carries no escape
 codes; RENDER-AGENT-ROWS adds the color and the zone markers around it."
   (let ((name (or (getf agent :name) "?"))
-        (status (symbol-name (or (getf agent :status) :unknown)))
+        (status (agent-status-label (getf agent :status)))
         (marker (if (and picked (stringp (getf agent :name))
                           (string= picked (getf agent :name)))
                     "*"

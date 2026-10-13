@@ -617,7 +617,146 @@ object isn't data-only the round-trip raises."
       (setf (fdefinition 'sexpr.kernel:agent-loop-streaming)
             real-agent-loop-streaming))))
 
-;;; --- Summary --------------------------------------------------------
+(test "40. the worker announces :status on the event bus at start and finish"
+  ;; The missing emitter: without these events a connected TUI's agent pane
+  ;; keeps the snapshot's initform :running forever — the RUNNING-instead-
+  ;; of-IDLE bug. reset! pins the next handle ID to "subagent-1".
+  (let ((events nil))
+    (with-stubbed-agent-loop
+      ;; Subscribe BEFORE the spawn: the stub returns immediately, so the
+      ;; worker could finish (and emit) before a post-spawn subscribe ran.
+      (sexpr.kernel:subscribe-event-bus "subagent-1" (lambda (e) (push e events)))
+      (let* ((id (spawn "test goal"))
+             (handle (sexpr.agents:find-handle id)))
+        (sb-thread:join-thread (sexpr.agents:handle-thread handle))
+        (and (string= id "subagent-1")
+             (eq (sexpr.kernel:agent-status
+                  (sexpr.agents:handle-agent handle)) :finished)
+             (= (length events) 2)
+             (let ((start (first (last events)))
+                   (finish (first events)))
+               (and (eq (getf start :type) :status)
+                    (string= (getf start :agent-id) "subagent-1")
+                    (eq (getf start :status) :running)
+                    ;; the announcement carries no :pending-approval key
+                    (null (getf start :pending-approval))
+                    (eq (getf finish :type) :status)
+                    (string= (getf finish :agent-id) "subagent-1")
+                    (eq (getf finish :status) :finished)
+                    (null (getf finish :pending-approval)))))))))
+
+(test "41. subagent-kill emits :status :killed on the event bus"
+  (let ((real-agent-loop (fdefinition 'sexpr.kernel:agent-loop))
+        (real-agent-loop-streaming
+          (fdefinition 'sexpr.kernel:agent-loop-streaming))
+        (events nil))
+    ;; A blocking stub: the worker must be alive when kill terminates it.
+    (setf (fdefinition 'sexpr.kernel:agent-loop)
+          (lambda (agent) (declare (ignore agent)) (sleep 300)))
+    (setf (fdefinition 'sexpr.kernel:agent-loop-streaming)
+          (lambda (agent) (declare (ignore agent)) (sleep 300)))
+    (unwind-protect
+         (progn
+           ;; reset! pins the next handle ID to "subagent-1"; subscribe before
+           ;; the spawn so the start announcement cannot race the subscribe.
+           (sexpr.kernel:subscribe-event-bus "subagent-1" (lambda (e) (push e events)))
+           (let* ((id (spawn "test goal"))
+                  (handle (sexpr.agents:find-handle id))
+                  (thread (sexpr.agents:handle-thread handle)))
+             ;; Wait for the worker to announce it is running: the blocking
+             ;; stub keeps it alive, but the thread may not have started
+             ;; when spawn returns, and a kill before the start announce
+             ;; would leave the events list one short.
+             (do ((i 0 1))
+                 ((or (find :running events :key (lambda (e) (getf e :status)))
+                      (> i 200)))
+               (sleep 0.01))
+             (kill id)
+             ;; terminate-thread is asynchronous: poll until the thread exits.
+             (do ((i 0 1))
+                 ((or (not (sb-thread:thread-alive-p thread)) (> i 100)))
+               (sleep 0.01))
+             (and (not (sb-thread:thread-alive-p thread))
+                  (eq (sexpr.kernel:agent-status
+                       (sexpr.agents:handle-agent handle)) :killed)
+                  ;; the start announcement precedes the kill announcement
+                  (= (length events) 2)
+                  (eq (getf (second events) :status) :running)
+                  (eq (getf (first events) :status) :killed)
+                  (string= (getf (first events) :agent-id) "subagent-1"))))
+      (setf (fdefinition 'sexpr.kernel:agent-loop) real-agent-loop)
+      (setf (fdefinition 'sexpr.kernel:agent-loop-streaming)
+            real-agent-loop-streaming))))
+
+(test "42. inject-note on a finished agent respawns a worker so the note drives a new turn"
+  (let ((real-agent-loop (fdefinition 'sexpr.kernel:agent-loop))
+        (real-agent-loop-streaming
+          (fdefinition 'sexpr.kernel:agent-loop-streaming))
+        (calls 0))
+    (setf (fdefinition 'sexpr.kernel:agent-loop)
+          (lambda (agent) (declare (ignore agent))))
+    (setf (fdefinition 'sexpr.kernel:agent-loop-streaming)
+          (lambda (agent)
+            (declare (ignore agent))
+            (incf calls)))
+    (unwind-protect
+         (let* ((id (spawn "test goal"))
+                (handle (sexpr.agents:find-handle id))
+                (thread (sexpr.agents:handle-thread handle)))
+           (sb-thread:join-thread thread)
+           (and (= 1 calls)
+                (eq (sexpr.kernel:agent-status
+                     (sexpr.agents:handle-agent handle)) :finished)
+                ;; the note lands, and a SECOND worker runs so the note gets
+                ;; a turn — the TUI equivalent of chat-loop's append-then-run
+                (string= (inject-note id "hello again")
+                         (format nil "noted ~a: hello again" id))
+                (= 2 calls)
+                (not (eq thread (sexpr.agents:handle-thread handle)))
+                (= (sexpr.transcript:transcript-length
+                    (sexpr.kernel:agent-transcript (sexpr.agents:handle-agent handle)))
+                   1)
+                (eq (sexpr.transcript:event-type
+                     (car (sexpr.transcript:events-list
+                           (sexpr.kernel:agent-transcript (sexpr.agents:handle-agent handle)))))
+                    :user))
+           (sb-thread:join-thread (sexpr.agents:handle-thread handle))
+           (and (= 2 calls)
+                (eq (sexpr.kernel:agent-status
+                     (sexpr.agents:handle-agent handle)) :finished)))
+      (setf (fdefinition 'sexpr.kernel:agent-loop) real-agent-loop)
+      (setf (fdefinition 'sexpr.kernel:agent-loop-streaming)
+            real-agent-loop-streaming))))
+
+(test "43. ensure-subagent-running leaves a running worker alone"
+  (let ((real-agent-loop (fdefinition 'sexpr.kernel:agent-loop))
+        (real-agent-loop-streaming
+          (fdefinition 'sexpr.kernel:agent-loop-streaming))
+        (release nil)
+        (worker-thread nil))
+    ;; A stub that blocks until RELEASED: the worker is mid-loop, so
+    ;; ensure-subagent-running must NOT respawn.
+    (setf (fdefinition 'sexpr.kernel:agent-loop)
+          (lambda (agent) (declare (ignore agent))))
+    (setf (fdefinition 'sexpr.kernel:agent-loop-streaming)
+          (lambda (agent)
+            (declare (ignore agent))
+            (loop until release do (sleep 0.01))))
+    (unwind-protect
+         (let* ((id (spawn "test goal"))
+                (handle (sexpr.agents:find-handle id)))
+           (setf worker-thread (sexpr.agents:handle-thread handle))
+           (sleep 0.2)  ; let the worker enter the blocking stub
+           (sexpr.agents:ensure-subagent-running id)
+           (and (eq (sexpr.agents:handle-thread handle) worker-thread)
+                (sb-thread:thread-alive-p worker-thread)
+                (eq (sexpr.kernel:agent-status
+                     (sexpr.agents:handle-agent handle)) :running)))
+      (setf release t)
+      (sb-thread:join-thread worker-thread)
+      (setf (fdefinition 'sexpr.kernel:agent-loop) real-agent-loop)
+      (setf (fdefinition 'sexpr.kernel:agent-loop-streaming)
+            real-agent-loop-streaming))))
 
 (format t "~%~D tests, ~D passed, ~D failed~%"
         *tests-run* *tests-passed* *tests-failed*)

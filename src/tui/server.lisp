@@ -450,9 +450,10 @@ A (:type :tool-start :agent-id A :call-id C :name N) event becomes (tool-start
 :agent A :call-id C :name N). A (:type :tool-result :agent-id A :call-id C
 :value V :text T) event becomes (tool-result :agent A :call-id C :value V :text
 T). A (:type :budget-exceeded :agent-id A :tokens-used U :limit L) event becomes
-(budget-exceeded :agent A :tokens-used U :limit L). A (:type :status :agent-id A
-:status S :pending-approval P) event becomes (status :agent A :status S
-:pending-approval P). A (:type :approval-needed :agent-id A :capability C :target
+(budget-exceeded :agent A :tokens-used U :limit L). A (:type :status :agent-id A :status S [:pending-approval P]) event becomes
+(status :agent A :status S [:pending-approval P]) — the key is forwarded only
+when the event carried it, so a worker announcement (no key) is distinguishable
+from an explicit NIL (resolve-approval) on the wire. A (:type :approval-needed :agent-id A :capability C :target
 T :description D :restarts R) event becomes (approval-needed :agent A :capability
 C :target T :description D :restarts R). Any other :type is ignored — that is
 forward-compatibility, not an error: a future server may add an event type and
@@ -505,11 +506,22 @@ this closure may take."
                                        :tokens-used (getf event :tokens-used)
                                        :limit (getf event :limit))))
         (:status
-         (%enqueue-backpressured client agent-id
-                                 (list 'status
-                                       :agent (or (getf event :agent-id) agent-id)
-                                       :status (getf event :status)
-                                       :pending-approval (getf event :pending-approval))))
+         ;; The payload is built SEPARATELY and consed onto the operator:
+         ;; getf/setf-getf on the full message would treat the operator as a
+         ;; key (the client reads fields from the CDR for the same reason), and
+         ;; setf on a MISSING getf key PREPENDS it (verified in this SBCL), so
+         ;; the payload is built whole instead. The key is forwarded only when
+         ;; the EVENT carried it — the worker start/finish announcements omit it,
+         ;; and the client distinguishes the two cases by the key's presence on
+         ;; the wire: a key-less frame means "status changed, approval state
+         ;; unknown — preserve the row's", while a frame carrying the key (even
+         ;; NIL, from resolve-approval) sets it.
+         (let* ((agent (or (getf event :agent-id) agent-id))
+                (payload (if (member :pending-approval event)
+                             (list :agent agent :status (getf event :status)
+                                   :pending-approval (getf event :pending-approval))
+                             (list :agent agent :status (getf event :status)))))
+           (%enqueue-backpressured client agent-id (cons 'status payload))))
         (:approval-needed
          (%enqueue-backpressured client agent-id
                                  (list 'approval-needed
@@ -586,6 +598,27 @@ subscriptions-lock and the event-bus lock. Returns the number removed."
       (%count server :listeners-removed (length pairs)))
     (length pairs)))
 
+(defun %proper-list-p (object)
+  "True when OBJECT is a proper (dotted-tail-free) list. CL has no
+proper-listp, and SBCL's LENGTH signals on a dotted tail, so the wire's
+well-formedness guard cannot use either."
+  (loop with cell = object
+        while (consp cell)
+        do (setf cell (cdr cell))
+        finally (return (null cell))))
+
+(defun %wire-payload-well-formed-p (message)
+  "True when MESSAGE's tail after the operator is a proper, even-length
+property list — the same contract the CLIENT's decoder enforces
+(well-formed-payload-p, wire.lisp). An odd-length tail makes GETF signal a
+SIMPLE-TYPE-ERROR (expected-type CONS), which would escape %handle-message,
+kill the handler thread, and drop the connection — the failure this guard
+exists to prevent (see the %handle-message docstring)."
+  (let ((payload (cdr message)))
+    (and (%proper-list-p payload)
+         (not (null payload))
+         (evenp (length payload)))))
+
 (defun %op (symbol)
   "Resolve the wire operator by SYMBOL-NAME, not by EQ.
 
@@ -610,7 +643,10 @@ S02's vocabulary is subscribe / subscribed / unsubscribe. Unknown operators are
 IGNORED rather than rejected: a newer client (S04/S05) may send finalize or
 approval-needed to an older server, and the server should not tear down the
 connection over a message it does not understand yet. A malformed message is not
-fatal to the connection either — it is counted and logged.
+fatal to the connection either — it is counted and logged. The guard is
+%WIRE-PAYLOAD-WELL-FORMED-P: an odd-length tail after the operator makes the
+GETF in the subscribe/unsubscribe branches signal a SIMPLE-TYPE-ERROR, which
+would otherwise escape this function and kill the handler thread.
 
 The subscribe reply is written AFTER subscribe-event-bus returns. That ordering
 is the race-closure signal: a client that has read (subscribed ...) knows the
@@ -619,10 +655,10 @@ listener is already registered, so any event it emits afterwards cannot be lost.
 No client lock is held while the event-bus is called (lock order), so the
 subscribe/unsubscribe paths take the bus lock, then the subscriptions-lock —
 never the reverse."
-  (unless (consp message)
+  (unless (and (consp message) (%wire-payload-well-formed-p message))
     (%count server :malformed)
     (%log server (format nil "client ~D malformed" (getf client :id))
-          (format nil "not a list: ~S" message))
+          (format nil "not a list or a malformed plist: ~S" message))
     (return-from %handle-message nil))
   (let ((op (and (consp message) (car message))))
     (case (%op op)

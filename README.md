@@ -475,7 +475,12 @@ opens the TUI. The client picks its default agent from the first
 snapshot row, so the greeter is what you land on; it runs like any
 subagent (worker thread, handle, transcript), streams its welcome over
 the push channel when the provider is configured, and finishes as
-`:failed` without one — the image comes up either way. Its transcript is
+`:failed` without one — the image comes up either way. The worker
+announces its status on the push channel as it starts and finishes, so the
+agent pane's row tracks it live — RUNNING while a turn is in flight, IDLE
+once the turn is done — and a chat note typed into a finished agent starts
+a fresh worker, so the note gets a turn of its own instead of sitting
+unanswered in the transcript. Its transcript is
 seeded with the same `hello world` user line, because the kernel sends
 the whole transcript to the model as messages and a goal-only call
 carries no user message — providers whose chat template requires one

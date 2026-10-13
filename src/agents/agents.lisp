@@ -14,6 +14,18 @@
 ;;;; "subagent-3"), not a Lisp object. The model can only emit text, so the
 ;;;; handle ID is the protocol between turns. The live subagent-handle lives
 ;;;; in a global registry keyed by ID; the other tools look it up.
+;;;
+;;;; WORKER RESTART: a handle outlives its worker thread. When a note is
+;;;; injected into an agent whose loop has finished, ensure-subagent-running
+;;;; starts a FRESH worker so the note drives a new model turn (the TUI is
+;;;; a chat client: append the event, then run — the same shape as
+;;;; chat-loop). The :lock and :worker-token slots make that restart race-free:
+;;;; the token is bumped under the lock before a replacement worker starts,
+;;;; so a dying worker's terminal status write can never clobber the
+;;;; replacement's :running. The residual window — a note arriving between
+;;;; the old loop's return and its terminal status write — is microscopic and
+;;;; self-healing (a second note sees the terminal status and respawns);
+;;;; the one-operator assumption (notes/tui.md §10) covers it.
 
 (in-package :sexpr.agents)
 
@@ -44,7 +56,21 @@
    (summary
     :accessor handle-summary
     :initform nil
-    :documentation "The worker's summary, extracted after join."))
+    :documentation "The worker's summary, extracted after join.")
+   (lock
+    :accessor handle-lock
+    :initform (sb-thread:make-mutex :name "subagent-handle")
+    :documentation "Guards the worker-thread restart (ensure-subagent-running)
+and the worker's terminal status write. Never held while calling
+agent-loop-streaming: the loop runs for minutes, and a caller blocked on
+this lock must not stall a turn.")
+   (worker-token
+    :accessor handle-worker-token
+    :initform 0
+    :type integer
+    :documentation "Bumped under :lock every time a (replacement) worker
+thread starts. A worker writes its terminal status only when its token
+still matches, so a dying worker cannot clobber a replacement's :running."))
   (:documentation "A handle to a spawned worker agent."))
 (export 'subagent-handle)
 
@@ -115,6 +141,87 @@ Returns a list of agent-name strings (model-passable)."
 ;;;; The LLM's interface to spawning workers. Inherits capabilities and
 ;;;; endpoint from the parent by default (D014, D017).
 
+(defun %worker-thread-body (handle token)
+  "The subagent worker thread body, shared by %spawn-subagent and
+ensure-subagent-running.
+
+Runs sexpr.kernel:agent-loop-streaming (so the turn streams onto the event
+bus), then announces the outcome on the bus so a connected TUI's agent
+pane leaves the stale :running status behind: without the :status event the
+pane keeps the initform :running forever, and an operator cannot tell a busy
+agent from a finished one. Every status write is under the handle lock and
+token-checked, so a dying worker cannot clobber a replacement worker's
+:running (the worker-restart contract in the file header). The event itself
+carries no :pending-approval: the approval registry lives in :sexpr.tui,
+which :sexpr.agents must not depend on, and a status frame without the key
+leaves the client's pending-approval untouched.
+
+TOKEN MISMATCH: the worker was superseded while looping (ensure-subagent-
+running started a replacement). It still records its error on the handle if
+it has one (subagent-error reads it), but writes no status and announces
+nothing, so the replacement's :running stands."
+  (let ((agent (handle-agent handle))
+        (announced nil))
+    (handler-case
+        (progn
+          (let ((mine nil))
+            (sb-thread:with-mutex ((handle-lock handle))
+              (when (eql (handle-worker-token handle) token)
+                (setf (sexpr.kernel:agent-status agent) :running
+                      mine t)))
+            ;; The start announcement flips a connected TUI's agent row from
+            ;; IDLE back to RUNNING the instant a note revives a finished
+            ;; agent — without it the row reads IDLE until the first
+            ;; streamed fragment arrives, which a model latency of seconds
+            ;; makes visible. The token is read under the lock but the emit
+            ;; happens outside it: emit-event takes the event-bus lock, and
+            ;; no listener may take the handle lock while holding it.
+            (when mine
+              (sexpr.kernel:emit-event
+               (sexpr.kernel:agent-name agent)
+               (list :type :status
+                     :agent-id (sexpr.kernel:agent-name agent)
+                     :status :running))))
+          ;; S05/T03: the worker runs the STREAMING loop, so a subagent's
+          ;; model turn emits :delta/:finalize/:tool-start/:tool-result onto
+          ;; the event bus and :streaming is true in agent-snapshot while
+          ;; the model stream is in flight. The finished/failed status
+          ;; handling below is unchanged: agent-loop and
+          ;; agent-loop-streaming share the same error contract.
+          (sexpr.kernel:agent-loop-streaming agent)
+          (sb-thread:with-mutex ((handle-lock handle))
+            (when (eql (handle-worker-token handle) token)
+              (setf (sexpr.kernel:agent-status agent) :finished
+                    announced t))))
+      (error (err)
+        (setf (handle-error handle) err)
+        (sb-thread:with-mutex ((handle-lock handle))
+          (when (eql (handle-worker-token handle) token)
+            (setf (sexpr.kernel:agent-status agent) :failed
+                  announced t)))))
+    ;; The announcement is tied to THIS worker's terminal write, so a
+    ;; superseded worker stays silent and a replacement's status stands.
+    (when announced
+      (sexpr.kernel:emit-event
+       (sexpr.kernel:agent-name agent)
+       (list :type :status
+             :agent-id (sexpr.kernel:agent-name agent)
+             :status (sexpr.kernel:agent-status agent))))))
+
+(defun %start-worker (handle)
+  "Start a fresh worker thread for HANDLE. THE CALLER MUST HOLD the handle
+lock: the token bump, the status reset and the thread slot update are one
+critical section with the caller's check, so two callers cannot both spawn
+and a dying worker's terminal writes are void (they fail the token check)."
+  (let ((token (1+ (handle-worker-token handle))))
+    (setf (handle-worker-token handle) token
+          (sexpr.kernel:agent-status (handle-agent handle)) :running
+          (handle-thread handle)
+          (sb-thread:make-thread
+            (lambda () (%worker-thread-body handle token))
+            :name (format nil "agent:~a"
+                          (sexpr.kernel:agent-goal (handle-agent handle)))))))
+
 (defun %spawn-subagent (goal &key capabilities endpoint parent)
   "Core spawn logic. Returns the subagent-handle (not the ID).
 
@@ -144,24 +251,8 @@ bus. A provider failure still lands in handle-error with status :failed."
                                 :agent agent
                                 :thread nil)))
     (register-agent! agent)
-    (setf (handle-thread handle)
-          (sb-thread:make-thread
-           (lambda ()
-             (handler-case
-                 (progn
-                   ;; S05/T03: the worker runs the STREAMING loop, so a
-                   ;; subagent's model turn emits :delta/:finalize/
-                   ;; :tool-start/:tool-result onto the event bus and
-                   ;; :streaming is true in agent-snapshot while the model
-                   ;; stream is in flight. The finished/failed status
-                   ;; handling below is unchanged: agent-loop and
-                   ;; agent-loop-streaming share the same error contract.
-                   (sexpr.kernel:agent-loop-streaming agent)
-                   (setf (sexpr.kernel:agent-status agent) :finished))
-               (error (err)
-                 (setf (handle-error handle) err)
-                 (setf (sexpr.kernel:agent-status agent) :failed))))
-           :name (format nil "agent:~a" goal)))
+    (sb-thread:with-mutex ((handle-lock handle))
+      (%start-worker handle))
     (register-handle! handle)
     handle))
 
@@ -175,6 +266,52 @@ subagent-summary, subagent-error, subagent-kill, and subagent-note."
                                  :capabilities capabilities
                                  :endpoint endpoint)))
     (handle-id handle)))
+
+;;;; --- worker restart -------------------------------------------------
+;;;
+;;;; A handle outlives its worker thread: the loop ends, the thread exits,
+;;;; and the handle stays in the registry. The TUI is a chat client, so a
+;;;; note injected into a finished agent must drive a NEW turn — the same
+;;;; append-then-run shape as chat-loop. ensure-subagent-running is that
+;;;; second half, and it is the only caller besides %spawn-subagent that
+;;;; starts a worker thread.
+
+(defun ensure-subagent-running (handle-id)
+  "Make sure the subagent identified by HANDLE-ID has a live worker thread.
+Returns the handle. Signals on an unknown handle, matching subagent-note.
+
+The check-and-spawn runs under the handle lock, so two callers cannot both
+spawn. A worker that is alive AND :running is left alone: the kernel sends
+the whole transcript to the model each turn, so a running loop picks up the
+note the caller is about to inject on its next model call. A dead thread or
+a terminal status (:finished/:failed/:killed) means the loop is over and the
+note would sit unanswered — a fresh worker is started, which re-sends the whole
+transcript (note included) on its first model call.
+
+The residual race — a note arriving in the microseconds between the old
+loop's return and its terminal status write — loses that one note; a second
+note sees the terminal status and respawns. Covered by the one-operator
+assumption (notes/tui.md §10)."
+  (let ((handle (find-handle handle-id)))
+    (unless handle
+      (error "unknown subagent handle: ~a" handle-id))
+    ;; The check-and-spawn is ONE critical section under the handle lock (see
+    ;; %start-worker): a worker that is alive AND :running is left alone — the
+    ;; kernel sends the whole transcript to the model each turn, so a running
+    ;; loop picks up the note the caller is about to inject on its next model
+    ;; call. A dead thread or a terminal status (:finished/:failed/:killed)
+    ;; means the loop is over and the note would sit unanswered, so a fresh
+    ;; worker is started and re-sends the whole transcript (note included) on
+    ;; its first model call.
+    (sb-thread:with-mutex ((handle-lock handle))
+      (let ((thread (handle-thread handle))
+            (agent (handle-agent handle)))
+        (unless (and thread
+                     (sb-thread:thread-alive-p thread)
+                     (eq (sexpr.kernel:agent-status agent) :running))
+          (%start-worker handle))))
+    handle))
+(export 'ensure-subagent-running)
 
 ;;;; --- coordination tools --------------------------------------------
 
@@ -208,8 +345,19 @@ confirmation string."
   (let ((handle (find-handle handle-id)))
     (unless handle
       (error "unknown subagent handle: ~a" handle-id))
-    (sb-thread:terminate-thread (handle-thread handle))
-    (setf (sexpr.kernel:agent-status (handle-agent handle)) :killed)
+    ;; Invalidate the worker token under the lock FIRST, so the unwound
+    ;; worker's terminal status write is void and cannot clobber :killed.
+    (sb-thread:with-mutex ((handle-lock handle))
+      (setf (handle-worker-token handle) (1+ (handle-worker-token handle))
+            (sexpr.kernel:agent-status (handle-agent handle)) :killed)
+      (let ((thread (handle-thread handle)))
+        (when thread
+          (sb-thread:terminate-thread thread))))
+    (sexpr.kernel:emit-event
+     (sexpr.kernel:agent-name (handle-agent handle))
+     (list :type :status
+           :agent-id (sexpr.kernel:agent-name (handle-agent handle))
+           :status :killed))
     (format nil "killed ~a" handle-id)))
 
 (defun subagent-note (handle-id note)

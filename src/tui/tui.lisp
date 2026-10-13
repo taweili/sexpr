@@ -137,9 +137,20 @@ If AGENT-NAME is not in the global table this signals an error.
 
 (defun inject-note (handle-id note)
   "Inject NOTE as a user event into the subagent identified by
-HANDLE-ID. Delegates to sexpr.agents:subagent-note; returns the
-confirmation string it produces (\"noted <id>: <note>\")."
-  (subagent-note handle-id note))
+HANDLE-ID, then make sure the note gets a response.
+
+The append delegates to sexpr.agents:subagent-note (which signals on an
+unknown handle and returns the confirmation string). The second half —
+ensure-subagent-running — is what makes the TUI a chat client rather than a
+transcript editor: the kernel sends the whole transcript to the model each
+turn, so a RUNNING loop picks the note up on its next model call, but a
+finished agent's loop is over and the note would sit unanswered. In that
+case a fresh worker thread is started and re-sends the whole transcript
+(note included) on its first model call — the same append-then-run shape as
+chat-loop. Returns the confirmation string subagent-note produced."
+  (let ((confirmation (subagent-note handle-id note)))
+    (ensure-subagent-running handle-id)
+    confirmation))
 
 (defun kill (handle-id)
   "Terminate the subagent identified by HANDLE-ID. Delegates to

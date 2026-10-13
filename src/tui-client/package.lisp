@@ -80,6 +80,7 @@
    #:status-msg-agent
    #:status-msg-status
    #:status-msg-pending-approval
+   #:status-msg-pending-approval-p
    #:approval-needed-msg
    #:make-approval-needed-msg
    #:approval-needed-msg-p
