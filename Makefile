@@ -12,7 +12,7 @@ SYSTEM    := sexpr
 CHAT_ARGS ?= --goal "pair programmer"
 TUI_ARGS  ?=
 
-.PHONY: hello test load build chat tui verify verify-wrapper diagnostic-tool-call diagnostic-live-round test-live clean help
+.PHONY: hello test load build chat tui sexpr-tui verify verify-wrapper diagnostic-tool-call diagnostic-live-round test-live clean help
 
 hello:
 	$(SBCL) --non-interactive \
@@ -46,6 +46,11 @@ tui:
 		--eval '(push (uiop:getcwd) asdf:*central-registry*)' \
 		--eval '(ql:quickload :sexpr-tui :print t)' \
 		--eval '(sb-ext:exit :code (sexpr-tui:main (remove "" (uiop:split-string "$(TUI_ARGS)" :separator " ") :test (function string=))))'
+
+# ./sexpr-tui.sh is the wrapper that starts the image before the client;
+# this target keeps the old `make tui` for a client-only run.
+sexpr-tui:
+	./sexpr-tui.sh $(TUI_ARGS)
 
 diagnostic-tool-call:
 	SEXPR_PROVIDER=openai-compatible \
@@ -106,9 +111,11 @@ verify: build
 # Wrapper-only checks: no SBCL, no ./sexpr build needed. Verifies that
 # ./sexpr.sh forwards all four built-in capabilities by default and that
 # the SEXPR_CAPABILITIES env override narrows the set. See
-# tools/check-default-capabilities.sh for the probe matrix.
+# tools/check-default-capabilities.sh for the probe matrix. Also runs the
+# sexpr-tui.sh launcher checks, which boot no image either.
 verify-wrapper:
 	@./tools/check-default-capabilities.sh
+	@./tools/check-tui-wrapper.sh
 
 clean:
 	rm -f ./sexpr
@@ -123,6 +130,7 @@ help:
 	@echo "  build   Produce ./sexpr via save-lisp-and-die (depends on test)"
 	@echo "  chat    Run ./sexpr (override with CHAT_ARGS='--goal \"...\"')"
 	@echo "  tui     Run the sexpr-tui client (pass args via TUI_ARGS)"
+	@echo "  sexpr-tui   Start the image if needed, then run the TUI (./sexpr-tui.sh)"
 	@echo "  verify  Run binary probes: --help, scripted session, --capability,
 	         cross-process load, R015 seam"
 	@echo "  diagnostic-tool-call  Probe a live local server for a usable :tool-calls node"

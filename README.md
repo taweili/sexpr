@@ -18,6 +18,7 @@
 - [Model provider](#model-provider)
 - [Chat interface](#chat-interface)
 - [REPL](#repl)
+- [Remote TUI](#remote-tui)
 - [Building the binary](#building-the-binary)
 - [Status](#status)
 - [Open questions](#open-questions)
@@ -439,6 +440,54 @@ key is needed. Reach it by evaluating a `provider-call` form yourself.
 - **Nil is suppressed.** A form returning a single `NIL` prints nothing
   (SBCL convention), so side-effecting `(format t ...)` calls don't echo
   a trailing `NIL`.
+
+## Remote TUI
+
+The TUI is a separate process (`:sexpr-tui`, cl-tuition) that renders a
+projection of a running image. It does not carry the kernel — the two
+sides stay apart so the client never becomes a second agent society;
+`notes/tui.md` is the design.
+
+`./sexpr-tui.sh` brings up both halves:
+
+```sh
+./sexpr-tui.sh                 # start the image if needed, then run the TUI
+./sexpr-tui.sh --agent Alpha   # same, starting on Alpha
+./sexpr-tui.sh --no-server     # attach only; fail if nothing is listening
+./sexpr-tui.sh --server-only   # bring the image up and leave it running
+./sexpr-tui.sh --dry-run       # show the boot file and the client command
+```
+
+The TUI needs two channels, both owned by the image: **swank** on `4004`
+carries request/response (typed `sexpr.tui` RPCs over a real Swank
+server), and the **push** channel on `4005` carries the one-way delta
+stream. "An image is running" means "port 4004 accepts a connection": the
+wrapper adopts what is already there and starts nothing if the image is
+up, and it tears down only an image it started itself — an image you
+started by hand is left exactly as you left it. The push channel is
+optional at the client; the wrapper asks for it only when it is actually
+listening. The image comes up in its own SBCL, fed by a named pipe it
+holds open, and exits on EOF, so a crash never looks like a hang.
+
+Every knob is overridable, with no build step and no binary:
+
+| env var | default | |
+| --- | --- | --- |
+| `SEXPR_TUI_HOST` | `127.0.0.1` | where the image listens |
+| `SEXPR_TUI_SWANK_PORT` | `4004` | request/response channel |
+| `SEXPR_TUI_PUSH_PORT` | `4005` | one-way delta channel |
+| `SEXPR_TUI_STATE_DIR` | `/tmp/sexpr-tui` | boot file, log, pipe |
+| `SEXPR_TUI_READY_TIMEOUT` | `120` | seconds to wait for the image |
+| `SEXPR_TUI_SBCL` | `sbcl` | the SBCL binary |
+| `SEXPR_TUI_SBCLINIT` | `~/.sbclinit` | loaded first, image and client |
+
+Flags (`--host`, `--swank-port`, `--push-port`) win over the environment;
+every other flag is forwarded to `sexpr-tui:main` verbatim. The boot file
+is regenerated on every run at `$SEXPR_TUI_STATE_DIR/server.lisp`, so it
+can never point the image at a stale checkout, and the image log lands at
+`$SEXPR_TUI_STATE_DIR/server.log` — that is where a failed boot explains
+itself. `make sexpr-tui` is the same wrapper; `make verify-wrapper` runs
+the launcher checks without starting a single process.
 
 ## Building the binary
 
