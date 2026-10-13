@@ -32,8 +32,15 @@
 
 (defmessage subscribed-msg
   ((agent :initarg :agent :initform nil :reader subscribed-msg-agent)
-   (cursor :initarg :cursor :initform 0 :reader subscribed-msg-cursor))
-  :documentation "The race-closure reply to a subscribe: everything before CURSOR is already on the terminal, so the client renders from CURSOR onward.")
+   (cursor :initarg :cursor :initform 0 :reader subscribed-msg-cursor)
+   ;; The agent's current kernel status at subscribe time — the RACE CLOSURE
+   ;; for a status that changed between the client's snapshot and this reply
+   ;; (the greeter finishing its welcome turn). The change's push has no
+   ;; subscriber yet, so without this field the pane would keep the
+   ;; snapshot's :running until the agent's NEXT turn. NIL when the agent
+   ;; was unknown at subscribe time.
+   (status :initarg :status :initform nil :reader subscribed-msg-status))
+  :documentation "The race-closure reply to a subscribe: everything before CURSOR is already on the terminal, so the client renders from CURSOR onward. STATUS is the agent's current kernel status, read AFTER the listener was registered, so it is never older than the events at CURSOR.")
 
 (defmessage wire-ignored-msg
   ((op :initarg :op :initform nil :reader wire-ignored-msg-op)
@@ -119,9 +126,11 @@ kind-less server decodes as model prose)."
   (typep obj 'resync-msg))
 (export 'resync-msg-p)
 
-(defun make-subscribed-msg (&key agent (cursor 0))
-  "Construct a subscribed-msg carrying AGENT and CURSOR."
-  (make-instance 'subscribed-msg :agent agent :cursor cursor))
+(defun make-subscribed-msg (&key agent (cursor 0) status)
+  "Construct a subscribed-msg carrying AGENT, CURSOR and STATUS (the agent's
+current kernel status at subscribe time; NIL when the agent was unknown)."
+  (make-instance 'subscribed-msg :agent agent :cursor cursor
+                                  :status status))
 (export 'make-subscribed-msg)
 
 (defun subscribed-msg-p (obj)

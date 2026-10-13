@@ -1552,6 +1552,37 @@ Returns the last value of PRED."
       (stop-server server)
       (reset!))))
 
+(test "41b. the subscribe reply is UNQUALIFIED on the wire (package-independent)"
+  ;; The client process has no :sexpr.tui package, so a reply whose operator
+  ;; prints from the image's own package context arrives as
+  ;; SEXPR.TUI::SUBSCRIBED and the CLIENT's reader signals 'Package does not
+  exist' — every delta and the subscribe reply would be unreadable. The
+  ;; server binds *package* to :sexpr.tui in %write-sexpr, so the operator
+  ;; prints bare and the client interns it in its own package.
+  (let ((server (start-server :port 0)))
+    (unwind-protect
+        (let* ((port (push-server-port server))
+               (c (make-instance 'sb-bsd-sockets:inet-socket
+                                  :type :stream :protocol :tcp)))
+          (sb-bsd-sockets:socket-connect c #(127 0 0 1) port)
+          (let ((stream (sb-bsd-sockets:socket-make-stream c
+                                                           :buffering :line
+                                                           :input t
+                                                           :output t)))
+            (unwind-protect
+                (progn
+                  (send-sexpr stream '(subscribe :agent "unqual-A"))
+                  (let ((reply (read-or-eof stream 3.0)))
+                    (and (wire-equal reply '(subscribed :agent "unqual-A" :cursor 0))
+                         ;; the raw BYTES carry no package prefix
+                         (let ((raw (with-output-to-string (out)
+                                     (prin1 reply out))))
+                           (and (not (search "::" raw))
+                                (search "SUBSCRIBED" raw))))))
+              (safe-close-socket c))))
+      (stop-server server)
+      (reset!))))
+
 (test "42. a :approval-needed event is translated to (approval-needed ...) and reaches the subscribed client"
   (let ((server (start-server :port 0)))
     (unwind-protect

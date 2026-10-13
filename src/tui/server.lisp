@@ -551,8 +551,16 @@ integrated into the transcript."
 princ would drop the quotes around a string and the client would read a symbol.
 *print-pretty* nil so nothing is wrapped or paren-tightened. force-output
 guarantees delivery: :buffering :line flushes on newline, but an explicit flush
-is what makes a push channel push."
-  (let ((*print-readably* t) (*print-pretty* nil))
+is what makes a push channel push.
+
+*PACKAGE* is bound to :sexpr.tui so the OPERATOR symbol prints UNQUALIFIED: the
+client process has no :sexpr.tui package, so a symbol printed from the image's
+own package context arrives as SEXPR.TUI::SUBSCRIBED and the client's reader
+signals 'Package does not exist' — the subscribe reply and every delta would be
+unreadable. The client resolves the operator by name, so the spelling is
+invisible to it; only the package-independence matters."
+  (let ((*print-readably* t) (*print-pretty* nil)
+        (*package* (find-package "SEXPR.TUI")))
     (prin1 object stream)
     (terpri stream)
     (force-output stream)))
@@ -619,6 +627,15 @@ exists to prevent (see the %handle-message docstring)."
          (not (null payload))
          (evenp (length payload)))))
 
+(defun %agent-status (agent-id)
+  "The current kernel status of the agent named AGENT-ID, or NIL when the
+agent is not registered (a client may subscribe to an agent that does not
+exist yet). Read at subscribe-reply time — AFTER the listener is registered —
+so a status change racing the subscribe is either in this reply or pushed,
+never lost (the reply and the push cannot both miss it)."
+  (let ((a (%lookup-agent agent-id)))
+    (and a (sexpr.kernel:agent-status a))))
+
 (defun %op (symbol)
   "Resolve the wire operator by SYMBOL-NAME, not by EQ.
 
@@ -676,11 +693,24 @@ never the reverse."
            (sb-thread:with-mutex ((getf client :subscriptions-lock))
              (push (cons agent-id listener) (getf client :subscriptions)))
            (%count server :subscribes)
-           (let ((cursor (%cursor-for agent-id)))
+           (let ((cursor (%cursor-for agent-id))
+                 ;; The agent's CURRENT status, read AFTER the listener is
+                 ;; registered (the subscribe-then-reply ordering above): a
+                 ;; status that changed between the client's snapshot and
+                 ;; this reply - the greeter finishing its welcome turn -
+                 ;; would otherwise be lost, because the change's push has no
+                 ;; subscriber yet, and the pane would keep the snapshot's
+                 ;; :running until the agent's NEXT turn.
+                 (status (%agent-status agent-id)))
              (%log server (format nil "client ~D subscribe" (getf client :id))
                    (format nil ":agent ~S :cursor ~D" agent-id cursor))
+             ;; :status only when the agent is registered — an unknown agent's
+             ;; status is not a fact the server can state, and the client
+             ;; treats an absent key exactly like the NIL it would have sent.
              (%write-to-client client stream
-               (list 'subscribed :agent agent-id :cursor cursor)))
+               (if status
+                   (list 'subscribed :agent agent-id :cursor cursor :status status)
+                   (list 'subscribed :agent agent-id :cursor cursor))))
            t)))
       ((:unsubscribe)
        (let ((agent-id (getf (cdr message) :agent)))

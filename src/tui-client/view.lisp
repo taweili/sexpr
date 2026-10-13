@@ -407,6 +407,73 @@ CLIPPED to WIDTH columns so the bar cannot outgrow the frame it sits in."
   (one-line (or text "") width))
 (export 'render-status-bar)
 
+(defun %textarea-slot (textarea slot-name)
+  "Read one of the textarea's NON-EXPORTED slots (LINES / ROW / COL) by name.
+cl-tuition exports the cursor position and the value but not the per-line
+content or the row/col separately. The project's established pattern for a
+non-exported slot is slot-value + intern (see program-running-p), so the
+renderer reads them the same way. Returns NIL when the slot cannot be read,
+so the renderer degrades rather than signalling."
+  (handler-case
+      (slot-value textarea (intern (string-upcase slot-name)
+                                   (find-package "TUITION.COMPONENTS.TEXTAREA")))
+    (error () nil)))
+(export '%textarea-slot)
+
+(defun render-textarea (textarea)
+  "Render one textarea line for the frame: PROMPT + content, with the cursor
+as a REVERSE-VIDEO character on the focused line.
+
+WHY NOT cl-tuition's textarea-view: it wraps the character under the cursor in
+[..] — while typing, an input reading "hello" renders as "hello[ ]"
+(bracket-space-bracket once the cursor passes the last character), the "extra []"
+the operator sees. Its cursor-blink slot is dead (never read by the view), so
+there is no accessor to change the cursor style. The project already treats the
+section border (*focus-color*) as the focus cue, so the cursor only needs to mark
+the insert position — reverse video is the terminal-standard way to do that.
+
+MIRRORS cl-tuition's contract: the placeholder branch fires when the value is
+empty (and shows no cursor — a placeholder is not a cursor position); the cursor
+appears only on the focused line at the insert column. PURE and total: anything
+unreadable degrades to an empty string rather than signalling, so a half-built
+pane cannot take the frame down."
+  (handler-case
+      (let* ((lines (%textarea-slot textarea "LINES"))
+             (row (%textarea-slot textarea "ROW"))
+             (col (%textarea-slot textarea "COL"))
+             (focused (tui.textarea:textarea-focused textarea))
+             (prompt (tui.textarea:textarea-prompt textarea))
+             (placeholder (tui.textarea:textarea-placeholder textarea))
+             (value (tui.textarea:textarea-value textarea)))
+        (cond
+          ((string= value "")
+           ;; empty: the placeholder, and no cursor — cl-tuition's own rule (a
+           ;; placeholder is not a cursor position). A NIL placeholder renders
+           ;; as nothing after the prompt.
+           (format nil "~A~A" prompt placeholder))
+          ((and lines (integerp row) (integerp col))
+           (let* ((line-text (if (< row (length lines)) (aref lines row) ""))
+                  (before (subseq line-text 0 (min col (length line-text))))
+                  (at-cursor (if (< col (length line-text))
+                                (string (char line-text col))
+                                " "))
+                  (after (if (< col (length line-text))
+                             (subseq line-text (min (1+ col) (length line-text)))
+                             ""))
+                  ;; REVERSE video, never brackets — the focus cue is the section
+                  ;; border (*focus-color*), the cursor only marks the insert spot.
+                  (cursor (if focused
+                              (tui:render-styled (tui:make-style :reverse t)
+                                                at-cursor)
+                              at-cursor)))
+             (format nil "~A~A~A~A" prompt before cursor after)))
+          (t "")))
+      ;; PURE and total: a NIL textarea (or an unreadable slot) degrades to an
+      ;; empty string rather than signalling — a half-built pane cannot take
+      ;; the frame down.
+      (error () "")))
+(export 'render-textarea)
+
 ;;;; --- layout ------------------------------------------------------------
 
 (defun compose-layout (chat-body repl-body agent-body status-line

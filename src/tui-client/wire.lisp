@@ -327,7 +327,8 @@ shows the last error and the counters."
                         :cursor (getf (cdr form) :cursor 0)))
       ((string= op "SUBSCRIBED")
        (make-subscribed-msg :agent (getf (cdr form) :agent)
-                            :cursor (getf (cdr form) :cursor 0)))
+                            :cursor (getf (cdr form) :cursor 0)
+                            :status (getf (cdr form) :status)))
       ((string= op "STATUS")
        ;; :pending-approval is read for PRESENCE, not just value: the worker
        ;; start/finish announcements omit the key, and the model must then

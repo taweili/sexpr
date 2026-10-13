@@ -62,6 +62,7 @@
    #:make-subscribed-msg
    #:subscribed-msg-agent
    #:subscribed-msg-cursor
+   #:subscribed-msg-status
    #:wire-ignored-msg
    #:make-wire-ignored-msg
    #:wire-ignored-msg-op

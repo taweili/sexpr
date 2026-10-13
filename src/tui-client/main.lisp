@@ -97,6 +97,23 @@ is NIL), and UIOP is always present because ASDF is built into SBCL."
                     ;; nothing. :mouse :cell-motion makes the terminal report mouse
                     ;; presses, without which the mouse dispatch never fires.
                     (let ((program (tui:make-program model :mouse :cell-motion)))
+                      ;; THE PROGRAM MUST REACH BOTH THE MODEL AND THE PUSH CONNECTION
+                      ;; BEFORE run STARTS THE READER IN init. Neither slot is set by
+                      ;; make-program, and the connection predates the program, so
+                      ;; without this wiring the push channel is DEAD in production:
+                      ;;   - init starts the wire reader only when (program-running-p
+                      ;;     (model-program model)) — a NIL model-program means the
+                      ;;     reader never starts (the status bar's "readers: off"
+                      ;;     was the tell);
+                      ;;   - even a started reader drops every message, because
+                      ;;     deliver calls tui:send only when the connection's program
+                      ;;     slot is non-NIL.
+                      ;; With both slots set, status pushes and streamed deltas reach
+                      ;; the TEA loop: the agent pane tracks RUNNING -> IDLE and a
+                      ;; chat note's reply renders in the chat pane.
+                      (setf (model-program model) program)
+                      (when push-conn
+                        (setf (tui-connection-program push-conn) program))
                       (tui:run program))))
               (error (e)
                 (close-swank-connection swank-conn)

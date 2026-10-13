@@ -1046,13 +1046,68 @@ model. The transcript-delta reply is id 2 (an empty refetch)."
         (and ;; no picked agent: init defaults to the first name sorted, so the id-2
              ;; transcript reply above is for "Alpha"
              (string= "Alpha" (model-picked-agent model))
-             ;; init's literal 'subscribe is interned in SEXPR-TUI, so the frame
-             ;; prints as (SEXPR-TUI::SUBSCRIBE ...) when *package* is the test
-             ;; package; assert on the qualifier-agnostic parts (the operator NAME
-             ;; and the :AGENT argument), not on an unqualified spelling.
+             ;; The operator is the KEYWORD :subscribe, not the client package's
+             ;; own symbol: the client package is :sexpr-tui (dash) and the
+             ;; image's is :sexpr.tui (dot), so a client-side symbol prints
+             ;; QUALIFIED as SEXPR-TUI::SUBSCRIBE — a package the image does
+             ;; not have, whose reader error kills the subscribe before any
+             ;; listener is registered. Keywords are package-independent; the
+             ;; server resolves the operator by name.
              (= 2 (count-substring "SUBSCRIBE" sent))
+             (search ":SUBSCRIBE" sent)
+             (null (search "SEXPR-TUI::SUBSCRIBE" sent))
              (search ":AGENT \"Alpha\"" sent)
              (search ":AGENT \"Beta\"" sent))))))
+
+(test "T05: init starts the wire reader only when the model's program is set and running"
+  ;; THE PRODUCTION WIRING BUG behind "RUNNING instead of IDLE" and "messages
+  ;; get no reply": main.lisp built the model without :program and never set
+  ;; the push connection's program slot, so program-running-p was NIL, the
+  ;; wire reader NEVER STARTED, and every status push / streamed delta was
+  ;; dropped on the floor. The notes still landed (synchronous swank RPC) and
+  ;; the transcript still rendered (initial RPC fetch) — only the push channel
+  ;; was dead, and the status bar's "readers: off" was the tell. This pins the
+  ;; whole wiring chain main.lisp now establishes: a running program on the
+  ;; model AND on the push connection.
+  (flet ((readers-after-init (program)
+           (let* ((swank-conn (canned-swank (swank-reply :ok nil 1)
+                                            (swank-reply :ok '(nil . 0) 2)))
+                  (push (capturing-push))
+                  (model (make-instance 'tui-model :swank-connection swank-conn
+                                                    :push-connection push)))
+             ;; what main.lisp does after tui:make-program: the program reaches
+             ;; both slots before run starts the reader in init
+             (when program
+               (setf (model-program model) program
+                     (tui-connection-program push) program))
+             (tui:init model)
+             (model-readers-running model))))
+    (let ((running (tui:make-program (make-instance 'tui-model))))
+      ;; tui:run sets program-running T before init; program-running is not
+      ;; exported, so the slot is reached the way program-running-p reaches it
+      (setf (slot-value running (intern "RUNNING" (find-package "TUITION"))) t)
+      (and (readers-after-init running)
+           (null (readers-after-init nil))))))
+
+(test "S04/T04: a subscribed-msg carries the subscribe-time status and the model applies it"
+  ;; The RACE CLOSURE for a status that changed between the client's snapshot
+  ;; and its subscribe (the greeter finishing its welcome turn): the change's
+  ;; push has no subscriber yet, so the subscribe reply carries the truth and
+  ;; the model applies it to the row — the pane shows IDLE, not the snapshot's
+  ;; :running.
+  (let ((model (init-two-agent-model :picked "Alpha")))
+    (tui:update model (make-subscribed-msg :agent "Alpha" :cursor 0 :status :finished))
+    (and (eq :finished (getf (model-agent-row model "Alpha") :status))
+         (eq :green (agent-light (model-agent-row model "Alpha")))
+         (search "Alpha IDLE"
+                 (tui.viewport:viewport-view (model-agent-viewport model))))))
+
+(test "S04/T04: a subscribed-msg with no status (unknown agent) leaves the row's status alone"
+  (let ((model (init-two-agent-model :picked "Alpha")))
+    (tui:update model (make-subscribed-msg :agent "Alpha" :cursor 0))
+    (and (eq :idle (getf (model-agent-row model "Alpha") :status))
+         ;; ...and the model's picked pending-approval is untouched
+         (null (model-pending-approval model)))))
 
 (test "S04/T04: a subscribed-msg for a non-picked agent does NOT refetch the transcript"
   ;; Empty society + picked "A": init consumes exactly two swank packets (ids 1 and
@@ -1279,6 +1334,66 @@ can assert on the packet text the model wrote."
         (and (search "no handle" (model-status-text model))
              (string= "" (get-output-stream-string out))
              (string= "hello" (tui.textarea:textarea-value ta)))))))
+
+(defun %strip-ansi (string)
+  "Remove ANSI SGR escape sequences (ESC [ ... m) from STRING."
+  (let ((out "")
+        (i 0)
+        (n (length string)))
+    (loop while (< i n)
+          do (if (and (char= (char string i) #\Escape)
+                      (< (1+ i) n)
+                      (char= (char string (1+ i)) #\[))
+                  (let ((j (position #\m string :start (1+ i))))
+                    (if j (setf i (1+ j)) (return)))
+                  (progn (setf out (concatenate 'string out (string (char string i))))
+                         (incf i))))
+    out))
+
+(test "T05: render-textarea draws the cursor in reverse video, never brackets"
+  ;; cl-tuition's textarea-view wraps the character under the cursor in [..] —
+  ;; while typing, an input reading "hello" renders as "hello[ ]", the "extra
+  ;; []" the operator sees. The client renderer draws the insert position as a
+  ;; reverse-video character instead. (textarea-set-value leaves the cursor
+  ;; at column 0, so the styled character is the first one.)
+  (let* ((ta (make-chat-textarea))
+         (view (progn
+                 (tui.textarea:textarea-set-value ta "hello")
+                 (render-textarea ta)))
+         (plain (%strip-ansi view)))
+    (and (string= "> hello" plain)
+         ;; the cursor char carries the reverse-video escape (ESC [ 7 m)
+         (search "[7m" view)
+         ;; and none of cl-tuition's bracket cursor: no ] anywhere (the [
+         ;; that does appear is the ESC [ of the ANSI sequence)
+         (null (find #\] view))
+         ;; the prompt is still there
+         (search "> " plain))))
+
+(test "T05: render-textarea shows the placeholder when empty, and no cursor"
+  (let* ((ta (make-chat-textarea))
+         (view (render-textarea ta)))
+    (and (string= "> message..." view)
+         ;; the placeholder branch returns before any cursor is drawn
+         (null (find #\[ view))
+         (null (find "[7m" view)))))
+
+(test "T05: render-textarea draws no cursor when the textarea is unfocused"
+  ;; The section border (*focus-color*) is the focus cue; an unfocused input
+  ;; renders as plain prompt + text, so the two inputs are distinguishable even
+  ;; when both are empty... and a focused empty input shows its placeholder.
+  (let* ((ta (make-chat-textarea))
+         (view (progn
+                 (tui.textarea:textarea-set-value ta "hello")
+                 (tui.textarea:textarea-blur ta)
+                 (render-textarea ta))))
+    (and (string= "> hello" view)
+         (null (find "[7m" view)))))
+
+(test "T05: render-textarea degrades on a NIL textarea"
+  ;; A half-built pane must not take the frame down: the model's view calls
+  ;; this unconditionally, and a NIL pane slot is the failure mode.
+  (equal "" (render-textarea nil)))
 
 (test "T05: parse-args defaults resolve correctly"
   (multiple-value-bind (options help-p)

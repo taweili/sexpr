@@ -695,7 +695,14 @@ Nothing here signals: every failure is recorded and the last good state is kept.
           (when agent
             (handler-case
                 (progn
-                  (write-wire push (list 'subscribe :agent agent))
+                  ;; :subscribe is a KEYWORD, not the client package's own symbol: the client
+                  ;; package is :sexpr-tui (dash) and the image's is :sexpr.tui
+                  ;; (dot), so a client-side symbol prints QUALIFIED as
+                  ;; SEXPR-TUI::SUBSCRIBE — a package the image does not have, and
+                  ;; its reader signals 'Package does not exist', killing the
+                  ;; subscribe before any listener is registered. Keywords are
+                  ;; package-independent; the server resolves the operator by name.
+                  (write-wire push (list :subscribe :agent agent))
                   nil)
               (error (e)
                 (handler-case (client-note-error! push e) (error () nil))
@@ -976,8 +983,16 @@ the single `update` method owns the dispatch."
     ((subscribed-msg-p msg)
      (let* ((cursor (subscribed-msg-cursor msg))
             (agent (or (subscribed-msg-agent msg) (model-picked-agent model)))
+            ;; The RACE CLOSURE for a status that changed between the snapshot
+            ;; and this subscribe reply (the greeter finishing its welcome
+            ;; turn): the change's push has no subscriber yet, so the reply
+            ;; carries the truth. Applied to the row BEFORE the transcript gate
+            ;; below, and kept-pending so it cannot resolve an approval.
+            (status (subscribed-msg-status msg))
             (picked (model-picked-agent model))
             (events nil) (new-cursor cursor) (error nil))
+       (when (and agent status)
+         (%set-agent-status-keeping-pending model agent status))
        (cond
          ;; a reply for an agent we are not showing: adopt only when nothing is
          ;; picked, otherwise do NOT refetch — this is the gate that stops N
@@ -1099,12 +1114,12 @@ as its own line between the body and the status bar."
       (tui:join-vertical :left
                          (tui.viewport:viewport-view (model-chat-viewport model))
                          (when (model-chat-textarea model)
-                           (tui.textarea:textarea-view (model-chat-textarea model)))))
+                           (render-textarea (model-chat-textarea model)))))
     (when (model-repl-viewport model)
       (tui:join-vertical :left
                          (tui.viewport:viewport-view (model-repl-viewport model))
                          (when (model-repl-textarea model)
-                           (tui.textarea:textarea-view (model-repl-textarea model)))))
+                           (render-textarea (model-repl-textarea model)))))
     (when (model-agent-viewport model)
       (tui.viewport:viewport-view (model-agent-viewport model)))
     (model-status-text model)

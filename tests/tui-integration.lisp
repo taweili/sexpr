@@ -285,11 +285,19 @@
              (setf stream (sb-bsd-sockets:socket-make-stream socket
                                                              :buffering :line
                                                              :input t :output t))
-            (prin1 (list 'subscribe :agent agent-name) stream)
+            ;; :subscribe is a KEYWORD, exactly what the production client writes:
+            ;; the client package is :sexpr-tui (dash) and the image's is
+            ;; :sexpr.tui (dot), so a client-side symbol prints QUALIFIED as
+            ;; SEXPR-TUI::SUBSCRIBE and the image's reader signals 'Package does
+            ;; not exist' — the subscribe would die before any listener exists.
+            (prin1 (list :subscribe :agent agent-name) stream)
             (terpri stream)
             (force-output stream)
             (setf reply (read-wire stream 5.0))
-            (ok (wire-equal reply (list 'subscribed :agent agent-name :cursor 0))
+            ;; The reply carries the agent's CURRENT status (the race closure):
+            ;; the agent was just spawned, so it is :running. A client whose
+            ;; snapshot predates a status change reads the truth here.
+            (ok (wire-equal reply (list 'subscribed :agent agent-name :cursor 0 :status :running))
                 "the client reads the (subscribed ...) reply — the race-closure signal")
             ;; the real streaming path: no hand-built event, no direct socket write
             (sexpr.kernel:model-step-streaming agent)
@@ -319,6 +327,66 @@
       (setf (fdefinition 'cl-llm-provider:stream-tool-calls) real-stc)
       (when socket
         (handler-case (sb-bsd-sockets:socket-close socket) (error () nil)))
+      (clrhash sexpr.kernel:*event-bus*)
+      (clrhash sexpr.agents:*agent-table*)))))
+
+(rove:deftest push-server-subscribe-reply-carries-the-agents-current-status
+  ;; The RACE CLOSURE for a status that changed between the client's snapshot
+  ;; and its subscribe (the greeter finishing its welcome turn): the change's
+  ;; push has no subscriber yet, so the subscribe reply carries the agent's
+  ;; CURRENT status, read AFTER the listener was registered. An agent that is
+  ;; not registered gets no :status key — the client treats an absent key
+  ;; exactly like the NIL it would have sent.
+  (clrhash sexpr.kernel:*event-bus*)
+  (clrhash sexpr.agents:*agent-table*)
+  (let* ((server (sexpr.tui:start-server :port 0))
+         (socket nil)
+         (stream nil))
+    (unwind-protect
+        (progn
+          (let ((agent (sexpr.agents:register-agent!
+                        (sexpr.kernel:spawn :goal "g" :name "race-A" :endpoint :ollama))))
+            ;; the worker finished between the client's snapshot and the subscribe
+            (setf (sexpr.kernel:agent-status agent) :finished)
+            (setf socket (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp))
+            (sb-bsd-sockets:socket-connect socket #(127 0 0 1)
+                                           (sexpr.tui:push-server-port server))
+            (setf stream (sb-bsd-sockets:socket-make-stream socket
+                                                            :buffering :line
+                                                            :input t :output t))
+            ;; :subscribe is a KEYWORD, exactly what the production client writes
+            ;; (the client package is :sexpr-tui dash, the image's :sexpr.tui dot;
+            ;; a client-side symbol prints qualified and the image's reader kills
+            ;; the subscribe with 'Package does not exist')
+            (prin1 (list :subscribe :agent "race-A") stream)
+            (terpri stream)
+            (force-output stream)
+            (let ((reply (read-wire stream 5.0)))
+              (and (wire-equal reply '(subscribed :agent "race-A" :cursor 0 :status :finished))
+                   ;; the raw BYTES carry no package prefix: the client process
+                   ;; has no :sexpr.tui package, so a reply printed as
+                   ;; SEXPR.TUI::SUBSCRIBED would be unreadable there
+                   (let ((raw (with-output-to-string (out)
+                                (prin1 reply out))))
+                     (and (not (search "::" raw))
+                          (search "SUBSCRIBED" raw)))
+                   ;; ...and the client's own decoder reads it — the full
+                   ;; package-independence round trip through the real server
+                   (let ((decoded (sexpr-tui:decode-wire
+                                   (sexpr-tui:make-client-connection) reply)))
+                     (and (sexpr-tui:subscribed-msg-p decoded)
+                          (string= (sexpr-tui:subscribed-msg-agent decoded) "race-A")
+                          (eq (sexpr-tui:subscribed-msg-status decoded) :finished)))
+                   ;; an unknown agent: no :status key at all
+                   (progn
+                     (prin1 (list :subscribe :agent "race-unknown") stream)
+                     (terpri stream)
+                     (force-output stream)
+                     (wire-equal (read-wire stream 5.0)
+                                 '(subscribed :agent "race-unknown" :cursor 0))))))
+      (when stream
+        (handler-case (sb-bsd-sockets:socket-close socket) (error () nil)))
+      (sexpr.tui:stop-server server)
       (clrhash sexpr.kernel:*event-bus*)
       (clrhash sexpr.agents:*agent-table*)))))
 
