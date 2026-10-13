@@ -127,6 +127,14 @@ need '(ql:quickload :swank :silent t)' "$b"
 need 'central-registry' "$out"
 # The image must stay client-free: cl-tuition belongs to the TUI process only.
 absent 'tuition' "$b"
+# The image honors the SEXPR_* provider env like the CLI, so the greeter's
+# model call can succeed in the documented local-dev flow.
+need '(sexpr.provider:configure-provider)' "$b"
+# A fresh image is an empty society; the boot file seeds the default agent
+# the TUI picks on first connect (goal "hello world"), with the same
+# "hello world" user line the kernel's user-speaks-first convention needs.
+need '(sexpr.tui:spawn "hello world")' "$b"
+need '(sexpr.tui:inject-note greeter "hello world")' "$b"
 
 echo
 echo "[3] the boot file points at THIS checkout, as an absolute directory"

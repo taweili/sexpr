@@ -31,6 +31,18 @@
 # as found. A push channel is picked up only when it is actually listening,
 # so an image that came up without one still renders (no live deltas).
 #
+# THE DEFAULT AGENT: a fresh image is an empty society, and the TUI client
+# defaults its picked agent to the first snapshot row — so without a seed the
+# agent pane is blank on first connect. The generated boot file therefore
+# spawns one default agent whose goal is "hello world": it exists to greet
+# whoever opens the TUI. Its transcript is seeded with the same "hello
+# world" user line, because the kernel sends the whole transcript to the
+# model as messages and a goal-only call carries no user message — a
+# provider whose chat template requires one refuses it. It runs like any
+# subagent (a worker thread, a handle, a transcript); with no provider
+# configured it finishes as :failed, and the image still comes up — the
+# spawn is fire-and-forget.
+#
 # Everything after the flags above is forwarded to sexpr-tui:main verbatim
 # (--agent NAME, --help, ...).
 #
@@ -220,6 +232,29 @@ write_server_boot() {
                 nil))))
   (format *error-output* "SEXPR-TUI IMAGE UP: swank=${SWANK_PORT} push=~A~%"
           (or (and push (sexpr.tui:push-server-port push)) "off")))
+
+;;;; The image honors the same SEXPR_PROVIDER / SEXPR_MODEL /
+;;;; SEXPR_BASE_URL environment variables the CLI honors (the README's
+;;;; local-dev flow), so a configured provider reaches every agent in the
+;;;; image — including the greeter below. Without this the provider stays
+;;;; at its :anthropic default and no model call in the image can succeed.
+(sexpr.provider:configure-provider)
+
+;;;; A default agent so a fresh image is not an empty society. The TUI client
+;;;; defaults its picked agent to the first snapshot row, so without this the
+;;;; agent pane is blank on first connect and there is no transcript to show.
+;;;; The goal is the welcome: this agent exists to greet whoever opens the
+;;;; TUI. Its transcript is seeded with the same "hello world" user line:
+;;;; the kernel sends the whole transcript to the model as messages, and a
+;;;; goal-only call carries no user message — a provider whose chat template
+;;;; requires one (llama-server's --jinja) refuses the request outright.
+;;;; The note lands microseconds after the spawn, far ahead of the worker
+;;;; thread's first model round. It runs like any subagent — a worker
+;;;; thread, a handle, a transcript — and with no provider configured it
+;;;; simply finishes as :failed; the spawn is fire-and-forget, so the boot
+;;;; is never blocked or failed by it.
+(let ((greeter (sexpr.tui:spawn "hello world")))
+  (sexpr.tui:inject-note greeter "hello world"))
 EOF
     printf '%s' "$boot"
 }
