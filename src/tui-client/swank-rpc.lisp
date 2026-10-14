@@ -440,8 +440,17 @@ not fatal."
            (client-log! connection "skipped unsolicited reply" (format nil "id ~A" id))
            (return-from classify-packet
              (list :status :unsolicited :packet packet :id id)))
-         (let ((kind (and (listp status) (symbolp (car status))
-                          (string-upcase (symbol-name (car status))))))
+         (let ((kind (cond ((listp status)
+                             (and (symbolp (car status))
+                                  (string-upcase (symbol-name (car status)))))
+                           ;; Swank's ONLY abort shape is a STRING: eval-for-emacs
+                           ;; sends `(:return (:abort ,(prin1-to-string condition)) id)`.
+                           ;; A string status is therefore always an abort, never an
+                           ;; unsolicited packet — misclassifying it as unsolicited made
+                           ;; swank-read-reply skip the only reply that would ever arrive and
+                           ;; block forever (the REPL freeze).
+                           ((stringp status) "ABORT")
+                           (t nil))))
            (cond
              ((string= kind "OK")
               (list :status :ok :packet packet :id id
@@ -490,7 +499,8 @@ Returns the classified reply plist; :status is :ok, :abort, :reader-error, or :e
     (swank-read-reply connection id)))
 (export 'swank-eval)
 
-(defun swank-read-reply (connection expected-id &key (max-attempts 100))
+(defun swank-read-reply (connection expected-id &key (max-attempts 100)
+                          (readout 30))
   "Read packets until one carries EXPECTED-ID. Unsolicited packets
 (`:new-features`, `:indentation-update`, a reply for a different id) are counted as
 :unsolicited-skipped and skipped. A `(:reader-error ...)` is counted and returned as
@@ -500,13 +510,54 @@ MAX-ATTEMPTS bounds the number of packets read so a caller cannot loop forever o
 connection that will never answer; exhausting it returns :status :no-match rather
 than hanging or raising. The bound must be greater than 1: the live probe showed
 `:new-features` arriving BEFORE the first reply, so a single-read reply matcher
-would report EOF for a perfectly healthy connection."
+would report EOF for a perfectly healthy connection.
+
+READOUT bounds EACH read in seconds. Without it a reply that never arrives — an
+image whose swank thread died, a network partition, a misclassified abort —
+blocks the caller FOREVER. sb-ext:with-timeout interrupts a blocking socket read
+on this SBCL, so a stuck image gets :status :timeout after READOUT seconds and
+the caller can show an error instead of freezing. A nil payload that is NOT a
+timeout is EOF and returns :status :eof (the canned-stream case).
+
+DEBUG PACKETS: when a form errors during RPC eval, swank enters its interactive
+debugger and sends `(:debug ...)` instead of a :return. An unanswered :debug
+blocks the image's worker thread FOREVER, so it is answered immediately by
+invoking the ABORT restart over a fresh :emacs-rex, then reported as
+:status :abort with the condition text."
   (let ((result nil))
     (loop for attempt from 1 to max-attempts
-          do (let ((payload (read-packet connection)))
-               (setf result (if (null payload)
-                                (list :status :eof :packet nil :id nil :value nil :error nil)
-                                (classify-packet connection (parse-packet connection payload) expected-id))))
+          do (let* ((timed-out nil)
+                    (payload (handler-case
+                                 (sb-ext:with-timeout readout
+                                   (read-packet connection))
+                               (sb-ext:timeout ()
+                                 (setf timed-out t) nil)))
+                    (parsed (and payload (parse-packet connection payload)))
+                    (debug-p (and parsed
+                                  (string= (packet-operator parsed) "DEBUG"))))
+               (cond
+                (debug-p
+                 ;; Answer the image's interactive debugger before classifying:
+                 ;; an unanswered :debug blocks the worker thread forever.
+                 (let ((abort-id (swank-next-id connection)))
+                   (write-packet connection
+                     (rpc-payload "(swank::invoke-nth-restart-for-emacs 1)"
+                                  :package "COMMON-LISP-USER" :id abort-id))
+                   (swank-read-reply connection abort-id))
+                 (setf result (list :status :abort
+                                    :packet parsed
+                                    :id (reply-continuation-id parsed)
+                                    :value nil
+                                    :error (format nil "~{~A~^ ~}"
+                                                    (cdr (second (second parsed)))))))
+                (timed-out
+                 (setf result (list :status :timeout :packet nil :id nil :value nil
+                                    :error (format nil "no reply within ~Ds" readout))))
+                (t
+                 (setf result (if (null payload)
+                                  (list :status :eof :packet nil :id nil :value nil
+                                        :error nil)
+                                  (classify-packet connection parsed expected-id))))))
           until (and result (not (eq (getf result :status) :unsolicited))))
     (or result (list :status :no-match :packet nil :id nil :value nil :error nil))))
 (export 'swank-read-reply)

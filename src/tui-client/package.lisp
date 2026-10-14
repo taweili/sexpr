@@ -199,6 +199,7 @@
    #:model-picked-agent
    #:model-pending-approval
    #:model-agents
+   #:model-agent-row
    #:model-cursor
    #:model-scrollback
    #:model-in-flight

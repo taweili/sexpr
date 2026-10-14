@@ -226,16 +226,19 @@ the status bar stays data."
              (format nil "~A" status))))))
 (export 'reply-error-text)
 
-(defun swank-rpc (connection form-text)
+(defun swank-rpc (connection form-text &key (package "SWANK-IO-PACKAGE"))
   "Run one sexpr.tui RPC over SWANK-CONNECTION. Returns (VALUES value error).
 FORM-TEXT is packet TEXT (see the file header). ERROR is NIL on success, otherwise a
 string that belongs in the status bar: :abort, :reader-error, :eof, :no-match, or the
 text of a condition the connection raised. Nothing is ever signalled out of here — the
-caller decides what to do with the last error."
+caller decides what to do with the last error.
+PACKAGE is the buffer package the image reads the form in (default
+SWANK-IO-PACKAGE, which works for fully-qualified forms only — see
+send-repl-form for why the REPL form needs COMMON-LISP-USER)."
   (when (null connection)
     (return-from swank-rpc (values nil "no swank connection")))
   (handler-case
-      (let ((reply (swank-eval connection form-text)))
+      (let ((reply (swank-eval connection form-text :package package)))
         (cond
           ((eq (getf reply :status) :ok)
            (values (swank-value connection reply) nil))
@@ -665,6 +668,9 @@ Nothing here signals: every failure is recorded and the last good state is kept.
       (setf (model-agents model) agents)
       (refresh-agent-viewport model))
     (note-error model error))
+  ;; a FAILED greeter is the common first sight of a fresh image without
+  ;; a provider: explain it before the operator concludes the TUI is broken
+  (note-agent-failure model)
   ;; default the picked agent to the first snapshot row (sorted by name for a stable
   ;; choice) so a client started without --agent still has a society view and a
   ;; target; --agent overrides it by being set before init runs.
@@ -822,7 +828,20 @@ is rendered locally; a reply only appears if the agent is actually running.
 (defun send-repl-form (model)
   "Send a REPL form to the image, wrapped in a let that binds
 `sexpr.repl:*agent*` to the picked agent. The form is eval'd synchronously
-and the result is rendered into the REPL pane."
+and the result is rendered into the REPL pane.
+
+The form is evaluated with :package \"COMMON-LISP-USER\": the default
+SWANK-IO-PACKAGE has no LET (the image log showed 'SWANK-IO-PACKAGE::LET is
+undefined' for an unqualified form — the error that froze the TUI). The
+operator's own symbols read correctly in CL-USER, and the sexpr.* names in
+the wrapper are qualified regardless.
+
+The form is wrapped in HANDLER-CASE: an erroring form must show its error in
+the REPL pane, not drop the image into the interactive debugger. Without the
+wrapper, a form like (car 5) signals an error during the RPC eval, swank enters
+the debugger and blocks the connection thread, and the TUI freezes forever —
+the 'repl would freeze the program' report. With the wrapper the error is
+caught and returned as text, so the connection stays responsive."
   (let* ((ta (model-repl-textarea model))
          (text (and ta (tui.textarea:textarea-value ta))))
     (cond
@@ -836,11 +855,13 @@ and the result is rendered into the REPL pane."
             (note-error model "no swank connection — cannot eval")
             (values model nil))
            (t
-            (let ((form-text (format nil "(let ((sexpr.repl:*agent* (gethash ~A sexpr.agents:*agent-table*))) ~A)"
+            (let ((form-text (format nil "(let ((sexpr.repl:*agent* (gethash ~A sexpr.agents:*agent-table*))) (handler-case ~A (error (e) (format nil \"ERR: ~~A\" e))))"
                                     (swank-escape-string (or name ""))
                                     text)))
               (multiple-value-bind (value error)
-                  (swank-rpc conn form-text)
+                  ;; :package COMMON-LISP-USER — see the docstring: the default
+                  ;; SWANK-IO-PACKAGE cannot read the unqualified let.
+                  (swank-rpc conn form-text :package "COMMON-LISP-USER")
                 (model-append-repl-line model
                                         (format nil "~A=> ~A" text
                                                 (if error
@@ -850,6 +871,40 @@ and the result is rendered into the REPL pane."
               (when ta (tui.textarea:textarea-reset ta))
               (values model nil)))))))))
 (export 'send-repl-form)
+
+(defun model-agent-row (model name)
+  "The agent-snapshot plist named NAME in MODEL, or NIL. PURE: a plain
+find over the snapshot rows."
+  (find name (model-agents model)
+        :key (lambda (a) (getf a :name)) :test #'string=))
+(export 'model-agent-row)
+
+(defun note-agent-failure (model)
+  "Explain a FAILED picked agent in the chat pane, with the reason.
+
+A failed agent cannot answer notes, and a bare FAILED row does not say
+whether the model is unreachable (a provider misconfiguration) or the
+agent hit a real error — the operator cannot tell a TUI bug from a config
+problem, which is exactly how 'the agent failed' reads. Fetches the
+handle's error text over swank and appends ONE actionable line. PURE of
+signalling: a failed fetch leaves the FAILED row as the only signal,
+and a NIL error (the agent was not actually failed) changes nothing."
+  (let* ((picked (model-picked-agent model))
+         (row (and picked (model-agent-row model picked)))
+         (handle (and row (getf row :handle))))
+    (when (and row (eq (getf row :status) :failed) handle)
+      (multiple-value-bind (reason error)
+          (swank-rpc (model-swank-connection model)
+                     (format nil "(sexpr.agents:subagent-error ~A)"
+                             (swank-escape-string handle)))
+        (declare (ignore error))
+        (model-append-chat-line
+         model
+         (one-line (format nil "agent ~A failed (~A): ~A — set SEXPR_MODEL and SEXPR_BASE_URL (or ANTHROPIC_API_KEY) and restart the image"
+                          picked handle
+                          (or reason "reason unavailable")))))))
+  model)
+(export 'note-agent-failure)
 
 (defun set-pane-dimensions (model)
   "Size every pane from (layout-dimensions term-width term-height). Returns MODEL.
@@ -1019,7 +1074,11 @@ the single `update` method owns the dispatch."
     ((status-msg-p msg)
      (let ((agent (status-msg-agent msg))
            (status (status-msg-status msg))
-           (pending (status-msg-pending-approval msg)))
+           (pending (status-msg-pending-approval msg))
+           ;; the row's status BEFORE this update, for the flip detection below
+           (before (let ((row (and (status-msg-agent msg)
+                                  (model-agent-row model (status-msg-agent msg)))))
+                     (and row (getf row :status)))))
        (when agent
          ;; A frame that carries :pending-approval explicitly (the approval
          ;; path) sets it; a frame WITHOUT the key (the worker start/finish
@@ -1027,6 +1086,14 @@ the single `update` method owns the dispatch."
          (if (status-msg-pending-approval-p msg)
              (%set-agent-status model agent status pending)
              (%set-agent-status-keeping-pending model agent status))
+         ;; a turn that FAILED mid-session: the pane flips to FAILED but the
+         ;; operator still cannot tell why — fetch the reason (only on the
+         ;; flip, not on every :failed update, so a re-run does not repeat it)
+         (when (and (model-picked-agent model)
+                    (string= agent (model-picked-agent model))
+                    (eq status :failed)
+                    (not (eq before :failed)))
+           (note-agent-failure model))
          ;; The model's pending-approval slot mirrors the PICKED row, so it is
          ;; re-synced from the row after either update.
          (when (and (model-picked-agent model)

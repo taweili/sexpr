@@ -1312,9 +1312,40 @@ can assert on the packet text the model wrote."
                (search "Alpha" packet-text)
                (search "sexpr.agents:*agent-table*" packet-text)
                (search "(+ 1 2)" packet-text)
+               ;; the freeze fix: the form is evaluated in COMMON-LISP-USER and
+               ;; wrapped in HANDLER-CASE so an erroring form cannot drop the
+               ;; image into the debugger
+               (search "COMMON-LISP-USER" packet-text)
+               (search "handler-case" packet-text)
                (string= "" (tui.textarea:textarea-value ta))
                ;; model-repl-lines is a LIST of lines; join before searching.
-               (search "result" (lines-to-string (model-repl-lines model)))))))))
+               (search "result" (lines-to-string (model-repl-lines model))))))))
+
+(test "T05: an erroring REPL form renders its error instead of freezing"
+  (multiple-value-bind (conn out)
+      (canned-swank-with-output (swank-reply :ok nil 1)
+                                (swank-reply :ok '(nil . 0) 2)
+                                (swank-reply :ok "boom" 3))
+    (let ((model (make-instance 'tui-model
+                                :swank-connection conn
+                                :picked-agent "Alpha")))
+      (tui:init model)
+      (get-output-stream-string out)
+      (setf (model-focused model) :repl)
+      (let ((ta (model-repl-textarea model)))
+        (tui.textarea:textarea-set-value ta "(error \"boom\")")
+        (tui:update model (make-enter-msg))
+        ;; the reply is the caught error text, rendered into the REPL pane
+        (and (search "boom" (lines-to-string (model-repl-lines model)))
+             (string= "" (tui.textarea:textarea-value ta)))))))
+
+(test "T05: note-agent-failure explains a FAILED picked agent"
+  (let ((model (make-instance 'tui-model :picked-agent "Alpha")))
+    (setf (model-agents model)
+          (list (list :name "Alpha" :status :failed :handle "subagent-1")))
+    (note-agent-failure model)
+    (and (search "Alpha failed (subagent-1)" (lines-to-string (model-scrollback model)))
+         (search "SEXPR_MODEL" (lines-to-string (model-scrollback model)))))))
 
 (test "T05: a NIL handle yields a status-bar error, not a crash"
   (multiple-value-bind (conn out)
