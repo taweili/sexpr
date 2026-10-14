@@ -166,13 +166,18 @@ cap and is committed exactly once by finalize-msg."
            ;; cells in place, leaving the slot pointing at the old head (now the tail)
            ;; and silently truncating the bounded scrollback to ONE line after every
            ;; render (only the two most recent appends ever survived).
+           ;;
+           ;; one-line is applied to in-flight content so the streaming display
+           ;; matches the committed display (append-line strips newlines). Without
+           ;; this, a streamed fragment containing a newline makes the viewport
+           ;; jump during streaming and snap back when the line is committed.
            (append (reverse (model-scrollback model))
                    (when (model-in-flight-reasoning model)
                      (list (tui:render-styled
                             (tui:make-style :foreground tui:*fg-bright-black*)
-                            (format nil "~A: ~A" :reasoning (model-in-flight-reasoning model)))))
+                            (one-line (format nil "~A: ~A" :reasoning (model-in-flight-reasoning model))))))
                    (when (model-in-flight model)
-                     (list (model-in-flight model))))))
+                     (list (one-line (model-in-flight model)))))))
       (tui.viewport:viewport-goto-bottom vp)))
   model)
 (export 'model-render-chat)
@@ -478,17 +483,18 @@ the model's picked state (S04/T05)."
 (defun agent-light (agent)
   "The green/red/yellow light for an agent-snapshot plist:
   :yellow  when :pending-approval is non-NIL (the agent is blocked on an approval)
-  :red     when :streaming is true (a stream is in flight for this agent — the true
-           busy signal, F6, replacing S04's running+live-thread heuristic)
-  :green   otherwise (idle/finished/failed/killed, or running with no in-flight stream)
+  :red     when :streaming is true (a stream is in flight) OR when :status is
+           :failed/:killed (a dead agent must be visually distinct from a live one)
+  :green   otherwise (idle/finished, or running with no in-flight stream)
 PURE and total: a missing key or a NIL AGENT degrades to :green, and nothing here
 signals. :streaming is the data-only boolean the image sets while model-step-streaming
-runs for that agent; S04's v1 heuristic is retired because a running agent with a live
-thread is not necessarily busy streaming a turn."
-  (cond
-    ((getf agent :pending-approval) :yellow)
-    ((getf agent :streaming) :red)
-    (t :green)))
+runs for that agent; :status is the worker's last announced state."
+  (let ((status (getf agent :status)))
+    (cond
+      ((getf agent :pending-approval) :yellow)
+      ((getf agent :streaming) :red)
+      ((or (eq status :failed) (eq status :killed)) :red)
+      (t :green))))
 (export 'agent-light)
 
 (defun %map-agent-row (model name fn)
@@ -1024,7 +1030,7 @@ the single `update` method owns the dispatch."
          (setf (model-in-flight-reasoning model) nil)
          (model-append-chat-line model
                                   (tui:render-styled (tui:make-style :foreground tui:*fg-bright-black*)
-                                                     (format nil "~A: ~A" :reasoning reasoning))))
+                                                     (one-line (format nil "~A: ~A" :reasoning reasoning)))))
        ;; commit the accumulated reply line as ONE scrollback line and clear the buffer
        ;; BEFORE re-rendering, so the committed line is not also shown as in-flight.
        (when line
