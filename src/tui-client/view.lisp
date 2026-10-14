@@ -380,11 +380,11 @@ Calling it with no :picked is valid and renders every row unhighlighted."
                       (:green tui:*fg-green*)
                       (:red tui:*fg-red*)
                       (:yellow tui:*fg-yellow*)))
-             (row-picked (and picked (stringp name) (string= picked name)))
-             (style (if row-picked
-                        (tui:make-style :foreground color
-                                        :background tui:*bg-blue* :bold t)
-                        (tui:make-style :foreground color)))
+             ;; All rows use the same style (foreground color only). The
+             ;; picked agent is still marked by the "*" text marker in
+             ;; agent-row-text, but no longer gets a blue background +
+             ;; bold highlight.
+             (style (tui:make-style :foreground color))
              (text (tui:render-styled style (agent-row-text agent :picked picked))))
         (push (tui:zone-mark (format nil "agent-row:~A" name) text) lines)))
     (lines-to-string (nreverse lines))))
