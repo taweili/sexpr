@@ -210,6 +210,31 @@ text are neither counted nor disturbed."
     (lines-to-string lines)))
 (export 'pad-block)
 
+(defun pad-block-rect (text width height)
+  "Pad TEXT to exactly WIDTH columns and HEIGHT rows: every line is padded to
+WIDTH, and blank WIDTH-wide lines are appended (or lines truncated) until the
+row count is exactly HEIGHT. Measured with visible-length, so ANSI escapes
+already in the text are neither counted nor disturbed.
+This is the height-fixing companion to pad-block: pad-block fixes width only,
+and join-horizontal pads the SHORTER side with bare spaces — so an agent pane
+shorter than the left column gets unbordered blank rows below the border. A
+rectangular pad BEFORE the border makes the border span the full body height."
+  (let* ((lines (tui:split-string-by-newline (or text "")))
+         (padded (mapcar (lambda (line)
+                           (let* ((n (tui:visible-length line))
+                                  (pad (max 0 (- width n))))
+                             (if (plusp pad)
+                                 (concatenate 'string line
+                                               (make-string pad :initial-element #\Space))
+                                 line)))
+                         lines))
+         (blank (make-string width :initial-element #\Space)))
+    (loop while (< (length padded) height)
+          do (setf padded (append padded (list blank))))
+    (setf padded (subseq padded 0 (min height (length padded))))
+    (lines-to-string padded)))
+(export 'pad-block-rect)
+
 ;;;; --- panes -------------------------------------------------------------
 ;;;
 ;;; The five fixed numbers below are layout-dimensions of an 80x24 terminal: the
@@ -494,7 +519,9 @@ occupies the strip; when nil the strip still takes its row (see *chrome-rows*), 
 the frame height does not move when an approval arrives or clears.
 CHAT-FOCUSED and REPL-FOCUSED color the matching section's border in *focus-color,
 so the operator can see which input takes the next key even with both inputs
-empty. Both false is valid: nothing is highlighted.
+empty. Both false is valid: nothing is highlighted. The agent pane is always
+bordered but never colored — it is read-only, so its plain border is the
+contrast that makes the focused pane's cyan border stand out.
 WIDTH and HEIGHT are the terminal size in columns and rows. Every pane size is
 derived from them by layout-dimensions, and every block is padded to its allotted
 width with pad-block, so the frame comes out exactly WIDTH by HEIGHT. This is the
@@ -504,17 +531,31 @@ Borderless strings are passed through unchanged. The 4-argument call is still
 valid: APPROVAL-LINE, both focus flags and both sizes are optional."
   (multiple-value-bind (chat-w agent-w chat-h repl-h agent-h)
       (layout-dimensions width height)
-    (declare (ignore chat-h repl-h agent-h))
+    (declare (ignore agent-h))
     (let* ((left-width (+ chat-w 2))
+           ;; the body height is the left column height: two sections, each
+           ;; viewport-height + *section-overhead*. The agent pane's border
+           ;; must span this height so it visually encloses the same rows.
+           (body-height (+ chat-h repl-h (* 2 *section-overhead*)))
            (left (tui:join-vertical :left
                                      (render-section "chat" chat-body :focused chat-focused
                                                      :width left-width)
                                      (render-section "repl" repl-body :focused repl-focused
                                                      :width left-width)))
+           ;; The agent pane gets a border (same *border* style as the
+           ;; sections) so all three panes have visible frames. The agent is
+           ;; read-only — never focused — so its border is always plain (no
+           ;; *focus-color*). The content is padded to a rectangle of
+           ;; (agent-w - 2) x (body-height - 2) BEFORE the border is applied,
+           ;; so the border's top and bottom rows reach the full body height.
+           (agent-pane (tui:render-border
+                        (pad-block-rect (or agent-body
+                                            (render-agent-rows nil))
+                                        (- agent-w 2)
+                                        (- body-height 2))
+                        *border*))
            (body (tui:join-horizontal :top left
-                                      (pad-block (or agent-body
-                                                     (render-agent-rows nil))
-                                                 agent-w)))
+                                      agent-pane))
            (frame (tui:join-vertical :left body
                                      (pad-block (or approval-line " ")
                                                 left-width)

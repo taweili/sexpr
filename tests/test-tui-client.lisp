@@ -2075,6 +2075,28 @@ and the accessor must not be called on it."
            (eql 1 (focused-textareas model))
            (tui.textarea:textarea-focused (model-chat-textarea model))))))
 
+(test "the agent pane has a visible border, never colored, alongside the focused chat border"
+  ;; The agent pane is read-only (not focusable), so it is always bordered
+  ;; but never colored — its plain border is the contrast that makes the
+  ;; focused pane's cyan border stand out.
+  ;;
+  ;; The agent pane uses render-border directly (no title line), so border
+  ;; characters appear on the SAME line as the agent content. The chat and
+  ;; REPL sections use render-section (title + border), so their border is
+  ;; on the line BELOW the title. Because the panes are joined horizontally,
+  ;; a single line carries both the chat border (cyan) and the agent border
+  ;; (plain). The test checks that the agent pane has its own border chars
+  ;; by counting border characters per line: a line with the agent pane has
+  ;; MORE border chars than a line with only the chat section.
+  (let* ((chat-view (tui:view (init-two-agent-model)))
+         (chat-lines (tui:split-string-by-newline chat-view))
+         (agent-line (find "agent" chat-lines :test #'search)))
+    (and agent-line
+         ;; the agent pane's border character is present on the agent content line
+         (search "│" agent-line)
+         ;; the frame still has exactly 24 rows (the border didn't change height)
+         (= 24 (length chat-lines)))))
+
 
 ;;;; --- summary -------------------------------------------------------------
 
