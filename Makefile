@@ -12,6 +12,14 @@ SYSTEM    := sexpr
 CHAT_ARGS ?= --goal "pair programmer"
 TUI_ARGS  ?=
 
+# Provider defaults — exported so every target that launches SBCL or
+# sexpr-tui.sh inherits them. Caller-set values pass through unchanged
+# (?= only assigns when the var is not already set).
+SEXPR_PROVIDER ?= openai-compatible
+SEXPR_BASE_URL ?= http://localhost:6969/v1
+SEXPR_MODEL    ?= Qwythos-9B-v2
+export SEXPR_PROVIDER SEXPR_BASE_URL SEXPR_MODEL
+
 .PHONY: hello test load build chat tui sexpr-tui verify verify-wrapper diagnostic-tool-call diagnostic-live-round test-live clean help
 
 hello:

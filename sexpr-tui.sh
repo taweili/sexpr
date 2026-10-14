@@ -24,6 +24,9 @@
 #   SEXPR_TUI_READY_TIMEOUT  seconds to wait       (default 120)
 #   SEXPR_TUI_SBCL           sbcl binary           (default sbcl)
 #   SEXPR_TUI_SBCLINIT       sbcl init file        (default ~/.sbclinit)
+#   SEXPR_PROVIDER           provider name         (default openai-compatible)
+#   SEXPR_BASE_URL           provider base URL     (default http://localhost:6969/v1)
+#   SEXPR_MODEL              model name            (default Qwythos-9B-v2)
 #
 # OWNERSHIP: "server running" means the SWANK port accepts a TCP connection.
 # The wrapper starts an image only when that fails, and tears down only an
@@ -66,6 +69,13 @@ READY_TIMEOUT="${SEXPR_TUI_READY_TIMEOUT:-120}"
 SBCL="${SEXPR_TUI_SBCL:-sbcl}"
 SBCLINIT="${SEXPR_TUI_SBCLINIT:-$HOME/.sbclinit}"
 
+# Provider defaults — same three vars sexpr.sh exports, so the image's
+# configure-provider and the greeter's model call succeed without the
+# operator setting anything. Caller-set values pass through unchanged.
+export SEXPR_PROVIDER="${SEXPR_PROVIDER:-openai-compatible}"
+export SEXPR_BASE_URL="${SEXPR_BASE_URL:-http://localhost:6969/v1}"
+export SEXPR_MODEL="${SEXPR_MODEL:-Qwythos-9B-v2}"
+
 SERVER_PID=""
 CLIENT_PID=""
 SERVER_FIFO=""
@@ -98,6 +108,9 @@ environment (override with `VAR=value ./sexpr-tui.sh ...`):
   SEXPR_TUI_READY_TIMEOUT   seconds to wait       (default 120)
   SEXPR_TUI_SBCL            sbcl binary           (default sbcl)
   SEXPR_TUI_SBCLINIT        sbcl init file        (default ~/.sbclinit)
+  SEXPR_PROVIDER            provider name         (default openai-compatible)
+  SEXPR_BASE_URL            provider base URL     (default http://localhost:6969/v1)
+  SEXPR_MODEL               model name            (default Qwythos-9B-v2)
 
 sexpr-tui args (forwarded verbatim):
   --agent NAME             agent name to pick on connect
