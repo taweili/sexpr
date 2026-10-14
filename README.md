@@ -19,6 +19,7 @@
 - [Chat interface](#chat-interface)
 - [REPL](#repl)
 - [Remote TUI](#remote-tui)
+- [Operation manuals](#operation-manuals)
 - [Building the binary](#building-the-binary)
 - [Status](#status)
 - [Open questions](#open-questions)
@@ -163,6 +164,16 @@ budget. The model is a socket. Budgets are dynamic variables. Interrupts come
 for free because everything is a thread in one image — a human can drop into
 any agent's debugger, patch a function, and let it continue.
 
+## Operation manuals
+
+`docs/` holds the operation manuals — practical references for running the
+binary and the TUI, distinct from the design documents in `notes/`.
+
+| File | What it covers |
+|------|---------------|
+| [`docs/sexpr.md`](docs/sexpr.md) | Operating the `sexpr` binary and the `./sexpr.sh` wrapper: model configuration, chat flags and slash commands, the REPL, examples, and Make targets. **The how-to-run reference.** |
+| [`docs/sexpr-tui.md`](docs/sexpr-tui.md) | Operating `./sexpr-tui.sh`: the two channels, flags, environment, layout, keybindings, lifecycle, and troubleshooting. **The how-to-run-the-TUI reference.** |
+
 ## Repository
 
 ```
@@ -301,6 +312,9 @@ rebinding — `(let ((*model-endpoint* (make-provider :ollama))) ...)` — the
 central design invariant.
 
 ## Chat interface
+
+> Full flag list, slash commands, the REPL, examples, and Make targets:
+> [`docs/sexpr.md`](docs/sexpr.md) (operation manual).
 
 `sexpr.cli` is the Listener — the terminal front end. The image is the
 state; the transcript is its conversation slice; the model is a socket
@@ -442,6 +456,10 @@ key is needed. Reach it by evaluating a `provider-call` form yourself.
   a trailing `NIL`.
 
 ## Remote TUI
+
+> Full flags, environment, layout, keybindings, and troubleshooting:
+> [`docs/sexpr-tui.md`](docs/sexpr-tui.md) (operation manual). Design:
+> [`notes/tui.md`](notes/tui.md).
 
 The TUI is a separate process (`:sexpr-tui`, cl-tuition) that renders a
 projection of a running image. It does not carry the kernel — the two
