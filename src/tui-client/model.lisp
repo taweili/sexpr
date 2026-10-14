@@ -100,6 +100,12 @@ own scrollback line, so a streamed sentence renders as ONE growing line rather t
 one word per line (research F5). The value is committed to the scrollback as a single
 line by finalize-msg and cleared; model-switch-agent clears it too, because a
 half-streamed line for the old agent must never bleed into the new transcript.")
+   (in-flight-reasoning :initform nil :accessor model-in-flight-reasoning
+              :documentation "The growing reasoning/thinking line, separate from
+the model's actual reply. :reasoning deltas accumulate here instead of in
+model-in-flight, so the TUI can render the thinking block in grey and keep it
+visually distinct from the reply. Committed as a separate scrollback line by
+finalize-msg, before the reply line.")
    (scrollback-cap :initarg :scrollback-cap :initform *scrollback-cap* :accessor model-scrollback-cap)
    (repl-lines :initform nil :accessor model-repl-lines
                :documentation "The REPL output lines, newest first, bounded by repl-cap.")
@@ -161,6 +167,10 @@ cap and is committed exactly once by finalize-msg."
            ;; and silently truncating the bounded scrollback to ONE line after every
            ;; render (only the two most recent appends ever survived).
            (append (reverse (model-scrollback model))
+                   (when (model-in-flight-reasoning model)
+                     (list (tui:render-styled
+                            (tui:make-style :foreground tui:*fg-bright-black*)
+                            (format nil "~A: ~A" :reasoning (model-in-flight-reasoning model)))))
                    (when (model-in-flight model)
                      (list (model-in-flight model))))))
       (tui.viewport:viewport-goto-bottom vp)))
@@ -201,14 +211,25 @@ the one projection that turns them into text. It prints the TYPE and then the ev
 own text, which is the least-lossy rendering available client-side without knowing the
 in-image event vocabulary:
   user   -> (getf event :content)
-  model  -> (getf event :content)
+  model  -> (getf event :content), with reasoning (if present) in grey above
   result -> (getf event :text)   (the printed projection, R023)
 A missing or malformed event degrades to a line, never a condition: a single bad event
 in a 10x burst must not blank the transcript."
-  (let ((text (or (getf event :content)
-                  (getf event :text)
-                  (when (stringp event) event))))
-    (format nil "~A: ~A" (getf event :type :event) (or text ""))))
+  (let* ((text (or (getf event :content)
+                   (getf event :text)
+                   (when (stringp event) event)))
+         (reasoning (getf event :reasoning)))
+    ;; If the model event carries a reasoning (thinking) block, render it
+    ;; in grey (bright-black) as a separate line BEFORE the actual reply.
+    ;; The two are separate fields in the provider's response, so the
+    ;; thinking block is never mixed into the reply text.
+    (if (and reasoning (stringp reasoning) (string/= reasoning ""))
+        (format nil "~A: ~A~%~A: ~A"
+                :reasoning (tui:render-styled
+                             (tui:make-style :foreground tui:*fg-bright-black*)
+                             reasoning)
+                (getf event :type :event) (or text ""))
+        (format nil "~A: ~A" (getf event :type :event) (or text "")))))
 (export 'event-to-line)
 
 ;;;; --- RPC -------------------------------------------------------------
@@ -618,7 +639,8 @@ signalled."
           (model-scrollback model) nil
           ;; a half-streamed line for the OLD agent must never bleed into the new
           ;; transcript; drop it rather than commit a partial line under the wrong agent.
-          (model-in-flight model) nil)
+          (model-in-flight model) nil
+          (model-in-flight-reasoning model) nil)
     (let ((vp (model-chat-viewport model)))
       (when vp (tui.viewport:viewport-set-content vp "")))
     (multiple-value-bind (events cursor error)
@@ -971,23 +993,39 @@ the single `update` method owns the dispatch."
        (when (or (null agent)
                  (null (model-picked-agent model))
                  (string= agent (model-picked-agent model)))
-         (if (eq kind :tool)
-             ;; a tool's streamed output is its own committed line, never joined into
-             ;; the model's in-flight prose line.
-             (model-append-chat-line model (format nil "tool: ~A" (or content "")))
-             ;; model prose ACCUMULATES into one growing line and re-renders ONCE,
-             ;; so a streamed sentence is one line, not one word per line (F5).
-             (progn
-               (setf (model-in-flight model)
-                     (concatenate 'string (or (model-in-flight model) "")
-                                  (or content "")))
-               (model-render-chat model))))
+         (cond
+           ((eq kind :tool)
+            ;; a tool's streamed output is its own committed line, never joined into
+            ;; the model's in-flight prose line.
+            (model-append-chat-line model (format nil "tool: ~A" (or content ""))))
+           ((eq kind :reasoning)
+            ;; Reasoning/thinking blocks accumulate into a SEPARATE buffer and
+            ;; render in grey, distinct from the model's actual reply.
+            (setf (model-in-flight-reasoning model)
+                  (concatenate 'string (or (model-in-flight-reasoning model) "")
+                               (or content "")))
+            (model-render-chat model))
+           (t
+            ;; model prose ACCUMULATES into one growing line and re-renders ONCE,
+            ;; so a streamed sentence is one line, not one word per line (F5).
+            (setf (model-in-flight model)
+                  (concatenate 'string (or (model-in-flight model) "")
+                               (or content "")))
+            (model-render-chat model))))
        (values model nil)))
     ;; push channel: the streaming turn ended — commit the in-flight line (S05)
     ((finalize-msg-p msg)
      (let ((agent (finalize-msg-agent msg))
-           (line (model-in-flight model)))
-       ;; commit the accumulated line as ONE scrollback line and clear the buffer
+           (line (model-in-flight model))
+           (reasoning (model-in-flight-reasoning model)))
+       ;; commit the reasoning line FIRST (if any), then the reply line, so
+       ;; the thinking block appears above the reply in the scrollback.
+       (when reasoning
+         (setf (model-in-flight-reasoning model) nil)
+         (model-append-chat-line model
+                                  (tui:render-styled (tui:make-style :foreground tui:*fg-bright-black*)
+                                                     (format nil "~A: ~A" :reasoning reasoning))))
+       ;; commit the accumulated reply line as ONE scrollback line and clear the buffer
        ;; BEFORE re-rendering, so the committed line is not also shown as in-flight.
        (when line
          (setf (model-in-flight model) nil)

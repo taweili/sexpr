@@ -268,7 +268,7 @@ write_server_boot() {
 ;;;; is never blocked or failed by it. The worker announces its status on
 ;;;; the push channel as it starts and finishes, so the TUI's agent pane
 ;;;; shows IDLE (not a stale RUNNING) once the greeter's turn is done.
-(let ((greeter (sexpr.tui:spawn "hello world")))
+(let ((greeter (sexpr.tui:spawn "hello world" :capabilities '(:fs-read :lisp-eval))))
   (sexpr.tui:inject-note greeter "hello world"))
 EOF
     printf '%s' "$boot"

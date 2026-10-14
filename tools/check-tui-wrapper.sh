@@ -133,7 +133,9 @@ need '(sexpr.provider:configure-provider)' "$b"
 # A fresh image is an empty society; the boot file seeds the default agent
 # the TUI picks on first connect (goal "hello world"), with the same
 # "hello world" user line the kernel's user-speaks-first convention needs.
-need '(sexpr.tui:spawn "hello world")' "$b"
+need 'sexpr.tui:spawn' "$b"
+need '"hello world"' "$b"
+need ':lisp-eval' "$b"
 need '(sexpr.tui:inject-note greeter "hello world")' "$b"
 
 echo

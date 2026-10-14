@@ -104,14 +104,18 @@ reader-safety boundary."
   (list :type +event-type-user+ :content content))
 (export 'make-user-event)
 
-(defun make-model-event (content &key tool-calls model usage finish)
+(defun make-model-event (content &key reasoning tool-calls model usage finish)
   "Build a model event from the fields of a sexpr.provider:provider-call node.
 
 KEYWORD arguments mirror the provider-call return shape
-(:content / :tool-calls / :model / :usage / :finish) one-for-one, so the
-kernel's conversion stays a straight copy with no knowledge of the transport."
+(:content / :reasoning / :tool-calls / :model / :usage / :finish) one-for-one,
+so the kernel's conversion stays a straight copy with no knowledge of the
+transport. REASONING carries the model's thinking block (reasoning_content)
+separate from the actual reply content — nil for models that do not produce
+reasoning_content."
   (list :type +event-type-model+
         :content content
+        :reasoning reasoning
         :tool-calls tool-calls
         :model model
         :usage usage

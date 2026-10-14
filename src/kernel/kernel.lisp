@@ -282,6 +282,7 @@ calls the model returns is run-until-finished's job, not this one's."
                 :system (or (agent-system agent) (agent-goal agent))
                 :tools (sexpr.tools:tool-schema-list))))
     (make-model-event (getf node :content)
+                      :reasoning (getf node :reasoning)
                       :tool-calls (getf node :tool-calls)
                       :model (getf node :model)
                       :usage (getf node :usage)
@@ -394,6 +395,17 @@ tell a completed stream from a stalled one (F3). Each :delta is marked
                    :while chunk
                    :do (setf last-chunk chunk)
                        (setf tokens-used (%stream-chunk-tokens chunk tokens-used))
+                       ;; Reasoning deltas (thinking blocks) are emitted
+                       ;; with :kind :reasoning so the TUI can render them
+                       ;; in grey, separate from the actual model reply.
+                       (when (and (cl-llm-provider:chunk-reasoning-delta chunk)
+                                  (stringp (cl-llm-provider:chunk-reasoning-delta chunk))
+                                  (string/= (cl-llm-provider:chunk-reasoning-delta chunk) ""))
+                         (emit-event agent-id
+                                     (list :type :delta
+                                           :agent-id agent-id
+                                           :kind :reasoning
+                                           :chunk-delta (cl-llm-provider:chunk-reasoning-delta chunk))))
                        (emit-event agent-id
                                    (list :type :delta
                                          :agent-id agent-id
@@ -430,6 +442,8 @@ tell a completed stream from a stalled one (F3). Each :delta is marked
     (append
      (make-model-event
       (cl-llm-provider:stream-accumulated-content stream)
+      :reasoning (let ((r (cl-llm-provider:stream-accumulated-reasoning stream)))
+                   (when (and r (string/= r "")) r))
       :tool-calls (mapcar (lambda (tc)
                             (list :id (cl-llm-provider:tool-call-id tc)
                                   :name (cl-llm-provider:tool-call-name tc)

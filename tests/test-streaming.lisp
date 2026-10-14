@@ -105,6 +105,9 @@ the same shape the provider's real readers establish."))
 (defmethod cl-llm-provider:stream-accumulated-content ((stream fake-stream))
   (fake-content stream))
 
+(defmethod cl-llm-provider:stream-accumulated-reasoning ((stream fake-stream))
+  nil)  ; fake-stream tests don't carry reasoning content
+
 (defun make-fake-chunk (delta &key (finish-reason nil) (usage nil))
   "A real cl-llm-provider:stream-chunk so chunk-delta is read natively."
   (make-instance 'cl-llm-provider:stream-chunk
