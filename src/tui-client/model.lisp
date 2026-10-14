@@ -826,22 +826,27 @@ is rendered locally; a reply only appears if the agent is actually running.
 (export 'send-chat-note)
 
 (defun send-repl-form (model)
-  "Send a REPL form to the image, wrapped in a let that binds
-`sexpr.repl:*agent*` to the picked agent. The form is eval'd synchronously
-and the result is rendered into the REPL pane.
+  "Send a REPL form to the image, wrapped so it evaluates in COMMON-LISP-USER.
+The result is rendered into the REPL pane.
 
-The form is evaluated with :package \"COMMON-LISP-USER\": the default
-SWANK-IO-PACKAGE has no LET (the image log showed 'SWANK-IO-PACKAGE::LET is
-undefined' for an unqualified form — the error that froze the TUI). The
-operator's own symbols read correctly in CL-USER, and the sexpr.* names in
-the wrapper are qualified regardless.
+SWANK READS THE :emacs-rex PACKET IN SWANK-IO-PACKAGE (a package with
+:use '() — no CL symbols at all). The :package argument only sets
+*buffer-package*, NOT *package*, so eval-for-emacs evaluates the form in
+SWANK-IO-PACKAGE where LET, +, FORMAT etc. are all undefined. The existing
+RPCs survive because they use fully-qualified symbols (sexpr.tui:...),
+but the REPL form uses unqualified CL symbols.
 
-The form is wrapped in HANDLER-CASE: an erroring form must show its error in
-the REPL pane, not drop the image into the interactive debugger. Without the
-wrapper, a form like (car 5) signals an error during the RPC eval, swank enters
-the debugger and blocks the connection thread, and the TUI freezes forever —
-the 'repl would freeze the program' report. With the wrapper the error is
-caught and returned as text, so the connection stays responsive."
+The fix: every CL symbol in the wrapper is fully qualified (cl:let,
+cl:find-package, cl:eval, cl:read-from-string, cl:handler-case, etc.).
+The user's form is sent as a STRING and read by cl:read-from-string AFTER
+*package* is bound to COMMON-LISP-USER, so its unqualified symbols resolve
+in CL-USER. The agent binding (sexpr.repl:*agent*) is a special variable,
+visible to cl:eval.
+
+HANDLER-CASE: an erroring form must show its error in the REPL pane, not
+drop the image into the interactive debugger. Without the wrapper, a form
+like (car 5) signals an error during eval, swank enters the debugger and
+blocks the connection thread, and the TUI freezes forever."
   (let* ((ta (model-repl-textarea model))
          (text (and ta (tui.textarea:textarea-value ta))))
     (cond
@@ -855,13 +860,20 @@ caught and returned as text, so the connection stays responsive."
             (note-error model "no swank connection — cannot eval")
             (values model nil))
            (t
-            (let ((form-text (format nil "(let ((sexpr.repl:*agent* (gethash ~A sexpr.agents:*agent-table*))) (handler-case ~A (error (e) (format nil \"ERR: ~~A\" e))))"
-                                    (swank-escape-string (or name ""))
-                                    text)))
+            ;; Every CL symbol is qualified because the packet is read in
+            ;; SWANK-IO-PACKAGE (no CL use). The user's form is a STRING,
+            ;; read by cl:read-from-string after *package* is bound to
+            ;; COMMON-LISP-USER, so unqualified symbols resolve correctly.
+            (let ((form-text
+                    (format nil
+                            "(cl:let ((*package* (cl:find-package \"COMMON-LISP-USER\"))~@
+                             (sexpr.repl:*agent* (cl:gethash ~A sexpr.agents:*agent-table*)))~@
+                             (cl:handler-case (cl:eval (cl:read-from-string ~A))~@
+                             (cl:error (e) (cl:format nil \"ERR: ~~A\" e))))"
+                            (swank-escape-string (or name ""))
+                            (swank-escape-string text))))
               (multiple-value-bind (value error)
-                  ;; :package COMMON-LISP-USER — see the docstring: the default
-                  ;; SWANK-IO-PACKAGE cannot read the unqualified let.
-                  (swank-rpc conn form-text :package "COMMON-LISP-USER")
+                  (swank-rpc conn form-text)
                 (model-append-repl-line model
                                         (format nil "~A=> ~A" text
                                                 (if error

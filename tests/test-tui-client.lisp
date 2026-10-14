@@ -1307,16 +1307,21 @@ can assert on the packet text the model wrote."
         (tui.textarea:textarea-set-value ta "(+ 1 2)")
         (tui:update model (make-enter-msg))
         (let ((packet-text (get-output-stream-string out)))
-          (and (search "let" packet-text)
+          (and (search "cl:let" packet-text)
                (search "sexpr.repl:*agent*" packet-text)
                (search "Alpha" packet-text)
                (search "sexpr.agents:*agent-table*" packet-text)
                (search "(+ 1 2)" packet-text)
-               ;; the freeze fix: the form is evaluated in COMMON-LISP-USER and
-               ;; wrapped in HANDLER-CASE so an erroring form cannot drop the
-               ;; image into the debugger
+               ;; the REPL wrapper qualifies every CL symbol because swank
+               ;; reads the packet in SWANK-IO-PACKAGE (no CL use). The user's
+               ;; form is sent as a STRING read by cl:read-from-string AFTER
+               ;; *package* is bound to COMMON-LISP-USER, so unqualified
+               ;; symbols like + resolve in CL-USER.
+               (search "cl:find-package" packet-text)
+               (search "cl:read-from-string" packet-text)
+               (search "cl:eval" packet-text)
                (search "COMMON-LISP-USER" packet-text)
-               (search "handler-case" packet-text)
+               (search "cl:handler-case" packet-text)
                (string= "" (tui.textarea:textarea-value ta))
                ;; model-repl-lines is a LIST of lines; join before searching.
                (search "result" (lines-to-string (model-repl-lines model))))))))
