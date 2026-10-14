@@ -177,7 +177,8 @@ binary and the TUI, distinct from the design documents in `notes/`.
 ## Repository
 
 ```
-sexpr.asd              ASDF system definition
+sexpr.asd              ASDF system definition (:sexpr + :sexpr/tests)
+sexpr-tui.asd          the TUI client system (:sexpr-tui, cl-tuition)
 src/
   package.lisp         :sexpr package
   sexpr.lisp           identity + `hello' entry point; test-op method
@@ -186,13 +187,23 @@ src/
     provider.lisp      provider-call GF + configuration (cl-llm-provider transport)
   transcript/          events, print/read round-trip, the GC substrate
   kernel/              the agent: budget, transcript, model-step, run-until-finished
-  cli/                 the Listener: chat loop, slash commands, SIGINT, argv/main/build
+  agents/              the multi-agent registry (*agent-table*, subagent registry)
+  cli/                 the Listener: chat loop, slash commands, SIGINT, argv/main/build (R015: never :use :sexpr.provider)
   tools/               the tool registry (register-tool!, derive-schema, dispatch)
-  builtins/            the five registered tools (read-file, write-file, edit-file, shell, lisp)
+  builtins/            the registered tools (read-file, write-file, edit-file, shell, lisp)
   sandbox/             the restricted-read eval sandbox (eclector, locked package, eval timeout)
-qlfile                 Qlot deps (cl-llm-provider, eclector, rove)
-Makefile               `make hello`, `make test`, `make build`, `make chat`, `make verify`, `make clean`
-notes/
+  repl/                the developer REPL (escapes chat via /repl; standalone via `sexpr.sh repl`)
+  tui/                 the image-side TUI package (sexpr.tui: swank + push server, snapshot/delta)
+  tui-client/          the client process (cl-tuition; projections, never live objects)
+sexpr.sh               local-dev wrapper (rlwrap + provider/model/capability defaults)
+sexpr-tui.sh           TUI launcher (starts the image if needed, runs the client)
+qlfile                 Qlot deps (cl-llm-provider, eclector, rove, cl-tuition)
+Makefile               `make hello|test|build|chat|verify|sexpr-tui|verify-wrapper|clean`
+tests/                 the rove test suite (cli, kernel, provider, transcript, tools, sandbox, repl, tui)
+tools/                 diagnostic probes + wrapper checks
+examples/              standalone .lisp examples (run via `sexpr.sh example`)
+docs/                  operation manuals (see § Operation manuals)
+notes/                 design notes + research base (see below)
   sexpr.md             — thesis, layer-by-layer mapping, open questions
   agent.md             — 2025 harness research (context engineering, skills, MCP)
   symbolics-lisp.md    — Symbolics / Genera / Dynamic Windows lineage
@@ -272,6 +283,17 @@ Load into an interactive session for development:
 make load
 # type: (sexpr:hello)
 ```
+
+Run the test suite (rove; lives in `tests/`, declared as the separate
+`:sexpr/tests` system):
+
+```sh
+make test
+```
+
+The TUI client (`:sexpr-tui`) depends on **cl-tuition**, which is in the
+Quicklisp dist — no vendoring needed. `./sexpr-tui.sh` quickloads it at
+runtime, so there is no separate TUI binary to build.
 
 ## Model provider
 

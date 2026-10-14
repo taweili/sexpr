@@ -11,8 +11,11 @@ it beats being clever.
 - **SBCL** + **Quicklisp** + **ASDF**. No other implementation is
   supported; do not add portability guards or `#+sbcl` noise preemptively.
 - External deps live in `qlfile` (Qlot) and in
-  `~/quicklisp/local-projects/` for anything not in the dist. The only
-  current dep is **cl-llm-provider** — see the boundary rules below.
+  `~/quicklisp/local-projects/` for anything not in the dist. Current deps:
+  **cl-llm-provider** (the LLM transport; vendored — not in the dist),
+  **eclector** (sandbox reader), **rove** (test framework), and
+  **cl-tuition** (the TUI client library, used by `:sexpr-tui` only —
+  see the boundary rules below and `sexpr-tui.asd`).
 - License is **GPL-3.0-or-later**. Every new source file must carry the
   SPDX header (see *Conventions*); `.gitignore`d agent cruft is
   `Unlicense`d.
@@ -20,34 +23,72 @@ it beats being clever.
 ## Commands
 
 ```sh
-make hello    # non-interactive smoke test: quickload + (sexpr:hello)
-make load     # interactive SBCL with the system loaded
-make clean    # strip fasls / qlot workdirs
-asdf:test-op  # runs (sexpr:hello); defined as a method in src/sexpr.lisp
+make hello              # non-interactive smoke test: quickload + (sexpr:hello)
+make test               # run the rove test suite (asdf:test-op -> :sexpr/tests)
+make load               # interactive SBCL with the system loaded
+make build              # produce ./sexpr via save-lisp-and-die (depends on test)
+make chat               # run ./sexpr (override with CHAT_ARGS='...')
+make tui                # run the sexpr-tui client only (args via TUI_ARGS)
+make sexpr-tui          # start the image if needed, then run the TUI (./sexpr-tui.sh)
+make verify             # binary probes: --help, scripted session, --capability,
+                        #   cross-process --load, R015 seam (depends on build)
+make verify-wrapper     # wrapper-only checks: default caps + TUI launcher (no SBCL)
+make diagnostic-tool-call   # probe a live local server for a usable :tool-calls node
+make diagnostic-live-round  # in-process live turn: assert recorded events + live :value
+make test-live          # ./sexpr against the live local model; structural transcript check
+make clean              # strip ./sexpr, fasls, qlot workdirs
+make help               # list targets
 ```
 
-There is no test suite yet. When you add one, wire it through the same
-`asdf:perform` method (the ASDF bundled with Quicklisp miscompiles inline
-`:perform` bodies once a system has real deps — that is why `sexpr.lisp`
-defines the method rather than inlining it; do not "fix" this).
+The test suite is **rove**, declared as the separate `:sexpr/tests` system in
+`sexpr.asd` (a secondary system wired into `:sexpr`'s `:in-order-to`, so
+ASDF plans it as a real dependency of `test-op` rather than a recursive
+`operate`). Tests live in `tests/` — one file per module (`cli`, `kernel`,
+`provider`, `transcript`, `tools`, `sandbox`, `repl`, plus the TUI tests
+`tui`, `tui-client`, `tui-integration`, `test-event-bus`,
+`test-push-server`, `test-streaming`, `test-swank-rpc`). When you add one,
+wire it through the same `asdf:perform` method (the ASDF bundled with
+Quicklisp miscompiles inline `:perform` bodies once a system has real deps
+— that is why `sexpr.lisp` defines the method rather than inlining it; do
+not "fix" this).
 
-`hello-llm` talks to a local OpenAI-compatible endpoint
+`make hello` runs `sexpr:hello` — the smoke-test entry point (proves the
+system loads; no model call). `hello-llm` in `src/sexpr.lisp` is a separate
+live-transport probe: it hardcodes a local OpenAI-compatible endpoint
 (`http://localhost:6969/v1`, model `Gemma-4-E2B-it`, api key `sk-12345`)
-to exercise the transport end-to-end. Do not change those defaults
-casually — they are load-bearing for smoke tests.
+to exercise the `provider-call` path end to end. Those hardcoded values are
+specific to `hello-llm`, not the project defaults (the Makefile and
+`sexpr.sh` default to `Qwythos-9B-v2`); do not change them casually — they
+are load-bearing for that probe.
 
 ## Source layout
 
 ```
-sexpr.asd               system definition (single system, submodules)
-src/package.lisp        :sexpr package (nickname :$)
-src/sexpr.lisp          identity, hello, hello-llm, asdf test-op method
+sexpr.asd                    system definition (:sexpr + :sexpr/tests)
+sexpr-tui.asd                the TUI client system (:sexpr-tui, cl-tuition)
+src/package.lisp             :sexpr package (nickname :$)
+src/sexpr.lisp               identity, hello, hello-llm, asdf test-op method
 src/provider/package.lisp    :sexpr.provider (nickname :$.provider)
 src/provider/provider.lisp   the "Ivory" layer — provider-call boundary
-src/transcript/         events, print/read round-trip, the GC substrate
-src/kernel/             the agent: budget, transcript, model-step, run-until-finished
-src/cli/                the Listener: chat loop, slash commands, SIGINT turn-abort, parse-args/main/build (R015: never :use :sexpr.provider)
-notes/                  design notes + research base (see below)
+src/transcript/              events, print/read round-trip, the GC substrate
+src/kernel/                  the agent: budget, transcript, model-step, run-until-finished
+src/agents/                  the multi-agent registry (*agent-table*, subagent registry)
+src/cli/                     the Listener: chat loop, slash commands, SIGINT turn-abort, parse-args/main/build (R015: never :use :sexpr.provider)
+src/tools/                   the tool registry (register-tool!, derive-schema, dispatch)
+src/builtins/                the registered tools (read-file, write-file, edit-file, shell, lisp)
+src/sandbox/                 the restricted-read eval sandbox (eclector, locked package, eval timeout)
+src/repl/                    the developer REPL (escapes chat via /repl; standalone via sexpr.sh repl)
+src/tui/                     the image-side TUI package (sexpr.tui: swank + push server, snapshot/delta)
+src/tui-client/              the client process (cl-tuition; projections, never live objects)
+sexpr.sh                     local-dev wrapper (rlwrap + provider/model/capability defaults)
+sexpr-tui.sh                 TUI launcher (starts the image if needed, runs the client)
+qlfile                       Qlot deps (cl-llm-provider, eclector, rove, cl-tuition)
+Makefile                     build/run targets (see Commands)
+tests/                       the rove test suite (one file per module)
+tools/                       diagnostic probes + wrapper checks
+examples/                    standalone .lisp examples (run via sexpr.sh example)
+docs/                        operation manuals (docs/sexpr.md, docs/sexpr-tui.md)
+notes/                       design notes + research base (see below)
 ```
 
 `src/cli/` (the Listener) is provider-agnostic by construction (R015):
@@ -56,6 +97,11 @@ notes/                  design notes + research base (see below)
 `run-until-finished` → `model-step` → `provider-call`; the single qualified
 `sexpr.provider:configure-provider` reference (for `--provider`/`--model`)
 is the only place the Listener names the transport.
+
+`src/tui-client/` loads `:sexpr-tui` only (see `sexpr-tui.asd`) —
+depending on `:sexpr` would pull the kernel into the client process and
+create a second society (R023). The client holds projections and object
+IDs, never live objects.
 
 `notes/` is the reference literature for the project, not commentary.
 `notes/sexpr.md` is the design thesis and the layer-by-layer mapping
