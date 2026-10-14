@@ -6,7 +6,7 @@
 
 (defsystem "sexpr"
   :name "sexpr"
-  :version "0.0.0"
+  :version "0.1.0"
   :author "David Li <taweili@gmail.com>"
   :license "GPL-3.0-or-later"
   :description "sexpr — an Agent OS in Common Lisp."
@@ -97,7 +97,7 @@
 
 (defsystem "sexpr/tests"
   :name "sexpr/tests"
-  :version "0.0.0"
+  :version "0.1.0"
   :author "David Li <taweili@gmail.com>"
   :license "GPL-3.0-or-later"
   :description "Test suite for sexpr (rove)."

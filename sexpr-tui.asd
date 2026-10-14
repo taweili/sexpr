@@ -16,7 +16,7 @@
 
 (defsystem "sexpr-tui"
   :name "sexpr-tui"
-  :version "0.0.0"
+  :version "0.1.0"
   :author "David Li <taweili@gmail.com>"
   :license "GPL-3.0-or-later"
   :description "sexpr-tui — remote TUI client for a running sexpr image."

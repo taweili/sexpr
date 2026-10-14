@@ -11,7 +11,7 @@
 ;;; --- identity ---------------------------------------------------------
 
 (defparameter *name*    "sexpr")
-(defparameter *version* "0.0.0")
+(defparameter *version* "0.1.0")
 
 (defun name ()
   "Return the project name."
