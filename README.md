@@ -1,6 +1,6 @@
 # sexpr — an Agent OS in Common Lisp
 
-![sexpr](sexpr.png)
+![sexpr](./medias/sexpr.png)
 
 > The agent runtime *is* a living Lisp image. The harness is not scaffolding around
 > intelligence — it is the operating environment in which intelligence is a
@@ -476,6 +476,8 @@ key is needed. Reach it by evaluating a `provider-call` form yourself.
 - **Nil is suppressed.** A form returning a single `NIL` prints nothing
   (SBCL convention), so side-effecting `(format t ...)` calls don't echo
   a trailing `NIL`.
+
+![sexpr-tui](./medias/sexpr-tui.png)
 
 ## Remote TUI
 
