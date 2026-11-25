@@ -210,14 +210,15 @@ notes/                 design notes + research base (see below)
   sbcl.md              — SBCL, Quicklisp, hot-patching, condition system, save-lisp-and-die
   sbcl-libs.md         — CL library survey mapped to the sexpr design
   tui.md               — the remote TUI: cl-tuition client over Swank
+  tui-improvements.md  — archived TUI-client work log (P0/P1/P2 landed)
 ```
 
 ## Design documents
 
 `notes/` holds the research, design, and work-log documents behind the
 project. [`notes/sexpr.md`](notes/sexpr.md) is the entry point; the research
-notes are the base it's synthesized from, and `tui-improvements.md` records the
-remote client's current state.
+notes are the base it's synthesized from, and `tui-improvements.md` is the
+archived record of the remote client's landed TUI work.
 
 | File | What it covers |
 |------|---------------|
@@ -227,7 +228,7 @@ remote client's current state.
 | [`notes/sbcl.md`](notes/sbcl.md) | SBCL and Quicklisp deep-dive: the live image, hot redefinition, the condition/restart system, `save-lisp-and-die` for whole-image snapshots, and Quicklisp as a dependency/skill distribution mechanism. The "our runtime substrate" reference. |
 | [`notes/sbcl-libs.md`](notes/sbcl-libs.md) | Library survey: maps the sexpr design onto existing Common Lisp libraries (ASDF, UIOP, cl-llm-provider, etc.), noting availability and fit. The "what already exists" reference. |
 | [`notes/tui.md`](notes/tui.md) | The remote TUI design: a cl-tuition client over a Swank wire, with a chat pane (Converse), an agent-management console (Peek), and a REPL pane (Listener) sharing a focused agent. Where `sexpr.tui` lives, what `:view :tui` projects, and the open tensions. Forward-looking — not the research base the others are. |
-| [`notes/tui-improvements.md`](notes/tui-improvements.md) | The remote-client work log: the P0 correctness fixes and P1 capabilities as landed (with their verification counts), the residual synchronous RPCs, and the parked P2 polish list. State of the code, not design literature. |
+| [`notes/tui-improvements.md`](notes/tui-improvements.md) | **Archived.** The remote-client work log: the P0/P1/P2 batches as landed (with their verification counts), the one unbuilt P2 item (`inspect-id`), and the residual synchronous RPCs. History, not design literature. |
 
 ### How to read them
 
@@ -243,9 +244,9 @@ remote client's current state.
 5. **`tui.md`** for the remote interface design — where it lands in the image
    (`sexpr.tui`), what the client holds (projections, never live objects), and
    how the three panes map onto Genera's Converse / Peek / Listener.
-6. **`tui-improvements.md`** for the TUI client's current state — what is
-   implemented and verified, which RPCs are still synchronous, and what polish
-   is parked.
+6. **`tui-improvements.md`** (archived) for the TUI client's landed-work history —
+   what shipped and how it was verified, which RPCs are still synchronous, and
+   what polish is still parked.
 
 ## Development setup
 

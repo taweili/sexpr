@@ -1,5 +1,11 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
-# TUI improvements — review, plan, and work log
+# TUI client — landed-work archive
+
+> **Archived.** This was the remote TUI client's review / plan / work log while
+> the work was in flight. The P0, P1, and P2 batches below are landed; the only
+> items left open are listed under *Open items carried forward*. Kept as the
+> record of what shipped, where it lives, and how it was verified. For current
+> project state see `README.md` §Status; for the design see `notes/tui.md`.
 
 *Lineage: a review of `src/tui/` (image side), `src/tui-client/` (remote
 client), `sexpr-tui.sh`, `docs/sexpr-tui.md` and the TUI test files,
@@ -10,26 +16,27 @@ note is unchanged.*
 
 ## STATUS (read this first)
 
-- **P0: implemented and verified** (`19b1619`). Client harness 163/163 green at
-  the P0 checkpoint; full rove suite green (499 assertions).
-- **P1: implemented and verified** (same commit). Membership events end to end;
+- **P0: landed and verified** (`19b1619`). Client harness 163/163 green at the
+  P0 checkpoint; full rove suite green (499 assertions).
+- **P1: landed and verified** (same commit). Membership events end to end;
   scrolling and follow mode; agent detail + `/help /spawn /kill /approvals
   /clear`; throttled reconnect for push and swank; async REPL eval with `Ctrl+X`
   abandon. Client harness **181/181**; full rove suite green (**499 assertions,
   exit 0**). A later review found one defect P0-2 had missed — see the caveat
   under the P0 table; the load is now warning-free.
-- **Residual from P1-C:** only the REPL eval is asynchronous. Snapshot polls,
-  resyncs, agent switches, notes and approvals still block the TEA thread for
-  up to the 30 s reply timeout. They are serialized under `*swank-rpc-lock*`
-  so the worker and those paths cannot interleave packets, but a slow image
-  can still pause them. Moving them to the same queue is the next step.
-- The P0/P1 work is committed (`19b1619`); the review fixes (below) are in the
-  working tree, uncommitted.
+- **Review fix: landed** (`a4d8fbc`). `:sexpr-tui` shadows `WRAP-TEXT` /
+  `TRUNCATE-TEXT` instead of redefining cl-tuition's, and passes the truncation
+  marker positionally.
+- **P2 batch: landed** (`a4d8fbc`) — input history and overlays, `:compact`
+  layout and theme knobs, batched rendering, and startup hardening. Every P2
+  line below is checked off except the image-side `inspect-id` resolver.
+- **Residual:** only the REPL eval is asynchronous. Snapshot polls, resyncs,
+  agent switches, notes and approvals still block the TEA thread for up to the
+  30 s reply timeout. They are serialized under `*swank-rpc-lock*` so the
+  worker and those paths cannot interleave packets, but a slow image can still
+  pause them. Moving them to the same queue is the next step.
 
-Testing note for agents: this sandbox blocks writes under `~/.cache`, so run
-SBCL with `XDG_CACHE_HOME=$PWD/.xdg-cache` (see *Commands* in AGENT.md for the
-normal `make test`). The cache is `.fasl`-only and `.gitignore`d (`*.fasl`), so
-it does not dirty the tree.
+Run the suite with `make test` (*Commands* in AGENT.md).
 
 ## What was already right
 
@@ -88,25 +95,38 @@ been a program error. `:sexpr-tui` now shadows both names
   retried on a throttle, then re-subscribed/re-read; a never-configured channel
   stays on the poll path.
 
-## P2 — polish (not started)
+## P2 — polish (landed in `a4d8fbc`, except the image-side resolver)
 
-- [ ] Multi-line chat input + history; help overlay (`?`); slash/command
+- [x] Multi-line chat input + history; help overlay (`?`); slash/command
   palette; search; timestamps/role styling; `[truncated — inspect]` markers.
-- [ ] Image-side `inspect-id` presentations (`notes/tui.md` §8) and a `:compact`
-      layout/theme knobs via `SEXPR_TUI_*`.
-- [ ] Render throttling / incremental scrollback (the per-fragment full-frame
-      rebuild is correct but wasteful; P0 fitting made each rebuild O(lines)).
-- [ ] Escape blurs/clears before quitting; port validation; client log env
-      (`*tui-client-log*` already exists in `wire.lisp` — only the `SEXPR_TUI_*`
-      binding is missing); connect timeouts.
+  Landed as Up/Down history with draft preservation, optional three-row input
+  (`SEXPR_TUI_MULTILINE`), the `?` / `Ctrl+P` / `Ctrl+F` overlays,
+  `SEXPR_TUI_TIMESTAMPS` and `SEXPR_TUI_ROLE_STYLES`, and distinct
+  content-vs-chrome truncation markers.
+- [x] `:compact` layout and theme knobs via `SEXPR_TUI_*`:
+  `SEXPR_TUI_COMPACT` drops the pane borders and gives the columns to the
+  transcript; `SEXPR_TUI_FOCUS_COLOR` retints the border/cursor accent.
+- [ ] Image-side `inspect-id` presentations (`notes/tui.md` §8). The client
+      renders `[N]` object refs; the resolver that evals
+      `(sexpr.tui:inspect-id N)` in the image is still unbuilt. The one P2
+      item left.
+- [x] Render throttling / incremental scrollback: fragments are batched through
+      `*tui-render-batch*` and per-(line,width) fits are memoized, so a turn
+      re-fits only its growing in-flight line instead of rebuilding every
+      frame.
+- [x] Escape clears the focused draft before quitting (an empty input quits);
+      `--swank-port` / `--push-port` validated before connecting;
+      `SEXPR_TUI_LOG` bound once per process; TCP connects bounded by
+      `SEXPR_TUI_CONNECT_TIMEOUT`.
 
-## Open tensions carried forward
+## Open items carried forward
 
 - Finishing the async move (the P1-C residual) is the largest remaining
   architectural change: snapshot polls, resyncs, agent switches, notes and
   approvals still run on the TEA thread under the wire lock, and moving them
   onto the REPL's queue interacts with the approval path (`resolve-approval`)
   and the poller.
+- The image-side `inspect-id` resolver is unbuilt (see P2).
 - Multi-client coherence is still parked (one operator), per `notes/tui.md` §10.
 - Security: both channels remain unauthenticated localhost; the docs already
   say to tunnel or add a token before going remote.

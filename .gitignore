@@ -67,3 +67,10 @@ vendor/
 coverage/
 .cache/
 tmp/
+
+# Dsh 
+.harness.out
+.load.out
+.model.diff
+.probe.lisp
+.probe.out
