@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # AI Agent Harness Architecture — Research Notes
 
 Research date: 2026 (sources from 2025–2026).

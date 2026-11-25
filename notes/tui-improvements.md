@@ -1,32 +1,35 @@
-;;; SPDX-License-Identifier: GPL-3.0-or-later
-;;;; notes/tui-improvements.md — TUI review, prioritized plan, and work log.
-;;;
-;;;; Lineage: a review of `src/tui/` (image side), `src/tui-client/` (remote
-;;;; client), `sexpr-tui.sh`, `docs/sexpr-tui.md` and the TUI test files,
-;;;; cross-checked against `notes/tui.md`. The findings below are the ones
-;;;; that survived reading the code and running the headless harness; each
-;;;; cites where it lives. Nothing here is a redesign — the Genera posture
-;;;; of the original note is unchanged.
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+# TUI improvements — review, plan, and work log
+
+*Lineage: a review of `src/tui/` (image side), `src/tui-client/` (remote
+client), `sexpr-tui.sh`, `docs/sexpr-tui.md` and the TUI test files,
+cross-checked against `notes/tui.md`. The findings below are the ones that
+survived reading the code and running the headless harness; each cites where
+it lives. Nothing here is a redesign — the Genera posture of the original
+note is unchanged.*
 
 ## STATUS (read this first)
 
-- **P0: implemented and verified.** Client harness 163/163 green; full rove
-  suite green (499 assertions) at the P0 checkpoint.
-- **P1: implemented and verified.** Membership events end to end; scrolling
-  and follow mode; agent detail + `/help /spawn /kill /approvals /clear`;
-  throttled reconnect for push and swank; async REPL eval with `Ctrl+X`
-  abandon. `ql:quickload :sexpr-tui` is clean; client harness **181/181**;
-  full rove suite green (**499 assertions, exit 0**).
+- **P0: implemented and verified** (`19b1619`). Client harness 163/163 green at
+  the P0 checkpoint; full rove suite green (499 assertions).
+- **P1: implemented and verified** (same commit). Membership events end to end;
+  scrolling and follow mode; agent detail + `/help /spawn /kill /approvals
+  /clear`; throttled reconnect for push and swank; async REPL eval with `Ctrl+X`
+  abandon. Client harness **181/181**; full rove suite green (**499 assertions,
+  exit 0**). A later review found one defect P0-2 had missed — see the caveat
+  under the P0 table; the load is now warning-free.
 - **Residual from P1-C:** only the REPL eval is asynchronous. Snapshot polls,
   resyncs, agent switches, notes and approvals still block the TEA thread for
   up to the 30 s reply timeout. They are serialized under `*swank-rpc-lock*`
   so the worker and those paths cannot interleave packets, but a slow image
   can still pause them. Moving them to the same queue is the next step.
-- Everything is uncommitted working-tree state; no commit was requested.
+- The P0/P1 work is committed (`19b1619`); the review fixes (below) are in the
+  working tree, uncommitted.
 
 Testing note for agents: this sandbox blocks writes under `~/.cache`, so run
 SBCL with `XDG_CACHE_HOME=$PWD/.xdg-cache` (see *Commands* in AGENT.md for the
-normal `make test`). Remove `.xdg-cache/` before committing.
+normal `make test`). The cache is `.fasl`-only and `.gitignore`d (`*.fasl`), so
+it does not dirty the tree.
 
 ## What was already right
 
@@ -54,7 +57,17 @@ frame fit, note echo and failure path, validation/sorting, click-through and
 multi-agent approvals, poll on/off, stats shape. All in
 `tests/test-tui-client.lisp` under the `P0:` names.
 
-## P1 — capability (in progress)
+**Caveat found in review (fixed).** `WRAP-TEXT`/`TRUNCATE-TEXT` were first
+defined on the symbols `:use`d from `:tuition`, so loading `:sexpr-tui`
+redefined cl-tuition's own functions (`WARNING: redefining TUITION:WRAP-TEXT`)
+rather than adding client-local ones. It was latent — this client never renders
+styled text at a width — but tuition's `RENDER-STYLED` calls its `WRAP-TEXT`
+with keyword arguments, so any width-styled render or markdown view would have
+been a program error. `:sexpr-tui` now shadows both names
+(`src/tui-client/package.lisp`); the harness resolves them with
+`:shadowing-import-from`.
+
+## P1 — capability (done)
 
 - [x] **Membership events.** `register-agent!`/`deregister-agent!` emit
   `:agent-added`/`:agent-removed`; the push server enriches the added event
@@ -79,17 +92,21 @@ multi-agent approvals, poll on/off, stats shape. All in
 
 - [ ] Multi-line chat input + history; help overlay (`?`); slash/command
   palette; search; timestamps/role styling; `[truncated — inspect]` markers.
-- [ ] Image-side `inspect-id` presentations (notes §8) and a `:compact`
+- [ ] Image-side `inspect-id` presentations (`notes/tui.md` §8) and a `:compact`
       layout/theme knobs via `SEXPR_TUI_*`.
 - [ ] Render throttling / incremental scrollback (the per-fragment full-frame
       rebuild is correct but wasteful; P0 fitting made each rebuild O(lines)).
-- [ ] Escape blurs/clears before quitting; port validation; client log env;
-      connect timeouts.
+- [ ] Escape blurs/clears before quitting; port validation; client log env
+      (`*tui-client-log*` already exists in `wire.lisp` — only the `SEXPR_TUI_*`
+      binding is missing); connect timeouts.
 
 ## Open tensions carried forward
 
-- Async RPC (P1) is the largest remaining architectural change; it interacts
-  with the approval path (`resolve-approval`) and the poller.
+- Finishing the async move (the P1-C residual) is the largest remaining
+  architectural change: snapshot polls, resyncs, agent switches, notes and
+  approvals still run on the TEA thread under the wire lock, and moving them
+  onto the REPL's queue interacts with the approval path (`resolve-approval`)
+  and the poller.
 - Multi-client coherence is still parked (one operator), per `notes/tui.md` §10.
 - Security: both channels remain unauthenticated localhost; the docs already
   say to tunnel or add a token before going remote.

@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # sexpr — An Agent OS in Pure Lisp
 
 *Brainstorm document. Synthesizes ideas from: SBCL/Quicklisp research (`notes/sbcl.md`), agent harness architecture (`notes/agent.md`), and Symbolics Genera (`notes/symbolics-lisp.md`).*
@@ -82,7 +83,7 @@ The central insight from context engineering ("curate the smallest set of high-s
 | Write | `remember`/`note` — agent writes to files & its own doc store (cheap, native) |
 | Select | `apropos`-style retrieval over tools, skills, docs, prior transcript summaries |
 | Compress | `compact` — generational summarization with anchors |
-| Isolate | **Processes** — subagents are `sb-thread` threads (or `lparallel` tasks) with their *own* transcript object, sharing the heap; they return `(values summary presentations)` |
+| Isolate | **Processes** — subagents are `sb-thread` threads with their *own* transcript object, sharing the heap; `subagent-summary` returns text today, and live-object returns wait on the presentation registry (§8) |
 
 Because subagents share the address space, isolation is about *context*, not data: a subagent can return live objects (parsed ASTs, open handles) to its parent without serialization — something JSON-transcript harnesses fundamentally cannot do.
 
@@ -159,7 +160,7 @@ sexpr's human-facing UI takes Genera's core idea — **present output as typed o
 - **Commands are typed and clickable**: `Fix`, `Retry`, `Approve`, `Redefine`, `Compact context`. Arguments are filled by clicking presentations. The human operates the agent OS with the same command processor the agents use — humans and agents are peers in the command loop.
 - Model-facing rendering is the same substrate with a different view: presentations render to token-budgeted text for the LLM (`present` with `:view :model`), and to rich hypertext for the human (`:view :human`). One object, two projections.
 - Documentation is a Document-Examiner-style hypertext system; since skills, tools, and source are all in-image, every mention of a function in any document is a live link to its definition, its callers, its test history.
-- Practical v1: the Listener lives in a terminal (or Emacs via Swank); presentations degrade to numbered object references the human can `describe`. Rich UI later — the *architecture* (object-preserving output) matters from day one, the pixels don't.
+- Practical v1: the Listener lives in a terminal (or Emacs via Swank), and the remote cl-tuition client adds a third surface (`notes/tui.md`); presentations degrade to numbered object references the human can `describe`. Rich UI later — the *architecture* (object-preserving output) matters from day one, the pixels don't.
 
 ## 5. Safety: conditions, restarts, and capabilities
 
@@ -169,7 +170,7 @@ The condition system is the best approval/permission architecture ever designed;
   `(signal 'effect-requested :capability :fs-write :target path :description "…")`
 - **Capability grants are restarts.** The dynamic environment (set by the human, a policy agent, or config) establishes restarts: `grant-once`, `grant-session`, `grant-always`, `deny`. A handler chooses the restart — interactively (human in the loop) or programmatically (policy).
 - Non-unwinding semantics mean the agent's work **is not destroyed** when approval is needed: the stack waits at the point of effect; the human inspects the exact state; approval resumes precisely there. Compare: Python harness re-prompting the model after a tool denial, losing stack context entirely.
-- **Sandboxing layers**: (1) restricted eval packages for model-emitted code, (2) capability conditions for effects, (3) OS-level sandbox for `run-program` escapes. Package locks (`sb-ext:lock-package`) protect the kernel from agent meddling — unless deliberately unlocked.
+- **Sandboxing layers**: (1) restricted eval packages for model-emitted code — built, behind the `lisp` builtin; (2) capability gating for effects — a membership gate in `perform-tool`, with the condition/restart layer still future (§8); (3) OS-level sandbox for `run-program` escapes — not built. Package locks (`sb-ext:lock-package`) protect the kernel from agent meddling — unless deliberately unlocked.
 - Kill switches: budget exhaustion signals `budget-exceeded` with restarts `extend-budget` / `return-partial-result` — graceful degradation is built into the arithmetic of the loop.
 
 ## 6. Hot-patching the mind
@@ -195,15 +196,43 @@ SBCL research pay-off: sexpr agents are **online-modifiable systems**.
 4. **Multi-agent coherence**: shared heap invites races. Lisp answer: the world model lives behind transactional accessors (STM-lite or a rules engine), not naked globals.
 5. **How much LLM, how much symbolics?** The interesting frontier: hybrid cognition — the model proposes, symbolic machinery (type system, planner, conditions) disposes. Keep the model's role *proposal generation under uncertainty*; keep control flow symbolic.
 
-**Where M001 (kernel spine + transcript) stands on these** — recorded so the deferrals are explicit rather than silent:
+**Where the implementation stands** — kept current as modules land, so the
+deferrals stay explicit rather than silent:
 
-- **(3) partly settled in shape.** Model responses are recorded as typed `:model` events, and a transcript round-trips through print/read with `*read-eval* nil` — that is the replay substrate. The canned-response stub provider the kernel tests drive `agent-loop` with is "replay with canned responses" in miniature. Replay itself is not built.
-- **(2) deferred, seam named.** `model-step` renders the *whole* transcript every turn; the token-budgeted `render-for-model` (§4, `:view :model`) is a later milestone, and the kernel comment says so. Until then nothing bounds context growth.
-- **(1) deferred.** Model events carry `:tool-calls` from day one so the seam has room, but nothing executes them: no sandbox, no capability enforcement, `capabilities` is an advisory slot.
-- **(4) deferred.** `agent-loop` is single-threaded and `agent`'s `thread` slot is always NIL; `spawn` deliberately does *not* start a thread.
+- **Landed:** tool execution with schema validation and a capability gate; the
+  restricted eval sandbox behind the `lisp` builtin; token-budget enforcement
+  in the streaming loop (`:budget-exceeded`); the multi-agent registry with
+  worker threads, handles, and restart; streaming model steps on the event bus;
+  and the remote TUI over swank + push.
+- **(3) partly settled in shape.** Model responses are recorded as typed
+  `:model` events, and a transcript round-trips through print/read with
+  `*read-eval* nil` — that is the replay substrate. The canned-response stub
+  provider the kernel tests drive `agent-loop` with is "replay with canned
+  responses" in miniature. Replay itself is not built.
+- **(2) deferred, seam named.** `model-step` renders the *whole* transcript
+  every turn; the token-budgeted `render-for-model` (§4, `:view :model`) is a
+  later milestone, and the kernel comment says so. Until then nothing bounds
+  context growth.
+- **(1) half-built.** Restricted `eval` packages exist and are wired into the
+  `lisp` builtin, and `perform-tool` refuses an ungranted capability. Missing is
+  the condition/restart layer: effects do not signal `effect-requested`, there
+  are no `grant-once`/`deny` restarts, and the TUI's approval queue is a
+  data-only projection over that future seam.
+- **(4) settled in shape, parked in policy.** Agents are worker threads with
+  live transcripts and handles, so shared-heap races are real; transactional
+  world-model accessors remain the open answer. Multi-client coherence is
+  explicitly out of scope (`notes/tui.md` §10).
 - **(5) untouched.** No planner or symbolic disposition yet.
+- **Also unbuilt, and easy to miss because earlier sections describe them in
+  the present tense:** compaction/GC over the transcript (its anchors and
+  presentation registry exist but are unused), the presentation system itself,
+  skills as ASDF systems, and the MCP bridge/server.
 
-Two deliberate deviations from the §9 sketch below, both to keep M001 loop-closing and honest: `spawn` takes keyword arguments (`:goal` required, `:endpoint` for a per-agent provider) rather than a positional goal, and it returns an agent *without* starting a thread. The `with-capabilities` / `with-budget` / `effect-requested` machinery in that sketch is not implemented — `budget` is recorded but unenforced.
+The §9 sketch below predates the code in two ways: `spawn` takes keyword
+arguments and returns an agent without a thread, and the `with-capabilities` /
+`effect-requested` machinery around it is still the future seam described
+above. Worker threads live one layer up, in `src/agents/`
+(`%spawn-subagent`, `ensure-subagent-running`).
 
 ## 9. Sketch: the smallest honest kernel
 
@@ -253,7 +282,7 @@ A tongue-in-cheek but honest layering, bottom-up:
 - **Zetalisp** — kernel: agents, transcripts, capabilities, budgets, conditions
 - **Flavors** — object model: presentations, tools, skills, world-model classes
 - **Genera** — environment: Listener UI, command processor, document examiner, skill registry
-- ** Ivory** — the model endpoints: interchangeable oracles, external cognition
+- **Ivory** — the model endpoints: interchangeable oracles, external cognition
 - **sexpr** — the whole thing, because code is data is thought.
 
 ## 11. Sources / lineage

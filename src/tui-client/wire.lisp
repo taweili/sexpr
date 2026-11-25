@@ -51,6 +51,112 @@ quiet — bind it to a string stream in tests to prove that thread-side failures
 observable rather than swallowed.")
 (export '*tui-client-log*)
 
+(defun client-log-destination (&optional (env (uiop:getenv "SEXPR_TUI_LOG")))
+  "Resolve SEXPR_TUI_LOG to a log destination: T for *error-output*, NIL for
+silent, or a pathname/string to append to. Empty and the common false spellings
+(\"0\", \"nil\", \"false\", \"no\", \"off\") are silent; \"1\"/\"t\"/\"true\"/
+\"yes\"/\"stderr\" mean stderr; anything else is a file path. A missing variable
+is NIL."
+  (cond ((or (null env) (string= env "")) nil)
+        ((member env '("1" "t" "true" "yes" "stderr") :test #'string-equal) t)
+        ((member env '("0" "nil" "false" "no" "off") :test #'string-equal) nil)
+        (t env)))
+(export 'client-log-destination)
+
+(defun configure-client-log (&optional (env (uiop:getenv "SEXPR_TUI_LOG")))
+  "Bind *TUI-CLIENT-LOG* from SEXPR_TUI_LOG once per process. A path is opened
+for appending (created when absent); an unopenable path warns on
+*error-output* and leaves logging off rather than failing the launch — a log is
+never worth refusing to start the TUI over. Returns the new destination."
+  (let ((dest (client-log-destination env)))
+    (setf *tui-client-log*
+          (cond ((eq dest t) t)
+                ((null dest) nil)
+                (t (handler-case
+                       (open dest :direction :output :if-exists :append
+                             :if-does-not-exist :create)
+                     (error (e)
+                       (format *error-output*
+                               "sexpr-tui: cannot open log ~S: ~A — logging off~%"
+                               dest e)
+                       nil))))))
+  *tui-client-log*)
+(export 'configure-client-log)
+
+;;;; --- connect timeout -------------------------------------------------
+
+(define-condition connect-timeout (error)
+  ((host :initarg :host :reader connect-timeout-host)
+   (port :initarg :port :reader connect-timeout-port)
+   (seconds :initarg :seconds :reader connect-timeout-seconds))
+  (:documentation "A TCP connect exceeded its deadline. Signalled instead of
+blocking forever: an image that is not listening yet would otherwise freeze the
+client's startup (and every reconnect attempt) indefinitely.")
+  (:report (lambda (c stream)
+             (format stream "timed out connecting to ~A:~A after ~A second~:P"
+                     (connect-timeout-host c)
+                     (connect-timeout-port c)
+                     (connect-timeout-seconds c)))))
+(export 'connect-timeout)
+(export 'connect-timeout-host)
+(export 'connect-timeout-port)
+(export 'connect-timeout-seconds)
+
+(defparameter *tui-connect-timeout* 10.0
+  "Default seconds to wait for one TCP connect. Overridden per process by
+SEXPR_TUI_CONNECT_TIMEOUT (a float; an unparseable value falls back to this).")
+(export '*tui-connect-timeout*)
+
+(defun connect-timeout-from-env (&optional (env (uiop:getenv "SEXPR_TUI_CONNECT_TIMEOUT")))
+  "The configured connect timeout in seconds, or *TUI-CONNECT-TIMEOUT*.
+A missing, empty, non-numeric, zero, or negative value falls back to the default
+rather than disabling the guard or signalling at startup."
+  (if (and env (plusp (length env)))
+      (let ((value (read-from-string env nil nil)))
+        (if (and (numberp value) (plusp value))
+            (float value)
+            *tui-connect-timeout*))
+      *tui-connect-timeout*))
+(export 'connect-timeout-from-env)
+
+(defun connect-socket-with-timeout (socket address host port &optional timeout)
+  "Connect SOCKET to ADDRESS/PORT, waiting at most TIMEOUT seconds.
+Returns T on success. A refused or unresolvable endpoint signals its own
+condition as usual; only a connect that neither succeeds nor fails in time
+signals CONNECT-TIMEOUT. The wait is a worker thread because sb-bsd-sockets has
+no deadline parameter: on expiry the socket is closed (which unblocks the
+connect), the worker is reaped, and the condition is raised."
+  (let* ((limit (float (or timeout (connect-timeout-from-env))))
+         (state (sb-thread:make-mutex :name "tui-connect-state"))
+         (done-p nil)
+         (failure nil)
+         (worker (sb-thread:make-thread
+                   (lambda ()
+                     (handler-case
+                         (progn
+                           (sb-bsd-sockets:socket-connect socket address port)
+                           (sb-thread:with-mutex (state) (setf done-p t)))
+                       (error (e)
+                         (sb-thread:with-mutex (state) (setf failure e)))))
+                   :name "tui-connect")))
+    (sb-thread:join-thread worker :timeout limit)
+    (let ((finished nil)
+          (err nil))
+      (sb-thread:with-mutex (state)
+        (setf finished done-p
+              err failure))
+      (cond
+        (finished t)
+        (err
+         (sb-thread:join-thread worker :timeout 1.0)
+         (error err))
+        (t
+         ;; Still blocked: close the socket to interrupt it, then reap the worker.
+         (handler-case (sb-bsd-sockets:socket-close socket) (error () nil))
+         (sb-thread:join-thread worker :timeout 1.0)
+         (error 'connect-timeout :host host :port port :seconds limit))))))
+(export 'connect-socket-with-timeout)
+
 (defparameter *wire-reader-thread-name* "tui-wire-reader"
   "The reader thread's name, so `sb-thread:list-all-threads` is a leak check:
 one thread per connection, and none surviving cleanup.")
@@ -171,7 +277,7 @@ path for a typo'd host."
         (coerce (mapcar #'parse-integer parts) 'vector)
         (sb-bsd-sockets:host-ent-address (sb-bsd-sockets:get-host-by-name host)))))
 
-(defun connect-push (host port &key program on-message)
+(defun connect-push (host port &key program on-message timeout)
   "Open the push-channel connection to HOST:PORT.
 Uses make-instance 'sb-bsd-sockets:inet-socket + socket-connect +
 socket-make-stream :buffering :line — not the deprecated single-letter constructor
@@ -182,13 +288,15 @@ on the newline, so the server sees one message per write.
 Failure path: connection refused, an unresolvable host, or a stream-open failure
 signals to the caller. Nothing is swallowed — the caller (main, or a test) decides
 whether a failed connect is fatal. The condition is also counted and logged so the
-status bar can show it."
+status bar can show it. TIMEOUT bounds the TCP connect in seconds (default:
+SEXPR_TUI_CONNECT_TIMEOUT, else *TUI-CONNECT-TIMEOUT*); an expired deadline
+signals CONNECT-TIMEOUT rather than blocking startup forever."
   (let* ((socket (make-instance 'sb-bsd-sockets:inet-socket
                                 :type :stream
                                 :protocol :tcp))
          (address (resolve-host-address host)))
     (handler-case
-      (sb-bsd-sockets:socket-connect socket address port)
+      (connect-socket-with-timeout socket address host port timeout)
       (error (e)
         (handler-case (sb-bsd-sockets:socket-close socket) (error () nil))
         (let ((conn (make-client-connection :host host :port port)))

@@ -172,7 +172,41 @@ result is recognized as stale and dropped instead of rendered.")
    (last-async-result :initform nil :accessor model-last-async-result
                       :documentation "Headless-test hook: with no tuition program,
 the REPL worker stores its result message here instead of calling tui:send.")
-   (quitting :initform nil :accessor model-quitting)))
+   (quitting :initform nil :accessor model-quitting)
+   ;; --- P2 input UX ---------------------------------------------------
+   (input-history :initform nil :accessor model-input-history
+                  :documentation "Submitted inputs, NEWEST FIRST, shared by both
+panes. Up/Down recalls them; the focused textarea's current draft is preserved
+while browsing.")
+   (history-index :initform nil :accessor model-history-index
+                  :documentation "Index into INPUT-HISTORY while browsing, or NIL
+when the operator is typing a fresh line.")
+   (history-draft :initform nil :accessor model-history-draft
+                  :documentation "The in-progress text saved when history
+browsing began, restored when the browse ends.")
+   (overlay :initform nil :accessor model-overlay
+             :documentation "NIL, :HELP, :PALETTE, or :SEARCH. While non-NIL the
+chat column renders the overlay instead of the transcript and the input line
+becomes the overlay's query/selection.")
+   (overlay-input :initform "" :accessor model-overlay-input
+                  :documentation "The palette filter or search query.")
+   (search-matches :initform nil :accessor model-search-matches
+                   :documentation "Chat scrollback lines matching the current
+search query, newest first.")
+   ;; --- P2 render batching --------------------------------------------
+   (fragments-since-render :initform 0 :accessor model-fragments-since-render
+                           :documentation "Streamed fragments applied since the
+last chat re-render. Rendering every fragment is correct but wasteful; the
+model prose branch renders at most every *TUI-RENDER-BATCH* fragments and the
+finalize branch always commits through model-append-chat-line, which renders.")
+   (fit-cache :initform nil :accessor model-fit-cache
+              :documentation "Alist of (LINE . WIDTH) -> fitted display lines,
+so a streamed turn re-fits only the growing in-flight line rather than the
+whole scrollback. Cleared by /clear and on a width change.")
+   ;; --- P2 layout/theme -----------------------------------------------
+   (compact-p :initarg :compact-p :initform nil :accessor model-compact-p
+              :documentation "Whether SEXPR_TUI_COMPACT dropped the pane borders
+and widened the transcript column.")))
 
 ;;;; --- bounded scrollback ----------------------------------------------
 
@@ -217,8 +251,8 @@ cap and is committed exactly once by finalize-msg."
              ;; NON-DESTRUCTIVE reverse: the scrollback slot is stored NEWEST FIRST,
              ;; so the view needs it oldest-first. NRVERSE would mutate the slot's cons
              ;; cells in place and silently truncate the bounded scrollback.
-             (display (nreverse (copy-list
-                                 (%fit-for-pane (model-scrollback model) width)))))
+             (display (nreverse (loop for line in (model-scrollback model)
+                                      append (model-fit-line model line width)))))
         (when (model-in-flight-reasoning model)
           (setf display
                 (append display
@@ -243,10 +277,16 @@ cap and is committed exactly once by finalize-msg."
 model-render-chat so any in-flight streamed line stays visible below it. The viewport
 follows the newest line, which is what makes a streamed turn readable without
 scrolling."
-  (setf (model-scrollback model)
-        (append-line (model-scrollback model)
-                     (model-scrollback-cap model)
-                     (flatten-line line)))
+  (let ((flat (flatten-line line)))
+    ;; Opt-in timestamps/role colour are applied at this ONE choke point, so every
+    ;; chat line (event, tool, budget, note) is treated alike and no caller can
+    ;; forget the decoration. With both knobs off FLAT is stored unchanged.
+    (when (or *tui-timestamps-p* *tui-role-styles-p*)
+      (setf flat (decorate-chat-line flat (line-role flat))))
+    (setf (model-scrollback model)
+          (append-line (model-scrollback model)
+                       (model-scrollback-cap model)
+                       flat)))
   (model-render-chat model)
   model)
 
@@ -1173,6 +1213,298 @@ Every other mouse message falls through to the caller's dispatch."
   (values model nil))
 (export 'handle-scroll)
 
+;;;; --- P2: history, overlays, palette, search, render batching ----------
+
+(defparameter *tui-render-batch* 8
+  "Streamed fragments between chat re-renders. A streamed turn arrives as many
+small deltas; fitting the whole scrollback for each one is correct but wasteful.
+The first fragment renders immediately (so a one-fragment turn looks instant),
+then at most every Nth; finalize always commits through model-append-chat-line,
+which renders.")
+(export '*tui-render-batch*)
+
+(defparameter *tui-history-cap* 100
+  "Most recent submitted inputs kept for Up/Down recall.")
+(export '*tui-history-cap*)
+
+(defparameter *palette-entries*
+  '("/help" "/spawn" "/kill" "/approvals" "/clear")
+  "Client-side verbs the palette lists. Enter fills the chat input with the
+selected verb rather than running it blind, so an argument-taking verb is not
+executed without its argument.")
+(export '*palette-entries*)
+
+(defun palette-matches (query)
+  "The palette entries containing QUERY, case-insensitively, in order. An empty
+QUERY lists every entry. PURE."
+  (let ((q (string-downcase (or query ""))))
+    (if (string= q "")
+        (copy-list *palette-entries*)
+        (remove-if-not (lambda (entry) (search q (string-downcase entry)))
+                       *palette-entries*))))
+(export 'palette-matches)
+
+(defun help-lines ()
+  "The `?` overlay body: the key map and the client-side verbs. Derived from
+*CHAT-COMMANDS* so the two cannot drift."
+  (cons "keys:  Tab input  Enter send  Ctrl+J newline/send  Up/Down history"
+        (cons "       ? help  Ctrl+P palette  Ctrl+F search  Esc clear/close  Ctrl+C quit"
+              (cons "" (cons "verbs:" (copy-list (chat-command-help-lines)))))))
+(export 'help-lines)
+
+(defun open-overlay (model kind &optional query)
+  "Show the OVERLAY of KIND (:help, :palette, :search) with QUERY as its initial
+input. Reopening resets the query. Returns MODEL."
+  (setf (model-overlay model) kind
+        (model-overlay-input model) (or query ""))
+  (when (eq kind :search) (recompute-search model))
+  model)
+(export 'open-overlay)
+
+(defun close-overlay (model)
+  "Hide any overlay and clear its query. Returns MODEL."
+  (setf (model-overlay model) nil
+        (model-overlay-input model) ""
+        (model-search-matches model) nil)
+  model)
+(export 'close-overlay)
+
+(defun recompute-search (model)
+  "Rebuild MODEL's search matches from OVERLAY-INPUT over the chat scrollback.
+Newest first, duplicates removed, case-insensitive substring. An empty query has
+no matches. The overlay shows the matches; it does not move the transcript
+viewport, which would need a wrapped-line offset this data layer cannot know."
+  (let* ((q (string-downcase (model-overlay-input model)))
+         (lines (if (string= q "")
+                    nil
+                    (remove-if-not
+                     (lambda (line)
+                       (and (stringp line)
+                            (search q (string-downcase line))))
+                     (model-scrollback model)))))
+    (setf (model-search-matches model)
+          (remove-duplicates lines :test #'string= :from-end t)))
+  model)
+(export 'recompute-search)
+
+(defun push-input-history (model text)
+  "Remember TEXT as the most recent input, dropping an immediate repeat and
+trimming to *TUI-HISTORY-CAP*. The browse position and draft are reset because a
+submission ends any history walk. Returns MODEL."
+  (when (and (stringp text) (plusp (length text)))
+    (setf (model-input-history model)
+          (cons text (remove text (model-input-history model)
+                             :test #'string= :count 1)))
+    (when (> (length (model-input-history model)) *tui-history-cap*)
+      (setf (model-input-history model)
+            (subseq (model-input-history model) 0 *tui-history-cap*))))
+  (setf (model-history-index model) nil
+        (model-history-draft model) nil)
+  model)
+(export 'push-input-history)
+
+(defun history-step (model delta)
+  "Move the history cursor by DELTA (+1 older, -1 newer) in the focused input.
+Up saves the current draft first and clamps at the oldest entry; Down from the
+newest entry restores the draft. With no history, a no-op. Returns MODEL."
+  (let* ((ta (focused-textarea model))
+         (history (model-input-history model)))
+    (when (and ta history)
+      (let ((index (model-history-index model)))
+        (when (null index)
+          (setf (model-history-draft model)
+                (tui.textarea:textarea-value ta)))
+        (let ((next (+ (or index -1) delta)))
+          (cond
+            ((>= next (length history))
+             (let ((oldest (1- (length history))))
+               (setf (model-history-index model) oldest)
+               (tui.textarea:textarea-set-value ta (nth oldest history))))
+            ((<= next 0)
+             (if (and (< delta 0) (= next 0) (model-history-index model))
+                 (history-restore-draft model)
+                 (progn
+                   (setf (model-history-index model) 0)
+                   (tui.textarea:textarea-set-value ta (nth 0 history)))))
+            (t
+             (setf (model-history-index model) next)
+             (tui.textarea:textarea-set-value ta (nth next history))))))))
+  model)
+(export 'history-step)
+
+(defun history-restore-draft (model)
+  "End a history walk: show the saved draft again. Returns MODEL."
+  (let ((ta (focused-textarea model)))
+    (when (and ta (model-history-index model))
+      (when (model-history-draft model)
+        (tui.textarea:textarea-set-value ta (model-history-draft model)))
+      (setf (model-history-index model) nil
+            (model-history-draft model) nil)))
+  model)
+(export 'history-restore-draft)
+
+(defun handle-overlay-key (model msg)
+  "One key while an overlay is open. Escape closes; Enter fills the chat input
+with the selected palette verb (search just closes, its results already visible);
+Backspace and printable characters edit the query; Ctrl+C quits. Returns
+(VALUES model cmd)."
+  (let ((key (tui:key-msg-key msg))
+        (ctrl (tui:key-msg-ctrl msg)))
+    (cond
+      ((and ctrl (characterp key) (char= key #\c))
+       (setf (model-quitting model) t)
+       (values model (%quit-cmd)))
+      ((eq key :escape)
+       (close-overlay model)
+       (values model nil))
+      ((eq key :enter)
+       (when (eq (model-overlay model) :palette)
+         (let ((entry (first (palette-matches (model-overlay-input model)))))
+           (when entry
+             (let ((ta (model-chat-textarea model)))
+               (close-overlay model)
+               (set-focus model :chat)
+               (when ta
+                 (tui.textarea:textarea-set-value
+                  ta (concatenate 'string entry " ")))))))
+       (values model nil))
+      ((eq key :backspace)
+       (setf (model-overlay-input model)
+             (subseq (model-overlay-input model)
+                     0 (max 0 (1- (length (model-overlay-input model))))))
+       (when (eq (model-overlay model) :search) (recompute-search model))
+       (values model nil))
+      ((characterp key)
+       (setf (model-overlay-input model)
+             (concatenate 'string (model-overlay-input model) (string key)))
+       (when (eq (model-overlay model) :search) (recompute-search model))
+       (values model nil))
+      (t (values model nil))))
+(export 'handle-overlay-key))
+
+(defun %stream-render-p (model)
+  "Whether this streamed fragment should re-render the chat pane. The FIRST
+fragment after a quiet period always renders (a one-fragment turn must appear
+instantly); later ones render at most every *TUI-RENDER-BATCH*. Finalize commits
+through model-append-chat-line, which renders regardless. Returns T or NIL."
+  (let ((n (incf (model-fragments-since-render model))))
+    (when (or (= n 1) (>= n *tui-render-batch*))
+      (setf (model-fragments-since-render model) 0)
+      t)))
+(export '%stream-render-p)
+
+(defun model-fit-line (model line width)
+  "Fit one logical LINE to WIDTH columns, memoizing on (LINE . WIDTH).
+A streamed turn re-fits only its growing in-flight line; the committed scrollback
+is fitted once. The cache is invalidated by /clear and by a width change.
+PURE with respect to the model: mutates only the cache slot."
+  (let* ((key (cons line width))
+         (cache (model-fit-cache model))
+         (pair (assoc key cache :test #'equal)))
+    (if pair
+        (cdr pair)
+        (let ((fitted (wrap-text line width)))
+          (push (cons key fitted) (model-fit-cache model))
+          fitted))))
+(export 'model-fit-line)
+
+(defparameter *tui-timestamps-p* nil
+  "Whether chat lines are prefixed with their local wall-clock time. Off by
+default so stored transcripts stay comparable with the image's event stream;
+enable with SEXPR_TUI_TIMESTAMPS.")
+(export '*tui-timestamps-p*)
+
+(defparameter *tui-role-styles-p* nil
+  "Whether the leading role token (user:/model:/result:/tool:/budget:) is
+coloured. Off by default because ANSI in the scrollback makes string
+comparisons brittle; enable with SEXPR_TUI_ROLE_STYLES.")
+(export '*tui-role-styles-p*)
+
+(defun timestamp-prefix ()
+  "The local-time [HH:MM] prefix for a chat line, in the client's timezone.
+Decodes universal time with the host default zone, so no extra dependency is
+needed. PURE enough for a UI stamp."
+  (multiple-value-bind (second minute hour day month year)
+      (decode-universal-time (get-universal-time))
+    (declare (ignore second day month year))
+    (format nil "[~2,'0D:~2,'0D] " hour minute)))
+(export 'timestamp-prefix)
+
+(defun role-color (kind)
+  "The accent colour for one chat role, or NIL for no styling. PURE."
+  (case kind
+    (:user tui:*fg-green*)
+    (:model tui:*fg-cyan*)
+    (:result tui:*fg-yellow*)
+    ((:tool :tool-start :tool-result) tui:*fg-magenta*)
+    ((:budget :budget-exceeded) tui:*fg-red*)
+    (:reasoning tui:*fg-bright-black*)
+    (otherwise nil)))
+(export 'role-color)
+(defun line-role (line)
+  "The role keyword named by LINE's leading token ("user", "tool", ...), or
+NIL when the line has no known role prefix. A line already carrying ANSI styling
+has no role to recolour. PURE."
+  (if (and (stringp line) (plusp (length line))
+           (char/= (char line 0) #\Escape))
+      (let ((colon (position #\: line)))
+        (when colon
+          (let ((name (subseq line 0 colon)))
+            (cond ((string-equal name "user") :user)
+                  ((string-equal name "model") :model)
+                  ((string-equal name "result") :result)
+                  ((string-equal name "tool") :tool)
+                  ((string-equal name "budget") :budget)
+                  ((string-equal name "reasoning") :reasoning)
+                  (t nil)))))
+      nil))
+(export 'line-role)
+
+(defun decorate-chat-line (line &optional kind)
+  "Apply the opt-in timestamp prefix and role-token colour to one chat line.
+With both knobs off this returns LINE unchanged, which is why the default
+scrollback stays plain and comparable. PURE."
+  (let ((prefix (if *tui-timestamps-p* (timestamp-prefix) "")))
+    (when *tui-role-styles-p*
+      (let ((colon (and kind (position #\: line))))
+        (when (and colon (role-color kind))
+          (let* ((token (subseq line 0 (1+ colon)))
+                 (rest (subseq line colon))
+                 (style (tui:make-style :foreground (role-color kind))))
+            (setf line (concatenate 'string
+                                    (tui:render-styled style token)
+                                    rest))))))
+    (concatenate 'string prefix line)))
+(export 'decorate-chat-line)
+
+(defun configure-tui-knobs ()
+  "Apply the SEXPR_TUI_* startup knobs once, before the first layout:
+  SEXPR_TUI_MULTILINE     chat input grows to three rows; Enter=newline, Ctrl+J=send
+  SEXPR_TUI_COMPACT       drop pane borders and give the columns to the transcript
+  SEXPR_TUI_FOCUS_COLOR   border/cursor accent colour (see FOCUS-COLOR-FROM-NAME)
+  SEXPR_TUI_TIMESTAMPS    prefix chat lines with local [HH:MM]
+  SEXPR_TUI_ROLE_STYLES   colour the leading role token
+Set at startup only; returns nothing useful."
+  (setf *tui-multiline-p* (env-true-p "SEXPR_TUI_MULTILINE")
+        *chat-input-lines* (if *tui-multiline-p* 3 1)
+        *repl-input-lines* 1
+        *compact-p* (env-true-p "SEXPR_TUI_COMPACT")
+        *tui-timestamps-p* (env-true-p "SEXPR_TUI_TIMESTAMPS")
+        *tui-role-styles-p* (env-true-p "SEXPR_TUI_ROLE_STYLES"))
+  (let ((focus (uiop:getenv "SEXPR_TUI_FOCUS_COLOR")))
+    (when (and focus (plusp (length focus)))
+      (let ((color (focus-color-from-name focus)))
+        (when color (setf *focus-color* color))))))
+(export 'configure-tui-knobs)
+
+
+
+(defun clear-fit-cache (model)
+  "Drop every memoized fit (a width change or /clear makes them stale)."
+  (setf (model-fit-cache model) nil)
+  model)
+(export 'clear-fit-cache)
+
 ;;;; --- init ------------------------------------------------------------
 
 (defmethod tui:init ((model tui-model))
@@ -1285,18 +1617,71 @@ The cmd is NIL except for the two quit keys. Nothing here signals."
        (setf (model-quitting model) t)
        (values model (%quit-cmd)))
       ((eq key :escape)
+       ;; Clear before quitting. An Escape with a draft in the focused input
+       ;; discards the draft and keeps the session; an empty input quits. The
+       ;; two-step is deliberate: Escape is one keypress from the typing hand,
+       ;; and losing a long note to a slip is worse than a second keypress.
+       (let ((ta (focused-textarea model)))
+         (when (and ta (plusp (length (tui.textarea:textarea-value ta))))
+           (tui.textarea:textarea-reset ta)
+           (values model nil)))
        (setf (model-quitting model) t)
        (values model (%quit-cmd)))
+      ;; An open overlay consumes Escape first (close, not quit) and every other
+      ;; key after that; the transcript stays untouched while it is up.
+      ((and (eq key :escape) (model-overlay model))
+       (close-overlay model)
+       (values model nil))
+      ((model-overlay model)
+       (handle-overlay-key model msg))
       ;; Abandon an in-flight REPL eval. The blocking read cannot be killed, but
       ;; the UI has stayed responsive; this prevents the stale render.
       ((and ctrl (characterp key) (char-equal key #\x))
        (cancel-repl model)
        (values model nil))
+      ;; Palette, search, and help overlays (P2). `?` opens help only when the
+      ;; chat draft is empty, so a literal question mark can still be typed.
+      ((and ctrl (characterp key) (char-equal key #\p))
+       (open-overlay model :palette)
+       (values model nil))
+      ((and ctrl (characterp key) (char-equal key #\f))
+       (open-overlay model :search)
+       (values model nil))
+      ((and (characterp key) (char= key #\?)
+            (eq (model-focused model) :chat)
+            (let ((ta (model-chat-textarea model)))
+              (or (null ta) (string= "" (tui.textarea:textarea-value ta)))))
+       (open-overlay model :help)
+       (values model nil))
+      ;; Ctrl+J: SEND in multi-line mode (where Enter is a newline), INSERT a
+      ;; newline in single-line mode (harmless; keeps one chord documented).
+      ((and ctrl (characterp key) (char-equal key #\j))
+       (if *tui-multiline-p*
+           (handle-enter model)
+           (let ((ta (focused-textarea model)))
+             (when ta
+               (tui.textarea:textarea-insert-string ta (string #\Newline)))
+             (values model nil))))
       ((eq key :tab)
+       ;; Leaving an input ends any history walk, so the draft is not stale when
+       ;; the operator comes back to this pane.
+       (history-restore-draft model)
        (set-focus model (if (eq (model-focused model) :chat) :repl :chat))
        (values model nil))
       ((eq key :enter)
-       (handle-enter model))
+       ;; Multi-line chat input: Enter is a NEWLINE and Ctrl+J sends. The
+       ;; single-line default keeps Enter = send.
+       (if (and *tui-multiline-p* (eq (model-focused model) :chat))
+           (update-focused-textarea model msg)
+           (handle-enter model)))
+      ;; History recall on Up/Down. In a multi-line chat draft the arrows keep
+      ;; their cursor meaning; everywhere else they walk submitted inputs.
+      ((member key '(:up :down))
+       (if (and *tui-multiline-p* (eq (model-focused model) :chat))
+           (update-focused-textarea model msg)
+           (progn
+             (history-step model (if (eq key :up) 1 -1))
+             (values model nil))))
       ;; Viewport scrolling: page keys and Ctrl+B/F scroll the FOCUSED pane. These
       ;; are intercepted before the textarea branch, so they can never corrupt the
       ;; input; the arrows stay with the textarea cursor.
@@ -1371,6 +1756,7 @@ an unfinished note). Nothing here signals."
          (setf (model-scrollback model) nil
                (model-in-flight model) nil
                (model-in-flight-reasoning model) nil)
+         (clear-fit-cache model)
          (let ((vp (model-chat-viewport model)))
            (when vp (tui.viewport:viewport-set-content vp ""))))
         ((string-equal name "approvals")
@@ -1449,6 +1835,7 @@ is rendered locally; a reply only appears if the agent is actually running.
       ((or (null text) (string= text ""))
        (values model nil))
       (t
+       (push-input-history model text)
        ;; A slash command is a client-side verb, never a note to the model.
        (when (and (plusp (length text)) (char= (char text 0) #\/))
          (handle-chat-command model text ta)
@@ -1532,6 +1919,7 @@ blocks the connection thread, and the TUI freezes forever."
       ((or (null text) (string= text ""))
        (values model nil))
       (t
+       (push-input-history model text)
        (let ((conn (model-swank-connection model))
              (name (model-picked-agent model)))
          (cond
@@ -1616,12 +2004,16 @@ skipped rather than signalled, so calling this before build-panes is a no-op."
       (setf (tui.viewport:viewport-width (model-chat-viewport model)) chat-w
             (tui.viewport:viewport-height (model-chat-viewport model)) chat-h))
     (when (model-chat-textarea model)
-      (setf (tui.textarea:textarea-width (model-chat-textarea model)) chat-w))
+      (setf (tui.textarea:textarea-width (model-chat-textarea model)) chat-w
+            (tui.textarea:textarea-height (model-chat-textarea model))
+            (max 1 *chat-input-lines*)))
     (when (model-repl-viewport model)
       (setf (tui.viewport:viewport-width (model-repl-viewport model)) chat-w
             (tui.viewport:viewport-height (model-repl-viewport model)) repl-h))
     (when (model-repl-textarea model)
-      (setf (tui.textarea:textarea-width (model-repl-textarea model)) chat-w))
+      (setf (tui.textarea:textarea-width (model-repl-textarea model)) chat-w
+            (tui.textarea:textarea-height (model-repl-textarea model))
+            (max 1 *repl-input-lines*)))
     (when (model-agent-viewport model)
       (setf (tui.viewport:viewport-width (model-agent-viewport model)) agent-w
             (tui.viewport:viewport-height (model-agent-viewport model)) agent-h)))
@@ -1629,7 +2021,13 @@ skipped rather than signalled, so calling this before build-panes is a no-op."
   ;; rows/detail are truncated at render time, and cl-tuition's pad-block-rect
   ;; pads but never truncates, so a stale wider line would widen the pane box
   ;; past the frame on a shrink (a 60-column terminal rendered 64).
+  ;; Content fitted to a WIDTH must be re-fitted when the width changes: agent
+  ;; rows/detail are truncated at render time, and cl-tuition's pad-block-rect
+  ;; pads but never truncates, so a stale wider line would widen the pane box
+  ;; past the frame on a shrink (a 60-column terminal rendered 64). The chat fit
+  ;; cache is dropped for the same reason.
   (refresh-agent-viewport model)
+  (clear-fit-cache model)
   model)
 (export 'set-pane-dimensions)
 
@@ -1670,14 +2068,14 @@ the single `update` method owns the dispatch."
             (setf (model-in-flight-reasoning model)
                   (concatenate 'string (or (model-in-flight-reasoning model) "")
                                (or content "")))
-            (model-render-chat model))
+            (when (%stream-render-p model) (model-render-chat model)))
            (t
             ;; model prose ACCUMULATES into one growing line and re-renders ONCE,
             ;; so a streamed sentence is one line, not one word per line (F5).
             (setf (model-in-flight model)
                   (concatenate 'string (or (model-in-flight model) "")
                                (or content "")))
-            (model-render-chat model))))
+            (when (%stream-render-p model) (model-render-chat model)))))
        (values model nil)))
     ;; push channel: the streaming turn ended — commit the in-flight line (S05)
     ((finalize-msg-p msg)
@@ -1925,9 +2323,20 @@ the single `update` method owns the dispatch."
      (note-error model
                  (format nil "push closed: ~A" (or (connection-closed-msg-reason msg) "eof")))
      (values model nil))
+    ;; bracketed paste: insert verbatim into the focused input (multi-line text
+    ;; arrives as one paste), or append to an open overlay's query.
+    ((tui:paste-msg-p msg)
+     (let ((text (tui:paste-msg-text msg)))
+       (if (model-overlay model)
+           (progn
+             (setf (model-overlay-input model)
+                   (concatenate 'string (model-overlay-input model) text))
+             (when (eq (model-overlay model) :search) (recompute-search model)))
+           (let ((ta (focused-textarea model)))
+             (when ta (tui.textarea:textarea-insert-string ta text)))))
+     (values model nil))
     ;; window resize: reflow every pane
-    ((tui:window-size-msg-p msg)
-     (setf (model-term-width model) (tui:window-size-msg-width msg)
+    ((tui:window-size-msg-p msg)     (setf (model-term-width model) (tui:window-size-msg-width msg)
            (model-term-height model) (tui:window-size-msg-height msg))
      (resize-panes model)
      (values model nil))
@@ -1963,11 +2372,17 @@ clickable (the zone-mark call is a no-op for recording). The approval strip is p
 as its own line between the body and the status bar."
   (tui:zone-scan
    (compose-layout
-    (when (model-chat-viewport model)
-      (tui:join-vertical :left
-                         (tui.viewport:viewport-view (model-chat-viewport model))
-                         (when (model-chat-textarea model)
-                           (render-textarea (model-chat-textarea model)))))
+    (if (model-overlay model)
+        ;; The overlay replaces the transcript AND the input; the layout still
+        ;; reserves the input rows, so the panel fills those too.
+        (render-overlay model (chat-pane-width model)
+                        (+ (chat-pane-height model)
+                           (max 0 (1- *chat-input-lines*))))
+        (when (model-chat-viewport model)
+          (tui:join-vertical :left
+                             (tui.viewport:viewport-view (model-chat-viewport model))
+                             (when (model-chat-textarea model)
+                               (render-textarea (model-chat-textarea model))))))
     (when (model-repl-viewport model)
       (tui:join-vertical :left
                          (tui.viewport:viewport-view (model-repl-viewport model))

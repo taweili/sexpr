@@ -21,6 +21,15 @@
   ;; shadows it: unqualified `quit` is the client's own symbol, and both meanings
   ;; are reachable by qualified name. Without this the client cannot call either.
   (:shadow #:quit)
+  ;; WRAP-TEXT and TRUNCATE-TEXT are the client's pane-fitting helpers, but
+  ;; :tuition exports functions with the same names. Defining them WITHOUT
+  ;; shadowing interns TUITION's symbols: `defun` on an inherited name redefines
+  ;; the library's function cell, which produced load-time "redefining
+  ;; TUITION:WRAP-TEXT" warnings and would break tuition's own RENDER-STYLED,
+  ;; since it calls its WRAP-TEXT with keyword arguments. Shadowing gives the
+  ;; client its own symbols; packages that want them alongside :tuition resolve
+  ;; the name with :shadowing-import-from (the test harness does).
+  (:shadow #:wrap-text #:truncate-text)
   (:export
    ;; --- connection (wire.lisp) ---
    #:tui-connection

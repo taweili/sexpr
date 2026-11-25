@@ -147,7 +147,7 @@ a late reply for an earlier request can still be recognised."
       id)))
 (export 'swank-next-id)
 
-(defun swank-connect (host port)
+(defun swank-connect (host port &key timeout)
   "Open a Swank RPC connection to HOST:PORT.
 Uses make-instance 'sb-bsd-sockets:inet-socket + socket-connect +
 socket-make-stream :element-type (unsigned-byte 8) — not the deprecated
@@ -163,7 +163,7 @@ logged so the status bar can show it."
                                 :protocol :tcp))
          (address (resolve-host-address host)))
     (handler-case
-      (sb-bsd-sockets:socket-connect socket address port)
+      (connect-socket-with-timeout socket address host port timeout)
       (error (e)
         (handler-case (sb-bsd-sockets:socket-close socket) (error () nil))
         (let ((conn (new-swank-connection :host host :port port)))

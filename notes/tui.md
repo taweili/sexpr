@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # sexpr — the Remote TUI
 
 *Brainstorm document. Synthesizes the runtime surfaces already in `src/` (kernel, agents, transcript, cli, repl) with the interface substrate named in `notes/sbcl-libs.md` §8 and the process model in `notes/sexpr.md` §2. Cites line numbers from `sbcl-libs.md` where the substrate was already decided.*
@@ -15,7 +16,7 @@ This is the Genera posture, modernized: a remote listener attached over the netw
 | **Wire** | **swank / slynk** — "the human operator's console: attach to the live OS, inspect any agent's transcript, patch tools mid-run" | `sbcl-libs.md` L51 |
 | **TUI v1** | **cl-tuition** — pure-CL, TEA + CLOS, Bubble-Tea-class components; supersedes the ncurses pair | §1.1 below; amends `sbcl-libs.md` L104 |
 | **TUI v2** | **McCLIM** — the real presentation substrate (`:view :human`) | `sbcl-libs.md` L103 |
-| **Day-one fallback** | Sly/SLIME + slynk — "do not underestimate this as v1 UI" | `sbcl-libs.md` L106 |
+| **Day-one fallback** | Sly/SLIME + slynk — "do not underestimate this as v1 UI" | `sbcl-libs.md` L107 |
 
 The one amendment this note makes to `sbcl-libs.md`: **cl-tuition supersedes `cl-charms` / `croatoan` for Terminal UI v1.** cl-tuition is pure Common Lisp (MIT, actively maintained), CLOS-message TEA, and ships `chat`, `tree`, `table`, `viewport`, `textarea`, `list`, mouse `zones`, and spring animation — the polished, Lisp-native surface the ncurses pair was reaching for. McCLIM remains the v2 prize for `:view :human`.
 
@@ -97,11 +98,10 @@ Every function returns **s-expressions** — which print/read for free (invarian
 | `inject-note agent note` | confirmation | `subagent-note` / `append-event` |
 | `kill agent` | confirmation | `subagent-kill` / `sb-thread:terminate-thread` |
 | `spawn goal &key ...` | handle id | `spawn-subagent` |
-| `inspect-id id` | printed object | the presentation registry (§4 of `sexpr.md`, when it lands) |
-| `pending-approvals` | effect-request queue + restarts | the §5 condition/restart layer, when it lands |
+| `pending-approvals` | effect-request queue + restarts | `request-approval` / `resolve-approval`; shipped as a **data-only projection**, the §5 condition/restart layer is future |
 | `start-server port` | bind confirmation | the stage-3 subscription server — Swank stays for eval, this carries deltas |
 
-The client holds **projections + object IDs, never live objects** (R023 — live objects are process-local). "Click a presentation `[N]`" = "eval `(sexpr.tui:inspect-id N)` in the image." The object-preserving architecture is intact; only the projection crosses the wire.
+The client holds **projections + object IDs, never live objects** (R023 — live objects are process-local). "Click a presentation `[N]`" = "eval `(sexpr.tui:inspect-id N)` in the image"; that resolver is the one planned function still unbuilt, parked in P2 (`notes/tui-improvements.md`). The object-preserving architecture is intact; only the projection crosses the wire.
 
 ## 6. The push pipeline: LLM → agent → TUI
 
@@ -238,6 +238,8 @@ The agent pane's real differentiator is not the process tree — any `htop` has 
 
 **Multiple simultaneous effect-requested:** If agent B and agent C both signal effect-requested, **both get yellow lights**. The user resolves them one by one. There is no queue — they are independent blocks at independent stack points. The order of resolution is user-chosen, not priority-based.
 
+**Status:** the queue, its yellow lights, and its zoned buttons exist today as a data-only projection (`src/tui/approval.lisp`) over this design; the non-unwinding resume at the exact stack point waits on `sexpr.md` §5.
+
 ## 10. Open tensions (and one parked for later)
 
 1. **Token cost of the delta wire.** Fragments are already strings, so model deltas are cheap; result-event projections (R023) must stay economic. The `:view :tui` printer shares the budget discipline of the deferred `:view :model` printer (`sexpr.md` §8.2). `resync` is the lever: when a client lags, the server stops sending fragments and sends `resync` so the client refetches structure rather than every token.
@@ -249,7 +251,7 @@ The agent pane's real differentiator is not the process tree — any `htop` has 
 ## 11. Where this leaves the existing notes
 
 - **`sbcl-libs.md` L104** — `cl-charms` / `croatoan` for "Terminal UI v1" is superseded by **cl-tuition** for the sexpr TUI. The ncurses pair remains a valid fallback if cl-tuition's deps are unwanted, but cl-tuition is the default.
-- **`sbcl-libs.md` L152** ql line `slynk cl-charms ; McCLIM when ready for v2` becomes `slynk cl-tuition ; McCLIM when ready for v2`.
+- **`sbcl-libs.md` L153** ql line `slynk cl-charms ; McCLIM when ready for v2` becomes `slynk cl-tuition ; McCLIM when ready for v2`.
 - **`sexpr.md` §4** "practical v1: the Listener lives in a terminal (or Emacs via Swank)" — this note adds the third practical v1: a remote cl-tuition client over Swank, with presentations degrading to numbered refs exactly as §4 prescribes.
 - **McCLIM is unchanged** as the v2 presentation substrate for `:view :human`; cl-tuition is the v1 that proves the object-preserving seam first.
 - **`sexpr.md` §7** — the stage-3 push channel is the same substrate §7 wants for "sexpr as an MCP server": one push-service mechanism, two transports, one message vocabulary. Building the TUI push channel builds half of §7.

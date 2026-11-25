@@ -30,7 +30,12 @@
   ;; :tuition exports #:quit and CL exports #:quit, so QUIT is ambiguous in a
   ;; package that :use's both. The harness needs CL's quit to set the exit status,
   ;; so it shadows and calls cl:quit explicitly.
-  (:shadow #:quit))
+  (:shadow #:quit)
+  ;; WRAP-TEXT and TRUNCATE-TEXT are the client's own fitting helpers now that
+  ;; :sexpr-tui shadows tuition's names (see src/tui-client/package.lisp). This
+  ;; package uses BOTH :tuition and :sexpr-tui, so the name is ambiguous again;
+  ;; these tests exercise the client implementation, not tuition's.
+  (:shadowing-import-from :sexpr-tui #:wrap-text #:truncate-text))
 (in-package :sexpr-test-tui-client)
 
 (defparameter *tests-run* 0)

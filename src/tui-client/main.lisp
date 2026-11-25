@@ -20,6 +20,19 @@
   "The default swank port.")
 (export '*default-swank-port*)
 
+(defparameter *max-tcp-port* 65535
+  "The largest valid TCP port number.")
+(export '*max-tcp-port*)
+
+(defun valid-port-p (port)
+  "Whether PORT is an integer in the usable TCP range 1..65535.
+A NIL (parse-integer :junk-allowed on garbage), a zero, a negative, or a value
+above 65535 is rejected before any socket is built — connecting to port 0 or a
+bogus port is a silent failure far downstream, and a typo'd flag should fail at
+the command line."
+  (and (integerp port) (<= 1 port *max-tcp-port*)))
+(export 'valid-port-p)
+
 (defun parse-args (args)
   "Parse command-line ARGS into a plist of options.
 Recognizes --host, --swank-port, --push-port, and --agent, each followed by a
@@ -77,6 +90,21 @@ is NIL), and UIOP is always present because ASDF is built into SBCL."
           (swank-port (getf options :swank-port))
           (push-port (getf options :push-port))
           (agent (getf options :agent)))
+      ;; Validate the flags BEFORE building a model or a socket: a typo'd port is
+      ;; an operator error, not a connection failure three layers down.
+      (when (not (valid-port-p swank-port))
+        (format *error-output* "sexpr-tui: invalid swank port ~S (expected 1-~D)~%"
+                swank-port *max-tcp-port*)
+        (return-from main 1))
+      (when (and push-port (not (valid-port-p push-port)))
+        (format *error-output* "sexpr-tui: invalid push port ~S (expected 1-~D)~%"
+                push-port *max-tcp-port*)
+        (return-from main 1))
+      ;; SEXPR_TUI_* layout/theme knobs are read once, before the first layout.
+      (configure-tui-knobs)
+      ;; SEXPR_TUI_LOG is read once, here, so every connection and RPC logs to the
+      ;; same destination for the whole session.
+      (configure-client-log)
       (handler-case
           (let ((swank-conn (swank-connect host swank-port)))
             (handler-case

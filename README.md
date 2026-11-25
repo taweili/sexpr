@@ -214,9 +214,10 @@ notes/                 design notes + research base (see below)
 
 ## Design documents
 
-`notes/` holds the research and design documents that motivated the project.
-[`notes/sexpr.md`](notes/sexpr.md) is the entry point; the others are the
-research base it's synthesized from.
+`notes/` holds the research, design, and work-log documents behind the
+project. [`notes/sexpr.md`](notes/sexpr.md) is the entry point; the research
+notes are the base it's synthesized from, and `tui-improvements.md` records the
+remote client's current state.
 
 | File | What it covers |
 |------|---------------|
@@ -226,6 +227,7 @@ research base it's synthesized from.
 | [`notes/sbcl.md`](notes/sbcl.md) | SBCL and Quicklisp deep-dive: the live image, hot redefinition, the condition/restart system, `save-lisp-and-die` for whole-image snapshots, and Quicklisp as a dependency/skill distribution mechanism. The "our runtime substrate" reference. |
 | [`notes/sbcl-libs.md`](notes/sbcl-libs.md) | Library survey: maps the sexpr design onto existing Common Lisp libraries (ASDF, UIOP, cl-llm-provider, etc.), noting availability and fit. The "what already exists" reference. |
 | [`notes/tui.md`](notes/tui.md) | The remote TUI design: a cl-tuition client over a Swank wire, with a chat pane (Converse), an agent-management console (Peek), and a REPL pane (Listener) sharing a focused agent. Where `sexpr.tui` lives, what `:view :tui` projects, and the open tensions. Forward-looking — not the research base the others are. |
+| [`notes/tui-improvements.md`](notes/tui-improvements.md) | The remote-client work log: the P0 correctness fixes and P1 capabilities as landed (with their verification counts), the residual synchronous RPCs, and the parked P2 polish list. State of the code, not design literature. |
 
 ### How to read them
 
@@ -241,6 +243,9 @@ research base it's synthesized from.
 5. **`tui.md`** for the remote interface design — where it lands in the image
    (`sexpr.tui`), what the client holds (projections, never live objects), and
    how the three panes map onto Genera's Converse / Peek / Listener.
+6. **`tui-improvements.md`** for the TUI client's current state — what is
+   implemented and verified, which RPCs are still synchronous, and what polish
+   is parked.
 
 ## Development setup
 
@@ -629,14 +634,16 @@ printf '/help\n/exit\n' | ./sexpr --goal "verify"
 
 ## Status
 
-Design phase, with the model/transport layer wired. The cl-llm-provider
-dependency is installed and `src/provider/` exposes the `provider-call` boundary
-(verified end-to-end: configuration → provider realization → HTTP → the
-provider's condition/restart error recovery). The design has been
-cross-checked against a concrete library survey (see `notes/sbcl-libs.md`) —
-most of the substrate exists in Quicklisp; the novel pieces still ahead are the
-transcript compactor, the token-budgeted presentation renderer, and a
-capability-restricted eval sandbox.
+The model/transport layer is wired: `src/provider/` exposes the `provider-call`
+boundary, verified end-to-end (configuration → provider realization → HTTP →
+the provider's condition/restart error recovery). Around it now sit the kernel
+loop with streaming and token budgets, the transcript with its print/read
+round-trip, the tool registry with schema validation and a capability gate, the
+restricted eval sandbox behind `lisp`, the multi-agent registry with worker
+threads and handles, and the remote cl-tuition TUI over swank + push. Still
+ahead: the condition/restart approval layer, compaction, the presentation
+system, skills, MCP, and replay — see `notes/sexpr.md` §8 for per-question
+status.
 
 ## Open questions
 

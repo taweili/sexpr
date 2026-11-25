@@ -228,7 +228,12 @@ content was dropped. ANSI escapes are preserved and never counted, and width is
 measured in columns (wide characters count 2), so the result cannot overflow the
 cell it is given. PURE and total: a NIL TEXT is an empty line."
   (let* ((width (max 0 width))
-         (text (or text "")))
+         (text (or text ""))
+         ;; A marker longer than the cell defeats the one promise this function
+         ;; makes (never exceed WIDTH), so it falls back to a plain ellipsis.
+         (marker (if (<= (tui:visible-length marker) width)
+                     marker
+                     "…")))
     (if (<= (tui:visible-length text) width)
         text
         (let ((budget (max 0 (- width (tui:visible-length marker)))))
@@ -252,6 +257,20 @@ cell it is given. PURE and total: a NIL TEXT is an empty line."
                        (incf w cw)
                        (incf i))))))))))))
 (export 'truncate-text)
+(defparameter *content-truncation-marker* "[truncated — inspect]"
+  "Marker TRUNCATE-CONTENT appends when a display line had to be shortened.
+The words matter: the full text still exists in the transcript/snapshot, so an
+operator who sees the marker knows nothing was silently lost.")
+(export '*content-truncation-marker*)
+
+(defun truncate-content (text width)
+  "Truncate TEXT for display with the content marker when it fits, else an
+ellipsis. For status-bar chrome use TRUNCATE-TEXT instead: that text has no
+other representation to inspect."
+  (if (and (plusp width) (> (tui:visible-length text) width))
+      (truncate-text text width *content-truncation-marker*)
+      text))
+(export 'truncate-content)
 
 ;;;; --- dimensions and border ---------------------------------------------
 
@@ -286,6 +305,61 @@ so a section is viewport-rows + 4 rows tall. Getting this number right is what m
 the left column exactly as tall as the agent pane; at 2 the left column came out
 four rows short and the frame showed two blank rows above the status bar.")
 (export '*section-overhead*)
+
+(defparameter *compact-p* nil
+  "When T (SEXPR_TUI_COMPACT), panes lose their borders and the transcript takes
+the freed columns. Set once at startup, before the first layout; changing it
+mid-session would leave the panes sized for the other chrome.")
+(export '*compact-p*)
+
+(defparameter *chat-input-lines* 1
+  "Rows the chat input occupies. 1 is the classic one-line prompt; SEXPR_TUI_MULTILINE
+raises it and makes Enter insert a newline while Ctrl+J sends.")
+(export '*chat-input-lines*)
+
+(defparameter *repl-input-lines* 1
+  "Rows the REPL input occupies. Kept separate from the chat input because only
+chat needs multi-line editing today.")
+(export '*repl-input-lines*)
+
+(defparameter *tui-multiline-p* nil
+  "Whether the chat input accepts newlines: Enter inserts one and Ctrl+J sends.
+Derived from SEXPR_TUI_MULTILINE at startup, never toggled mid-session.")
+(export '*tui-multiline-p*)
+
+(defun section-overhead-for (input-lines)
+  "Rows one section costs beyond its viewport: the title line, the textarea of
+INPUT-LINES rows, and — unless *COMPACT-P* — the top and bottom border rows.
+The default 1-line bordered section is *SECTION-OVERHEAD* (4)."
+  (+ (if *compact-p* 1 3) (max 1 input-lines)))
+(export 'section-overhead-for)
+(defun env-true-p (name)
+  "Whether environment variable NAME is set to a true spelling (1/t/true/yes/on).
+Case-insensitive; unset and empty are NIL. Used by CONFIGURE-TUI-KNOBS."
+  (let ((value (uiop:getenv name)))
+    (and value
+         (member value '("1" "t" "true" "yes" "on") :test #'string-equal))))
+(export 'env-true-p)
+
+(defun focus-color-from-name (name)
+  "The cl-tuition foreground colour named NAME, or NIL if unknown. Accepts the
+plain colour words (cyan, green, red, yellow, blue, magenta, white, black,
+bright-black, bright-white); anything else is ignored rather than signalled."
+  (let ((word (string-downcase (string-trim '(#\Space #\Tab) (or name "")))))
+    (case (intern word :keyword)
+      (:cyan tui:*fg-cyan*)
+      (:green tui:*fg-green*)
+      (:red tui:*fg-red*)
+      (:yellow tui:*fg-yellow*)
+      (:blue tui:*fg-blue*)
+      (:magenta tui:*fg-magenta*)
+      (:white tui:*fg-white*)
+      (:black tui:*fg-bright-black*)
+      (:bright-black tui:*fg-bright-black*)
+      (:bright-white tui:*fg-bright-white*)
+      (otherwise nil))))
+(export 'focus-color-from-name)
+
 
 (defparameter *chrome-rows* 2
   "Rows the bottom chrome costs: the approval strip and the status bar, one row
@@ -363,15 +437,24 @@ zero-height viewport renders NOTHING at all (research F2)."
                                   (floor (* width *agent-width-share*)))))
            ;; join-horizontal adds no gap, so the left column is exactly what the
            ;; agent pane leaves behind.
-           (chat-width (max *chat-min-width* (- width 2 agent-width)))
-           ;; the viewports share what the chrome and the two section boxes leave.
-           (rows (max 0 (- height *chrome-rows* (* 2 *section-overhead*))))
+           ;; Compact mode drops the section borders, so those two columns go to
+           ;; the transcript instead.
+           (border-cols (if *compact-p* 0 2))
+           (chat-width (max *chat-min-width* (- width border-cols agent-width)))
+           ;; the viewports share what the chrome and the two section boxes leave
+           (rows (max 0 (- height *chrome-rows*
+                           (section-overhead-for *chat-input-lines*)
+                           (section-overhead-for *repl-input-lines*))))
            (repl-height (max *repl-min-height*
                             (min (floor rows 4)
                                  (max *repl-min-height* (ceiling rows 3)))))
            (chat-height (max *chat-min-height* (- rows repl-height)))
-           ;; the agent pane is unbordered, so it spans the whole body.
-           (agent-height (max *agent-min-height* (+ rows (* 2 *section-overhead*)))))
+           ;; the agent pane is unbordered, so it spans the whole body: viewport
+           ;; rows plus whatever each section costs beyond its viewport.
+           (agent-height (max *agent-min-height*
+                            (+ rows
+                               (section-overhead-for *chat-input-lines*)
+                               (section-overhead-for *repl-input-lines*)))))
       (values chat-width agent-width chat-height repl-height agent-height))))
 (export 'layout-dimensions)
 
@@ -473,7 +556,7 @@ positive, not 0 — a zero-height viewport renders NOTHING even with rows presen
 press should land in chat and not in the REPL."
   (let ((ta (tui.textarea:make-textarea
              :width width
-             :height *textarea-height*
+             :height *chat-input-lines*
              :placeholder "message...")))
     ;; Line numbers would eat four columns of a one-line input, and a single-line
     ;; textarea has nothing to number. Both settings go through exported accessors.
@@ -492,7 +575,7 @@ press should land in chat and not in the REPL."
   "The REPL input, unfocused (chat is focused first)."
   (let ((ta (tui.textarea:make-textarea
              :width width
-             :height *textarea-height*
+             :height *repl-input-lines*
              :placeholder "eval...")))
     (setf (tui.textarea:textarea-show-line-numbers ta) nil
           (tui.textarea:textarea-prompt ta) "* ")
@@ -557,7 +640,7 @@ no escape codes; RENDER-AGENT-ROWS adds the color and the zone markers around it
                     " ")))
     (let ((text (format nil "~A ● ~A ~A" marker name status)))
       (if (and width (plusp width))
-          (truncate-text text width)
+          (truncate-content text width)
           text))))
 (export 'agent-row-text)
 
@@ -606,7 +689,7 @@ Calling it with no :picked is valid and renders every row unhighlighted."
   (let ((lines (list (format nil "  ~A  ~A" "agent" "status"))))
     (dolist (line (if (listp detail) detail (when detail (list detail))))
       (push (if (and width (plusp width))
-                 (truncate-text line width)
+                 (truncate-content line width)
                  line)
             lines))
     (dolist (agent agents)
@@ -700,10 +783,13 @@ WIDTH, when given, is the OUTER width in columns including both border columns:
 the title and body are padded to WIDTH minus 2 so render-border draws a box that
 exactly fills it. Without it the box sizes to its widest line, which is what the
 standalone callers want."
-  (let ((inner (if width-p
-                   (pad-block (lines-to-string (list title (or body ""))) (- width 2))
-                   (lines-to-string (list title (or body ""))))))
-    (tui:render-border inner *border* :fg-color (when focused *focus-color*))))
+  (let ((inner (lines-to-string (list title (or body "")))))
+    (if *compact-p*
+        ;; No box: the title line and body are padded to the outer width directly.
+        (if width-p (pad-block inner width) inner)
+        (tui:render-border
+         (if width-p (pad-block inner (- width 2)) inner)
+         *border* :fg-color (when focused *focus-color*)))))
 (export 'render-section)
 
 (defun render-status-bar (text &optional (width 240))
@@ -784,6 +870,46 @@ pane cannot take the frame down."
       (error () "")))
 (export 'render-textarea)
 
+;;;; --- overlays ----------------------------------------------------------
+
+(defun overlay-lines (model max-lines)
+  "The OVERLAY panel's lines for MODEL, truncated to MAX-LINES.
+:HELP shows the key map and verbs; :PALETTE shows the filtered command list with
+its query line; :SEARCH shows the query line, match count, and matching
+scrollback lines. An unknown or NIL overlay is empty. PURE."
+  (let* ((kind (model-overlay model))
+         (input (model-overlay-input model))
+         (lines (cond
+                  ((eq kind :help)
+                   (cons "  help  (Esc closes)"
+                         (help-lines)))
+                  ((eq kind :palette)
+                   (let ((matches (palette-matches input)))
+                     (cons (format nil "  /~A" input)
+                           (cons (format nil "  ~D command~:P — Enter fills, Esc closes"
+                                         (length matches))
+                                 (mapcar (lambda (entry) (format nil "  ~A" entry))
+                                         matches)))))
+                  ((eq kind :search)
+                   (let ((matches (model-search-matches model)))
+                     (cons (format nil "  search: ~A" input)
+                           (cons (format nil "  ~D match~:P — Esc closes"
+                                         (length matches))
+                                 (mapcar (lambda (line) (format nil "  ~A" line))
+                                         matches)))))
+                  (t '()))))
+    (subseq lines 0 (max 0 (min max-lines (length lines))))))
+(export 'overlay-lines)
+
+(defun render-overlay (model &optional (width 40) (height 10))
+  "Render MODEL's overlay as a WIDTH x HEIGHT block, ready for a section body.
+The height fills the chat viewport (plus the hidden input rows, which the
+layout still reserves), so the panel replaces the transcript rather than
+floating over it."
+  (pad-block-rect (lines-to-string (overlay-lines model (max 1 height)))
+                 (max 1 width) (max 1 height)))
+(export 'render-overlay)
+
 ;;;; --- layout ------------------------------------------------------------
 
 (defun compose-layout (chat-body repl-body agent-body status-line
@@ -817,28 +943,30 @@ valid: APPROVAL-LINE, both focus flags and both sizes are optional."
   (multiple-value-bind (chat-w agent-w chat-h repl-h agent-h)
       (layout-dimensions width height)
     (declare (ignore agent-h))
-    (let* ((left-width (+ chat-w 2))
+    (let* ((border-cols (if *compact-p* 0 2))
+           (left-width (+ chat-w border-cols))
            ;; the body height is the left column height: two sections, each
-           ;; viewport-height + *section-overhead*. The agent pane's border
-           ;; must span this height so it visually encloses the same rows.
-           (body-height (+ chat-h repl-h (* 2 *section-overhead*)))
+           ;; viewport-height + its own overhead (title, textarea, borders).
+           ;; The agent pane must span this height so it encloses the same rows.
+           (body-height (+ chat-h repl-h
+                            (section-overhead-for *chat-input-lines*)
+                            (section-overhead-for *repl-input-lines*)))
            (left (tui:join-vertical :left
                                      (render-section "chat" chat-body :focused chat-focused
                                                      :width left-width)
                                      (render-section "repl" repl-body :focused repl-focused
                                                      :width left-width)))
-           ;; The agent pane gets a border (same *border* style as the
-           ;; sections) so all three panes have visible frames. The agent is
-           ;; read-only — never focused — so its border is always plain (no
-           ;; *focus-color*). The content is padded to a rectangle of
-           ;; (agent-w - 2) x (body-height - 2) BEFORE the border is applied,
-           ;; so the border's top and bottom rows reach the full body height.
-           (agent-pane (tui:render-border
-                        (pad-block-rect (or agent-body
-                                            (render-agent-rows nil))
-                                        (- agent-w 2)
-                                        (- body-height 2))
-                        *border*))
+           ;; Bordered mode frames the agent pane (always plain — it is
+           ;; read-only); compact mode pads the same rectangle with no box.
+           (agent-pane (if *compact-p*
+                           (pad-block-rect (or agent-body (render-agent-rows nil))
+                                           agent-w body-height)
+                           (tui:render-border
+                            (pad-block-rect (or agent-body
+                                                (render-agent-rows nil))
+                                            (- agent-w 2)
+                                            (- body-height 2))
+                            *border*)))
            (body (tui:join-horizontal :top left
                                       agent-pane))
            (frame (tui:join-vertical :left body

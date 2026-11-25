@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # SBCL/Quicklisp Ecosystem Survey for Building sexpr OS
 
 *Maps the sexpr OS design (`notes/sexpr.md`) onto existing Common Lisp libraries. Availability: most are in Quicklisp; GitHub-only projects noted.*
@@ -125,16 +126,19 @@ Design note: **rove** is the chosen framework (wired as `:sexpr-tests` in `sexpr
 
 Notable mention: **serapeum** deserves emphasis — its `dict`, `queue`, `synchronized` and control utilities remove a lot of kernel boilerplate.
 
-## 11. Gaps (things we'd need to build)
+## 11. Gaps (open and closed)
 
 1. **Token accounting / context-window budgeting** — no CL tokenizer for frontier models (tiktoken bindings via CFFI or a pure-CL BPE would be needed for accurate budgets).
 2. **Native embedding/ANN stack** — CFFI to usearch/hnswlib, or shell out.
-3. **A structured, safe `eval` sandbox package** — capability-restricted reader+evaluator for model code (eclector gets us 80%; the package/capability discipline is ours).
+3. **A structured, safe `eval` sandbox package** — **landed** as `src/sandbox/`: an eclector readtable, a locked package, and an eval timeout, wired into the `lisp` builtin. Policy is the remaining work.
 4. **Presentation substrate v1** — McCLIM exists but the token-budgeted `:view :model` rendering protocol is novel work.
 5. **Transcript GC/compaction engine** — nobody has written the generational context compactor; it's the core differentiator.
-6. **Mature multi-agent supervision trees** — lparallel/dissect provide primitives; Erlang-style supervision policy is ours to write (and conditions make it pleasant).
+6. **Mature multi-agent supervision trees** — **partly landed**: `src/agents/` ships worker threads, handles, restart, and kill; the Erlang-style supervision policy is still ours to write (and conditions make it pleasant).
 
-## 12. Suggested core dependency list (v0)
+## 12. Suggested core dependency list (v0 — historical)
+
+Superseded as a plan by `qlfile` (`cl-llm-provider`, `eclector`, `rove`,
+`cl-tuition`); kept as the survey's first guess at a full stack.
 
 ```
 ;; kernel

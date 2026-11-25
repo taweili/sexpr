@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Symbolics Lisp Machines, Genera OS & UI — Research Notes
 
 ## 1. History

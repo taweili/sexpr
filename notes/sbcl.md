@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # SBCL & Quicklisp — Research Notes
 
 ## 1. Overview
