@@ -36,7 +36,8 @@ the wire, never the live handle object."
 
 Every field is either a keyword, a symbol, a string, a number, a list
 of those, or NIL. The status is the kernel's agent-status keyword
-(:running, :finished, :failed, :killed). The streaming flag is a
+(:running, :idle, :finished, :failed, :killed — :idle marks a seeded
+placeholder with no live turn). The streaming flag is a
 data-only boolean — T exactly while a model stream is in flight (F6, the
 red-light busy signal) — never the raw slot value or a live stream
 object, so the print/read round-trip still holds (R023). The
@@ -85,7 +86,7 @@ plists, one per registered agent. Each plist has:
     :handle STRING or NIL (the handle ID from *subagent-registry*; NIL when
       the agent has no subagent handle). inject-note and kill take handle IDs,
       not agent names, so the client needs this field to route chat input.
-    :status KEYWORD (:running | :finished | :failed | :killed),
+    :status KEYWORD (:running | :idle | :finished | :failed | :killed),
     :streaming BOOLEAN (T exactly while a model stream is in flight — the
       red-light busy signal; NIL otherwise, never a live stream object),
     :pending-approval NIL or a data-only plist
@@ -161,5 +162,24 @@ sexpr.agents:subagent-kill; returns the confirmation string
 (defun spawn (goal &key capabilities endpoint)
   "Spawn a worker subagent with GOAL and return its handle ID string.
 Delegates to sexpr.agents:spawn-subagent; capabilities and endpoint
-inherit from the calling agent unless overridden (R014, D013)."
+inherit from the calling agent unless overridden (R014, D013).
+
+This STARTS A WORKER THREAD: the agent calls the model immediately. Prefer
+SEED for a placeholder that must not spend a model round on its own."
   (spawn-subagent goal :capabilities capabilities :endpoint endpoint))
+
+(defun seed (goal &key capabilities endpoint note)
+  "Register a placeholder subagent with GOAL and return its handle ID string,
+WITHOUT starting a worker thread. Delegates to sexpr.agents:seed-subagent.
+
+No model call happens here. The agent reads :idle in agent-snapshot, so the
+TUI's agent pane shows a real row instead of an empty society, and the chat
+pane has a picked agent to send to — which is what makes Enter work on a
+fresh image. The first turn is driven by whatever the operator types:
+inject-note appends it and ensure-subagent-running starts the worker.
+
+NOTE, when non-NIL, is appended as a user event before returning. Use it only
+when something will actually drive the turn (a provider whose chat template
+requires a user message refuses a goal-only call); otherwise leave it NIL so
+the seed costs nothing but registration."
+  (seed-subagent goal :capabilities capabilities :endpoint endpoint :note note))

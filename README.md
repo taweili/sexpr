@@ -524,25 +524,26 @@ optional at the client; the wrapper asks for it only when it is actually
 listening. The image comes up in its own SBCL, fed by a named pipe it
 holds open, and exits on EOF, so a crash never looks like a hang.
 
-**A fresh image is not an empty society.** The boot file seeds one
-default agent whose goal is `hello world` — it exists to greet whoever
-opens the TUI. The client picks its default agent from the first
-snapshot row, so the greeter is what you land on; it runs like any
-subagent (worker thread, handle, transcript), streams its welcome over
-the push channel when the provider is configured, and finishes as
-`:failed` without one — the image comes up either way. The worker
-announces its status on the push channel as it starts and finishes, so the
-agent pane's row tracks it live — RUNNING while a turn is in flight, IDLE
-once the turn is done — and a chat note typed into a finished agent starts
-a fresh worker, so the note gets a turn of its own instead of sitting
-unanswered in the transcript. Its transcript is
-seeded with the same `hello world` user line, because the kernel sends
-the whole transcript to the model as messages and a goal-only call
-carries no user message — providers whose chat template requires one
-(llama-server's `--jinja`) refuse such a request. The image also honors
-the `SEXPR_PROVIDER` / `SEXPR_MODEL` / `SEXPR_BASE_URL`
-environment variables (see [Model provider](#model-provider)), exactly
-like the CLI does, so the local-dev flow greets out of the box.
+**A fresh image gets one idle placeholder agent.** The client picks its chat
+agent from the first snapshot row, so a society with no rows leaves the pane
+blank and Enter has nowhere to send — it looks like a broken input. The boot
+file therefore registers one agent whose goal is `hello world`
+(`SEXPR_TUI_SEED=1`, the default). Registration starts **no worker thread and
+spends no model round**: the agent reads IDLE, its transcript stays empty, and
+its first turn is whatever you type. Set `SEXPR_TUI_GREETER=1` to also hand it
+a `hello world` note on boot, so it greets before you type — that costs one
+model round per image boot, which is why the greeting is opt-in.
+
+While the greeting was unconditional, the chat started itself: `spawn` starts a
+worker that calls the model immediately, and `inject-note` both appends the note
+and ensures a worker runs, so every boot — including `--server-only`, which
+never opens a TUI at all — spent a model call on a welcome nobody had asked
+for. A chat note typed into a finished agent still starts a fresh worker, so
+the note gets a turn of its own instead of sitting unanswered in the
+transcript. The image also honors the `SEXPR_PROVIDER` / `SEXPR_MODEL` /
+`SEXPR_BASE_URL` environment variables (see [Model provider](#model-provider)),
+exactly like the CLI does. `SEXPR_TUI_SEED=0` gives the historical behaviour:
+a truly empty image you populate with `/spawn GOAL`.
 
 Every knob is overridable, with no build step and no binary:
 
@@ -555,6 +556,8 @@ Every knob is overridable, with no build step and no binary:
 | `SEXPR_TUI_READY_TIMEOUT` | `120` | seconds to wait for the image |
 | `SEXPR_TUI_SBCL` | `sbcl` | the SBCL binary |
 | `SEXPR_TUI_SBCLINIT` | `~/.sbclinit` | loaded first, image and client |
+| `SEXPR_TUI_GREETER` | `0` | greet on boot: seed the agent, then say hello |
+| `SEXPR_TUI_SEED` | `1` | register an idle placeholder agent at boot |
 
 Flags (`--host`, `--swank-port`, `--push-port`) win over the environment;
 every other flag is forwarded to `sexpr-tui:main` verbatim. The boot file

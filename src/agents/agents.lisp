@@ -239,17 +239,15 @@ and a dying worker's terminal writes are void (they fail the token check)."
             :name (format nil "agent:~a"
                           (sexpr.kernel:agent-goal (handle-agent handle)))))))
 
-(defun %spawn-subagent (goal &key capabilities endpoint parent)
-  "Core spawn logic. Returns the subagent-handle (not the ID).
+(defun %new-subagent-handle (goal &key capabilities endpoint parent)
+  "Build the agent and its handle for GOAL and return the HANDLE: entered in
+neither table, with NO worker thread. Shared by %spawn-subagent (which then
+starts the worker) and seed-subagent (which deliberately does not).
 
-The generated handle ID is also the agent's NAME (e.g. "subagent-1"), so
+The generated handle ID is also the agent's NAME (e.g. \"subagent-1\"), so
 register-agent! keys *agent-table* by a distinct string per spawn and
 agent-snapshot can list the whole society. Without this, make-agent's
-default name "agent" makes every spawn overwrite the previous table entry.
-
-The worker thread runs sexpr.kernel:agent-loop-streaming (S05/T03), not the
-non-streaming agent-loop, so the subagent's model turn streams onto the event
-bus. A provider failure still lands in handle-error with status :failed."
+default name \"agent\" makes every spawn overwrite the previous table entry."
   (let* ((parent-agent (or parent sexpr.kernel:*current-agent*))
          (caps (or capabilities
                    (and parent-agent (sexpr.kernel:agent-capabilities parent-agent))
@@ -262,16 +260,56 @@ bus. A provider failure still lands in handle-error with status :failed."
                  :goal goal
                  :capabilities caps
                  :endpoint ep
-                 :parent parent-agent))
-         (handle (make-instance 'subagent-handle
-                                :id id
-                                :agent agent
-                                :thread nil)))
-    (register-agent! agent)
+                 :parent parent-agent)))
+    (make-instance 'subagent-handle :id id :agent agent :thread nil)))
+
+(defun %spawn-subagent (goal &key capabilities endpoint parent)
+  "Core spawn logic. Returns the subagent-handle (not the ID).
+
+The worker thread runs sexpr.kernel:agent-loop-streaming (S05/T03), not the
+non-streaming agent-loop, so the subagent's model turn streams onto the event
+bus. A provider failure still lands in handle-error with status :failed."
+  (let ((handle (%new-subagent-handle goal
+                                     :capabilities capabilities
+                                     :endpoint endpoint
+                                     :parent parent)))
+    (register-agent! (handle-agent handle))
     (sb-thread:with-mutex ((handle-lock handle))
       (%start-worker handle))
     (register-handle! handle)
     handle))
+
+(defun seed-subagent (goal &key capabilities endpoint note)
+  "Register a subagent for GOAL and return its handle ID, WITHOUT starting a
+worker thread — no model call happens until a note drives
+ensure-subagent-running.
+
+This is the placeholder half of the TUI's first screen. The client picks its
+agent from the first snapshot row, so a society with no rows leaves the chat
+pane with nowhere to send and Enter silently does nothing. A seeded handle
+fixes that without spending a model round at boot: the agent exists, reads
+IDLE, and its first turn is whatever the operator types.
+
+NOTE must be NIL for a truly quiet seed. When given it is appended as a user
+event — the append-then-run shape chat-loop uses — which matters only once a
+turn is actually driven: the kernel sends the whole transcript to the model,
+so a goal-only call carries no user message, and providers whose chat template
+requires one (llama-server's --jinja) refuse such a request outright.
+
+Status is set to :idle rather than left at the class initform :running: a
+seeded agent has no live turn, so a stale RUNNING would light the pane red
+forever. :idle is display vocabulary (the client renders it IDLE); a worker
+never writes it, setting :running when it starts."
+  (let ((handle (%new-subagent-handle goal
+                                     :capabilities capabilities
+                                     :endpoint endpoint)))
+    (setf (sexpr.kernel:agent-status (handle-agent handle)) :idle)
+    (register-agent! (handle-agent handle))
+    (register-handle! handle)
+    (when note
+      (subagent-note (handle-id handle) note))
+    (handle-id handle)))
+(export 'seed-subagent)
 
 (defun spawn-subagent (goal &key capabilities endpoint)
   "Spawn a worker agent to run a subtask in parallel.

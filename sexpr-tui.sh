@@ -36,17 +36,25 @@
 # as found. A push channel is picked up only when it is actually listening,
 # so an image that came up without one still renders (no live deltas).
 #
-# THE DEFAULT AGENT: a fresh image is an empty society, and the TUI client
-# defaults its picked agent to the first snapshot row — so without a seed the
-# agent pane is blank on first connect. The generated boot file therefore
-# spawns one default agent whose goal is "hello world": it exists to greet
-# whoever opens the TUI. Its transcript is seeded with the same "hello
-# world" user line, because the kernel sends the whole transcript to the
-# model as messages and a goal-only call carries no user message — a
-# provider whose chat template requires one refuses it. It runs like any
-# subagent (a worker thread, a handle, a transcript); with no provider
-# configured it finishes as :failed, and the image still comes up — the
-# spawn is fire-and-forget.
+# THE FIRST SCREEN. A fresh image is an empty society, and the TUI client picks
+# its chat agent from the first snapshot row — with no rows the agent pane is
+# blank and Enter has nowhere to send, which reads as a broken input. Two knobs:
+#
+#   SEXPR_TUI_SEED=1 (default)  register one placeholder agent. It costs NO
+#                               model round: sexpr.tui:seed creates no worker
+#                               thread, the agent reads IDLE, and the operator's
+#                               first Enter drives its first turn.
+#   SEXPR_TUI_GREETER=0        when 1, that agent is also given a "hello world"
+#                               note on boot, so it greets before anyone types.
+#                               Costs one model round per image boot — including
+#                               --server-only, which never opens a TUI at all —
+#                               which is why the greeting is opt-in. Unconditional
+#                               greeting is what made the chat start by itself.
+#
+# Both off gives the historical behaviour: a truly empty image you populate with
+# /spawn. The transcript of a seeded placeholder stays empty unless GREETER is
+# on, because the kernel sends the whole transcript to the model each turn and
+# the operator's own typed line is then the user message a provider expects.
 #
 # Everything after the flags above is forwarded to sexpr-tui:main verbatim
 # (--agent NAME, --help, ...).
@@ -110,6 +118,18 @@ load_dotenv() {
     done < "$file"
 }
 
+# True when V asks for the opt-in behaviour: anything but empty, 0, false or
+# no (case-insensitive). Matches how the TUI client reads its own SEXPR_TUI_*
+# booleans, so `=1`, `=true` and `=yes` all turn it on.
+env_true() {
+    local v="${1:-}"
+    v="${v,,}"
+    case "$v" in
+        ""|0|false|no) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
 # ---------------------------------------------------------------------------
 # config
 # ---------------------------------------------------------------------------
@@ -125,8 +145,17 @@ READY_TIMEOUT="${SEXPR_TUI_READY_TIMEOUT:-120}"
 SBCL="${SEXPR_TUI_SBCL:-sbcl}"
 SBCLINIT="${SEXPR_TUI_SBCLINIT:-$HOME/.sbclinit}"
 
+# OPT-IN welcome turn, off by default (see the header). Evaluated here rather
+# than inline in write_server_boot so --dry-run and start_image agree.
+GREETER=0
+env_true "${SEXPR_TUI_GREETER:-0}" && GREETER=1
+# The placeholder agent, ON by default. It costs no model round: a fresh image
+# otherwise has no rows for the client to pick, and Enter has nowhere to send.
+SEED=0
+env_true "${SEXPR_TUI_SEED:-1}" && SEED=1
+
 # Provider defaults — same three vars sexpr.sh exports, so the image's
-# configure-provider and the greeter's model call succeed without the
+# configure-provider and the welcome agent's model call succeed without the
 # operator setting anything. Caller-set values pass through unchanged.
 export SEXPR_PROVIDER="${SEXPR_PROVIDER:-openai-compatible}"
 export SEXPR_BASE_URL="${SEXPR_BASE_URL:-http://localhost:6969/v1}"
@@ -166,6 +195,8 @@ script sets them too, and exported variables win over .env):
   SEXPR_TUI_READY_TIMEOUT   seconds to wait       (default 120)
   SEXPR_TUI_SBCL            sbcl binary           (default sbcl)
   SEXPR_TUI_SBCLINIT        sbcl init file        (default ~/.sbclinit)
+  SEXPR_TUI_GREETER         greet on boot: seed the agent, then say hello (0)
+  SEXPR_TUI_SEED            register an idle placeholder agent at boot (1)
   SEXPR_PROVIDER            provider name         (default openai-compatible)
   SEXPR_BASE_URL            provider base URL     (default http://localhost:6969/v1)
   SEXPR_MODEL               model name            (default Qwythos-9B-v2)
@@ -181,6 +212,8 @@ examples:
   ./sexpr-tui.sh --agent Alpha          # same, pick Alpha
   ./sexpr-tui.sh --no-server            # attach to an image started by hand
   SEXPR_TUI_SWANK_PORT=4100 ./sexpr-tui.sh --swank-port 4100
+  SEXPR_TUI_GREETER=1 ./sexpr-tui.sh   # also greet on boot (one model round)
+  SEXPR_TUI_SEED=0 ./sexpr-tui.sh      # leave the image a truly empty society
 USAGE
 }
 
@@ -307,28 +340,57 @@ write_server_boot() {
 ;;;; The image honors the same SEXPR_PROVIDER / SEXPR_MODEL /
 ;;;; SEXPR_BASE_URL environment variables the CLI honors (the README's
 ;;;; local-dev flow), so a configured provider reaches every agent in the
-;;;; image — including the greeter below. Without this the provider stays
-;;;; at its :anthropic default and no model call in the image can succeed.
+;;;; image — including the welcome agent when SEXPR_TUI_GREETER seeds one.
+;;;; Without this the provider stays at its :anthropic default and no model
+;;;; call in the image can succeed.
 (sexpr.provider:configure-provider)
+EOF
 
-;;;; A default agent so a fresh image is not an empty society. The TUI client
-;;;; defaults its picked agent to the first snapshot row, so without this the
-;;;; agent pane is blank on first connect and there is no transcript to show.
-;;;; The goal is the welcome: this agent exists to greet whoever opens the
-;;;; TUI. Its transcript is seeded with the same "hello world" user line:
-;;;; the kernel sends the whole transcript to the model as messages, and a
-;;;; goal-only call carries no user message — a provider whose chat template
-;;;; requires one (llama-server's --jinja) refuses the request outright.
-;;;; The note lands microseconds after the spawn, far ahead of the worker
-;;;; thread's first model round. It runs like any subagent — a worker
-;;;; thread, a handle, a transcript — and with no provider configured it
-;;;; simply finishes as :failed; the spawn is fire-and-forget, so the boot
-;;;; is never blocked or failed by it. The worker announces its status on
-;;;; the push channel as it starts and finishes, so the TUI's agent pane
-;;;; shows IDLE (not a stale RUNNING) once the greeter's turn is done.
+# The first-screen agent, appended only in the combinations that ask for one.
+# A separate append rather than an interpolated block keeps the Lisp text from
+# being re-read by the shell (an unquoted heredoc treats $( as command
+# substitution). Placement at the end of the boot file is exact: it must follow
+# configure-provider so any turn it drives has a configured endpoint.
+if [[ "$SEED" == "1" && "$GREETER" == "1" ]]; then
+    # Seed AND greet: the placeholder carries the user line, and inject-note
+    # starts its worker, so the welcome turn runs on boot (the old behaviour).
+    cat >> "$boot" <<'SEED'
+
+;;;; THE WELCOME AGENT (SEXPR_TUI_SEED=1, SEXPR_TUI_GREETER=1). One idle
+;;;; placeholder is registered, then given its own first message so a worker
+;;;; starts and greets whoever opens the TUI. Costs one model round per image
+;;;; boot — that is what GREETER opts into. With no provider configured the
+;;;; turn finishes as :failed and the image still comes up.
+(let ((placeholder (sexpr.tui:seed "hello world"
+                                  :capabilities '(:fs-read :lisp-eval)
+                                  :note "hello world")))
+  (sexpr.tui:inject-note placeholder "hello world"))
+SEED
+elif [[ "$SEED" == "1" ]]; then
+    # The default: a real agent row, no worker, no model call. The operator's
+    # first Enter drives its first turn.
+    cat >> "$boot" <<'SEED'
+
+;;;; THE PLACEHOLDER AGENT (SEXPR_TUI_SEED=1, the default; SEXPR_TUI_GREETER=0).
+;;;; Registered but never started: sexpr.tui:seed creates no worker thread, so
+;;;; the image boots without spending a model round. This exists because the
+;;;; client picks its chat agent from the first snapshot row — with no rows the
+;;;; pane is blank and Enter has nowhere to send. The agent reads IDLE until the
+;;;; operator types, and its first turn is whatever they type. Set
+;;;; SEXPR_TUI_GREETER=1 to have it greet on boot instead.
+(sexpr.tui:seed "hello world" :capabilities '(:fs-read :lisp-eval))
+SEED
+elif [[ "$GREETER" == "1" ]]; then
+    # GREETER without SEED: the historical boot behaviour, one spawned worker
+    # that greets immediately, and no idle placeholder left behind.
+    cat >> "$boot" <<'SEED'
+
+;;;; THE WELCOME AGENT (SEXPR_TUI_GREETER=1, SEXPR_TUI_SEED=0): a worker is
+;;;; spawned and greeted on boot. Costs one model round per image boot.
 (let ((greeter (sexpr.tui:spawn "hello world" :capabilities '(:fs-read :lisp-eval))))
   (sexpr.tui:inject-note greeter "hello world"))
-EOF
+SEED
+fi
     printf '%s' "$boot"
 }
 

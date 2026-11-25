@@ -33,6 +33,7 @@
    #:inject-note
    #:kill
    #:spawn
+   #:seed
    #:pending-approvals
    #:request-approval
    #:resolve-approval

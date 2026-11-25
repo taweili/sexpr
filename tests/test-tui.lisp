@@ -758,6 +758,96 @@ object isn't data-only the round-trip raises."
       (setf (fdefinition 'sexpr.kernel:agent-loop-streaming)
             real-agent-loop-streaming))))
 
+(test "44. seed registers an idle placeholder: no worker, no model call, a real snapshot row"
+  (let ((calls 0))
+    (setf (fdefinition 'sexpr.kernel:agent-loop)
+          (lambda (agent) (declare (ignore agent)) (incf calls)))
+    (setf (fdefinition 'sexpr.kernel:agent-loop-streaming)
+          (lambda (agent) (declare (ignore agent)) (incf calls)))
+    (unwind-protect
+         (let* ((id (seed "hello world"))
+                (handle (sexpr.agents:find-handle id))
+                (agent (sexpr.agents:handle-agent handle))
+                (row (snapshot-of id)))
+           (and (stringp id)
+                ;; registered in BOTH tables, so the client can pick it and
+                ;; route notes by handle
+                (eq (gethash id sexpr.agents:*subagent-registry*) handle)
+                (eq (gethash id sexpr.agents:*agent-table*) agent)
+                ;; the whole point: nothing runs at seed time
+                (null (sexpr.agents:handle-thread handle))
+                (= 0 calls)
+                (eq (sexpr.kernel:agent-status agent) :idle)
+                (not (sexpr.kernel:agent-streaming-p agent))
+                (= 0 (sexpr.transcript:transcript-length
+                      (sexpr.kernel:agent-transcript agent)))
+                ;; and the first screen is not empty: a row with a handle
+                (string= (getf row :handle) id)
+                (eq (getf row :status) :idle)
+                (null (getf row :thread-alive-p))))
+      (setf (fdefinition 'sexpr.kernel:agent-loop)
+            (lambda (agent) (declare (ignore agent))))
+      (setf (fdefinition 'sexpr.kernel:agent-loop-streaming)
+            (lambda (agent) (declare (ignore agent)))))))
+
+(test "45. seed with :note appends exactly one user event and still starts nothing"
+  (with-stubbed-agent-loop
+    (let* ((id (seed "hello world" :note "hello world"))
+           (handle (sexpr.agents:find-handle id))
+           (events (sexpr.transcript:events-list
+                    (sexpr.kernel:agent-transcript (sexpr.agents:handle-agent handle)))))
+      (and (null (sexpr.agents:handle-thread handle))
+           (= 1 (length events))
+           (eq (sexpr.transcript:event-type (first events)) :user)
+           (string= (sexpr.transcript:event-content (first events)) "hello world")))))
+
+(test "46. inject-note on a seeded agent starts exactly one worker and drives the turn"
+  ;; This is the property that makes Enter work on a fresh image: the
+  ;; placeholder exists, so a note has somewhere to go, and ensure-subagent-
+  ;; running supplies the worker.
+  (let ((real-agent-loop (fdefinition 'sexpr.kernel:agent-loop))
+        (real-agent-loop-streaming
+          (fdefinition 'sexpr.kernel:agent-loop-streaming))
+        (calls 0))
+    (setf (fdefinition 'sexpr.kernel:agent-loop)
+          (lambda (agent) (declare (ignore agent))))
+    (setf (fdefinition 'sexpr.kernel:agent-loop-streaming)
+          (lambda (agent)
+            (declare (ignore agent))
+            (incf calls)))
+    (unwind-protect
+         (let* ((id (seed "test goal"))
+                (handle (sexpr.agents:find-handle id)))
+           (and (null (sexpr.agents:handle-thread handle))
+                (= 0 calls)
+                (string= (inject-note id "hello again")
+                         (format nil "noted ~a: hello again" id))
+                ;; Join BEFORE counting: the worker bumps CALLS and writes the
+                ;; terminal status concurrently, so reading either one the
+                ;; instant inject-note returns is a race (a FINISHED thread can
+                ;; still read as 0 calls).
+                (progn (sb-thread:join-thread (sexpr.agents:handle-thread handle))
+                       t)
+                (= 1 calls)
+                (eq (sexpr.kernel:agent-status
+                     (sexpr.agents:handle-agent handle)) :finished)
+                (= 1 (sexpr.transcript:transcript-length
+                       (sexpr.kernel:agent-transcript
+                        (sexpr.agents:handle-agent handle))))))
+      (setf (fdefinition 'sexpr.kernel:agent-loop) real-agent-loop)
+      (setf (fdefinition 'sexpr.kernel:agent-loop-streaming)
+            real-agent-loop-streaming))))
+
+(test "47. boundary: the seeded row survives a print/read round-trip"
+  (with-stubbed-agent-loop
+    (let* ((id (seed "hello world"))
+           (row (snapshot-of id))
+           (round (read-from-string (prin1-to-string row))))
+      (and (equal (getf round :name) (getf row :name))
+           (equal (getf round :handle) id)
+           (eq (getf round :status) :idle)
+           (null (getf round :pending-approval))))))
+
 (format t "~%~D tests, ~D passed, ~D failed~%"
         *tests-run* *tests-passed* *tests-failed*)
 

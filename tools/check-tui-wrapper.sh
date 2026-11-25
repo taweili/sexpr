@@ -74,6 +74,7 @@ dry() {
     mkdir -p "$STATE"
     env SEXPR_TUI_STATE_DIR="$STATE" SEXPR_TUI_HOST=127.0.0.1 \
         SEXPR_TUI_SWANK_PORT="${T_SWANK:-4004}" SEXPR_TUI_PUSH_PORT="${T_PUSH:-4005}" \
+        SEXPR_TUI_GREETER="${GREETER:-0}" SEXPR_TUI_SEED="${SEED:-1}" \
         "$WRAP" --dry-run "$@" 2>&1
 }
 
@@ -104,7 +105,8 @@ for s in "usage: sexpr-tui.sh" "--no-server" "--server-only" "--dry-run" \
          "--swank-port" "--push-port" "--agent" \
          "SEXPR_TUI_HOST" "SEXPR_TUI_SWANK_PORT" "SEXPR_TUI_PUSH_PORT" \
          "SEXPR_TUI_STATE_DIR" "SEXPR_TUI_READY_TIMEOUT" \
-         "SEXPR_TUI_SBCL" "SEXPR_TUI_SBCLINIT"; do
+         "SEXPR_TUI_SBCL" "SEXPR_TUI_SBCLINIT" "SEXPR_TUI_GREETER" \
+         "SEXPR_TUI_SEED"; do
     need "$s" "$out"
 done
 
@@ -127,16 +129,64 @@ need '(ql:quickload :swank :silent t)' "$b"
 need 'central-registry' "$out"
 # The image must stay client-free: cl-tuition belongs to the TUI process only.
 absent 'tuition' "$b"
-# The image honors the SEXPR_* provider env like the CLI, so the greeter's
-# model call can succeed in the documented local-dev flow.
+# The image honors the SEXPR_* provider env like the CLI, so a welcome turn can
+# succeed in the documented local-dev flow.
 need '(sexpr.provider:configure-provider)' "$b"
-# A fresh image is an empty society; the boot file seeds the default agent
-# the TUI picks on first connect (goal "hello world"), with the same
-# "hello world" user line the kernel's user-speaks-first convention needs.
-need 'sexpr.tui:spawn' "$b"
-need '"hello world"' "$b"
+# Default first screen: one idle placeholder, and NO unprompted model call. The
+# seed must not start a worker — sexpr.tui:spawn does, and that is exactly the
+# "chat started by itself" bug.
+need '(sexpr.tui:seed "hello world"' "$b"
 need ':lisp-eval' "$b"
+absent 'sexpr.tui:spawn' "$b"
+absent 'inject-note' "$b"
+
+echo
+echo "[2b] the placeholder costs no model round unless SEXPR_TUI_GREETER=1"
+# GREETER on: the same seeded agent is given its first note, so a worker starts.
+rm -rf "$STATE"; mkdir -p "$STATE"
+out="$(env SEXPR_TUI_STATE_DIR="$STATE" SEXPR_TUI_GREETER=1 \
+        SEXPR_TUI_SEED=1 "$WRAP" --dry-run 2>&1)"
+status_ok "dry run with GREETER=1 SEED=1" "$?"
+b="$(boot_file)"
+need '(sexpr.tui:seed "hello world"' "$b"
+need '(sexpr.tui:inject-note placeholder "hello world")' "$b"
+absent 'sexpr.tui:spawn' "$b"
+# Any truthy spelling works, and the seed must be the last form in the boot
+# file so it still follows configure-provider.
+rm -rf "$STATE"; mkdir -p "$STATE"
+out="$(env SEXPR_TUI_STATE_DIR="$STATE" SEXPR_TUI_GREETER=true \
+        "$WRAP" --dry-run 2>&1)"
+status_ok "dry run with GREETER=true" "$?"
+b="$(boot_file)"
+need '(sexpr.tui:seed "hello world"' "$b"
+tail -1 "$STATE/server.lisp" | grep -q 'inject-note' \
+    && pass "the seed is the last form" || bad "the seed is not the last form"
+# A false-y spelling stays quiet.
+rm -rf "$STATE"; mkdir -p "$STATE"
+env SEXPR_TUI_STATE_DIR="$STATE" SEXPR_TUI_GREETER=false "$WRAP" --dry-run >/dev/null 2>&1
+b="$(boot_file)"
+need '(sexpr.tui:seed "hello world"' "$b"
+absent 'inject-note' "$b"
+
+echo
+echo "[2c] SEXPR_TUI_SEED=0 leaves a truly empty society"
+rm -rf "$STATE"; mkdir -p "$STATE"
+env SEXPR_TUI_STATE_DIR="$STATE" SEXPR_TUI_SEED=0 "$WRAP" --dry-run >/dev/null 2>&1
+b="$(boot_file)"
+absent 'sexpr.tui:seed' "$b"
+absent 'sexpr.tui:spawn' "$b"
+absent 'inject-note' "$b"
+# GREETER without SEED falls back to the historical spawn-and-greet.
+rm -rf "$STATE"; mkdir -p "$STATE"
+env SEXPR_TUI_STATE_DIR="$STATE" SEXPR_TUI_SEED=0 SEXPR_TUI_GREETER=1 \
+    "$WRAP" --dry-run >/dev/null 2>&1
+b="$(boot_file)"
+need '(sexpr.tui:spawn "hello world"' "$b"
 need '(sexpr.tui:inject-note greeter "hello world")' "$b"
+absent 'sexpr.tui:seed' "$b"
+# Restore the pinned default for the cases below.
+rm -rf "$STATE"; mkdir -p "$STATE"
+dry >/dev/null
 
 echo
 echo "[3] the boot file points at THIS checkout, as an absolute directory"

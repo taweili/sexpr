@@ -2778,6 +2778,32 @@ and the accessor must not be called on it."
                   (not (search "late"
                                (lines-to-string (model-repl-lines model))))))))))
 
+(test "P2: Enter sends on the first screen's idle placeholder, not just a running agent"
+  ;; Regression for the empty-society dead end: the wrapper now seeds an agent
+  ;; with :status :idle and no live thread, and that is exactly the row the
+  ;; client picks on connect. Enter must still route a note to it — the draft
+  ;; clears, the user event echoes, and the cursor advances.
+  (multiple-value-bind (conn out)
+      (canned-swank-with-output (swank-reply :ok nil 1)
+                                (swank-reply :ok '(nil . 0) 2)
+                                (swank-reply :ok "noted" 3))
+    (let ((model (make-instance 'tui-model
+                                :swank-connection conn
+                                :picked-agent "subagent-1")))
+      (tui:init model)
+      (get-output-stream-string out)
+      (setf (model-agents model)
+            (list (list :name "subagent-1" :status :idle :handle "subagent-1"
+                        :thread-alive-p nil)))
+      (let ((ta (model-chat-textarea model)))
+        (tui.textarea:textarea-set-value ta "hello agent")
+        (tui:update model (make-enter-msg))
+        (and (string= "" (tui.textarea:textarea-value ta))
+             (= 1 (model-cursor model))
+             (search "USER: hello agent"
+                     (lines-to-string (model-scrollback model)))
+             (search "inject-note" (get-output-stream-string out)))))))
+
 ;;; --- summary -------------------------------------------------------------
 
 (format t "~%~D tests, ~D passed, ~D failed~%" *tests-run* *tests-passed* *tests-failed*)
