@@ -364,6 +364,13 @@ shows the last error and the counters."
        (make-budget-exceeded-msg :agent (getf (cdr form) :agent)
                                  :tokens-used (getf (cdr form) :tokens-used)
                                  :limit (getf (cdr form) :limit)))
+      ;; Membership: the registry announces joins and leaves so a long session
+      ;; does not need a poll to notice its own society changing.
+      ((string= op "AGENT-ADDED")
+       (make-agent-added-msg :agent (getf (cdr form) :agent)
+                             :row (getf (cdr form) :row)))
+      ((string= op "AGENT-REMOVED")
+       (make-agent-removed-msg :agent (getf (cdr form) :agent)))
       (t
        (%count! connection :decode-unknown)
        (%log connection "unknown operator" op)

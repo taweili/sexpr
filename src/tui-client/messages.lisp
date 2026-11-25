@@ -103,6 +103,19 @@
    (limit :initarg :limit :initform nil :reader budget-exceeded-msg-limit))
   :documentation "The agent's token budget was hit and the stream was aborted mid-turn: (budget-exceeded :agent A :tokens-used U :limit L). The viewport shows it so a truncated turn is never mistaken for a finished one.")
 
+(defmessage agent-added-msg
+  ((agent :initarg :agent :initform nil :reader agent-added-msg-agent)
+   (row :initarg :row :initform nil :reader agent-added-msg-row))
+  :documentation "A new agent joined the society: (agent-added :agent NAME :row PLIST). ROW is the data-only projection the image built at the registry (R023), or NIL when the agent had already vanished — the pane then waits for the next snapshot/poll rather than inventing a row.")
+
+(defmessage agent-removed-msg
+  ((agent :initarg :agent :initform nil :reader agent-removed-msg-agent))
+  :documentation "An agent left the society: (agent-removed :agent NAME). There is nothing left to project, so the name alone is the whole payload.")
+
+(defmessage async-done-msg
+  ((cancelled :initarg :cancelled :initform nil :reader async-done-msg-cancelled))
+  :documentation "The background REPL worker finished but its result was abandoned (the generation was bumped by CANCEL-REPL). Internal, never on the wire; it exists so the pending indicator clears even when a result is dropped.")
+
 ;;;; --- constructors and predicates (tuition compat-name style) ----------
 
 (defun make-delta-msg (&key agent content (kind :model))
@@ -235,3 +248,34 @@ explicitly — the approval path; the worker announcements omit it)."
   "Return true if OBJ is a budget-exceeded-msg."
   (typep obj 'budget-exceeded-msg))
 (export 'budget-exceeded-msg-p)
+
+(defun make-agent-added-msg (&key agent row)
+  "Construct an agent-added-msg carrying the new agent's NAME and its data-only
+ROW projection (NIL when it had already vanished)."
+  (make-instance 'agent-added-msg :agent agent :row row))
+(export 'make-agent-added-msg)
+
+(defun agent-added-msg-p (obj)
+  "Return true if OBJ is an agent-added-msg."
+  (typep obj 'agent-added-msg))
+(export 'agent-added-msg-p)
+
+(defun make-agent-removed-msg (&key agent)
+  "Construct an agent-removed-msg carrying the departed agent's NAME."
+  (make-instance 'agent-removed-msg :agent agent))
+(export 'make-agent-removed-msg)
+
+(defun agent-removed-msg-p (obj)
+  "Return true if OBJ is an agent-removed-msg."
+  (typep obj 'agent-removed-msg))
+(export 'agent-removed-msg-p)
+
+(defun make-async-done-msg (&key cancelled)
+  "Construct an async-done-msg marking an abandoned REPL eval."
+  (make-instance 'async-done-msg :cancelled cancelled))
+(export 'make-async-done-msg)
+
+(defun async-done-msg-p (obj)
+  "Return true if OBJ is an async-done-msg."
+  (typep obj 'async-done-msg))
+(export 'async-done-msg-p)

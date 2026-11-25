@@ -101,7 +101,34 @@
                "the received event matches what was emitted"))
       (unsubscribe-event-bus "int-bus-1" listener))))
 
-;;; --- (2) model-step-streaming ---------------------------------------
+;;; --- (1b) membership announcements -----------------------------------
+
+(rove:deftest registry-announces-agent-added-and-removed
+  ;; A remote TUI subscribed to the push channel must learn that the society
+  ;; changed without polling: registration emits :agent-added, deregistration
+  ;; :agent-removed, both naming the agent. The push server enriches the added
+  ;; event with the data-only row before a client sees it.
+  (clrhash *event-bus*)
+  (let* ((received nil)
+         (listener (lambda (event) (push event received)))
+         (agent (sexpr.kernel:spawn :goal "g" :name "int-membership"
+                                    :endpoint :ollama)))
+    (unwind-protect
+         (progn
+           (subscribe-event-bus "int-membership" listener)
+           (sexpr.agents:register-agent! agent)
+           (sexpr.agents:deregister-agent! agent)
+           (let ((events (reverse received)))
+             (ok (equal '(:agent-added :agent-removed)
+                        (mapcar (lambda (e) (getf e :type)) events))
+                 "registration then deregistration emit the two membership types")
+             (ok (every (lambda (e) (equal "int-membership" (getf e :agent-id)))
+                        events)
+                 "both events name the agent")))
+      (unsubscribe-event-bus "int-membership" listener)
+      (sexpr.agents:deregister-agent! agent))))
+
+
 
 (rove:deftest model-step-streaming-emits-delta-events-and-returns-a-model-event
   (clrhash *event-bus*)

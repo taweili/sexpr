@@ -51,12 +51,207 @@ line and the viewport would stop scrolling."
 (defun one-line (string &optional (limit 240))
   "Strip any newline out of STRING, clipping to LIMIT columns. A pane title and the
 status bar are one line by contract; a delta fragment containing a newline must not
-break the layout."
+break the layout. Prefer TRUNCATE-TEXT/WRAP-TEXT below for anything sized to a pane:
+this clips by CHARACTER COUNT, which over-measures wide (CJK) text."
   (let ((flat (substitute #\Space #\Newline string)))
     (cond
       ((>= (length flat) limit) (subseq flat 0 limit))
       (t flat))))
 (export 'one-line)
+
+;;; --- display-width fitting -------------------------------------------
+;;;
+;;; WHY THESE EXIST: cl-tuition measures with VISIBLE-LENGTH but never fits.
+;;; render-border sizes its box to the widest line, viewport-view prints a line
+;;; whole when its x-offset is 0, and join-horizontal/join-vertical do not
+;;; truncate. So ONE transcript line wider than its pane widens the section box
+;;; past its allotment, the frame grows past the terminal, and the agent pane is
+;;; pushed off screen. Fitting is therefore the client's job, and this is the
+;;; one place that does it: wrapping preserves content, truncation is for
+;;; fixed one-line cells (agent rows, the status bar).
+;;;
+;;; BOTH ARE ANSI-AWARE AND DISPLAY-WIDTH-AWARE. An escape sequence is zero
+;;; columns and travels with the text that follows it, so a styled line (the
+;;; grey reasoning block) wraps without corrupting its colour; a wide character
+;;; counts two columns, so CJK does not silently overflow.
+
+(defparameter *char-width-cache* (make-hash-table :test #'eql)
+  "Display width of each character already measured. VISIBLE-LENGTH of a
+one-character string answers the wide/combining question (2 / 1 / 0); caching
+it keeps wrapping linear in the length of the line rather than quadratic.")
+(export '*char-width-cache*)
+
+(defun char-display-width (char)
+  "The number of terminal columns CHAR occupies: 2 for a wide character (CJK),
+1 for an ordinary one, 0 for a combining mark. Measured through
+VISIBLE-LENGTH so the answer matches how cl-tuition pads and measures."
+  (multiple-value-bind (width found) (gethash char *char-width-cache*)
+    (if found
+        width
+        (let ((width (tui:visible-length (string char))))
+          (setf (gethash char *char-width-cache*) width)
+          width))))
+(export 'char-display-width)
+
+(defun %ansi-csi-length (string i)
+  "When STRING[I] begins an ANSI CSI sequence (ESC [ ... final-byte), return its
+length in characters; otherwise NIL. The final byte is 0x40..0x7E, the same rule
+cl-tuition's own VISIBLE-LENGTH uses. A non-CSI ESC is not special-cased: it is
+an ordinary (zero-width-ish) character and cannot occur in this UI's output,
+which only ever emits CSI SGR sequences."
+  (when (and (char= (char string i) #\Escape)
+             (< (1+ i) (length string))
+             (char= (char string (1+ i)) #\[))
+    ;; Start AFTER the '[': '[' itself is 0x5B and would match the final-byte
+    ;; range (0x40..0x7E) instantly, truncating every colour sequence. The value
+    ;; is a LENGTH FROM I (callers subseq I..I+LEN), not an absolute end index.
+    (let ((final (position-if (lambda (c) (<= #x40 (char-code c) #x7E))
+                              string :start (+ i 2))))
+      (if final
+          (- (1+ final) i)
+          (- (length string) i)))))
+
+(defun %tokenize-wrapped (text)
+  "Split TEXT into WRAP-TEXT tokens: (:space), (:word S W) where S carries any
+ANSI escapes inside the word and W is its display width. Tokenizing by WORD is
+what makes the wrap greedy per word (a word moves whole to the next line instead
+of being torn in half), which a character-at-a-time wrap gets wrong when a line
+happens to be exactly full."
+  (let ((tokens nil)
+        (word "")
+        (wordw 0)
+        (i 0)
+        (n (length text)))
+    (labels ((flush-word ()
+               (when (plusp (length word))
+                 (push (list :word word wordw) tokens)
+                 (setf word "" wordw 0))))
+      (loop while (< i n) do
+        (let ((ch (char text i)))
+          (cond
+            ((%ansi-csi-length text i)
+             (let ((len (%ansi-csi-length text i)))
+               (setf word (concatenate 'string word (subseq text i (+ i len))))
+               (incf i len)))
+            ((char= ch #\Space)
+             (flush-word)
+             (push (list :space) tokens)
+             (incf i))
+            (t
+             (setf word (concatenate 'string word (string ch)))
+             (incf wordw (char-display-width ch))
+             (incf i)))))
+      (flush-word)
+      (nreverse tokens))))
+(export '%tokenize-wrapped)
+
+(defun %split-wide-word (word width)
+  "Split one WORD longer than WIDTH into chunks of at most WIDTH columns,
+preserving ANSI escapes. A word that fits is returned as a one-element list."
+  (let ((chunks nil)
+        (cur "")
+        (curw 0)
+        (i 0)
+        (n (length word)))
+    (loop while (< i n) do
+      (let ((ch (char word i)))
+        (cond
+          ((%ansi-csi-length word i)
+           (let ((len (%ansi-csi-length word i)))
+             (setf cur (concatenate 'string cur (subseq word i (+ i len))))
+             (incf i len)))
+          (t
+           (let ((w (char-display-width ch)))
+             (when (and (plusp curw) (> (+ curw w) width))
+               (push cur chunks)
+               (setf cur "" curw 0))
+             (setf cur (concatenate 'string cur (string ch)))
+             (incf curw w)
+             (incf i))))))
+    (push cur chunks)
+    (nreverse chunks)))
+
+(defun wrap-text (text width)
+  "Split TEXT into display lines of at most WIDTH columns, breaking BETWEEN WORDS
+when the next word does not fit and hard-breaking only a word that is wider than
+the pane on its own. ANSI escapes are copied through verbatim and count zero
+columns, so styled text keeps its colour across a break. Returns a list of lines;
+empty or NIL TEXT yields (\"\"). PURE and total."
+  (let ((width (max 1 width))
+        (lines nil)
+        (cur "")
+        (curw 0)
+        (pending-space nil))
+    (labels ((flush (&optional force)
+               (when (or force (plusp (length cur)))
+                 (push cur lines)
+                 (setf cur "" curw 0))
+               (setf pending-space nil))
+             (place (chunk)
+               (setf cur chunk)
+               (setf curw (tui:visible-length chunk))))
+      (dolist (token (%tokenize-wrapped (or text "")))
+        (case (first token)
+          (:space
+           ;; leading spaces on an empty line are dropped; otherwise one space is
+           ;; pending and is emitted only if a following word still fits
+           (when (plusp (length cur))
+             (setf pending-space t)))
+          (:word
+           (let* ((word (second token))
+                  (wordw (third token))
+                  (sep (if pending-space 1 0)))
+             (cond
+               ((<= (+ curw sep wordw) width)
+                (when pending-space
+                  (setf cur (concatenate 'string cur " "))
+                  (incf curw))
+                (setf cur (concatenate 'string cur word))
+                (incf curw wordw))
+               (t
+                (flush)
+                (let ((chunks (%split-wide-word word width)))
+                  (if (rest chunks)
+                      (progn
+                        (dolist (chunk (butlast chunks))
+                          (push chunk lines))
+                        (place (car (last chunks))))
+                      (place (first chunks))))))
+             (setf pending-space nil)))))
+      (flush t)
+      (nreverse lines))))
+(export 'wrap-text)
+
+(defun truncate-text (text width &optional (marker "…"))
+  "Fit TEXT on ONE display line of at most WIDTH columns, appending MARKER when
+content was dropped. ANSI escapes are preserved and never counted, and width is
+measured in columns (wide characters count 2), so the result cannot overflow the
+cell it is given. PURE and total: a NIL TEXT is an empty line."
+  (let* ((width (max 0 width))
+         (text (or text "")))
+    (if (<= (tui:visible-length text) width)
+        text
+        (let ((budget (max 0 (- width (tui:visible-length marker)))))
+          (with-output-to-string (out)
+            (let ((w 0)
+                  (i 0)
+                  (n (length text)))
+              (loop while (< i n) do
+                (let ((ch (char text i)))
+                  (cond
+                    ((%ansi-csi-length text i)
+                     (let ((len (%ansi-csi-length text i)))
+                       (write-string (subseq text i (+ i len)) out)
+                       (incf i len)))
+                    (t
+                     (let ((cw (char-display-width ch)))
+                       (when (> (+ w cw) budget)
+                         (write-string marker out)
+                         (return))
+                       (write-char ch out)
+                       (incf w cw)
+                       (incf i))))))))))))
+(export 'truncate-text)
 
 ;;;; --- dimensions and border ---------------------------------------------
 
@@ -345,35 +540,75 @@ UNKNOWN. PURE and total: nothing here signals."
                   (symbol-name (label status)))))))
 (export 'agent-status-label)
 
-(defun agent-row-text (agent &key picked)
-  "The PLAIN, ANSI-free, zone-free text of one agent row: a picked marker (\"*\" when
+(defun agent-row-text (agent &key picked width)
+  "The PLAIN, zone-free text of one agent row: a picked marker (\"*\" when
 PICKED names this agent, else a space), the light glyph \"●\", the agent name, and
 the display label of the status (agent-status-label) — e.g. \"* ● Alpha RUNNING\", and \"* ● Alpha IDLE\" for a finished agent.
 PURE and total: a missing :name/:status degrades to \"?\"/\"UNKNOWN\" and nothing here
-signals. This is the string the headless tests assert on, so it carries no escape
-codes; RENDER-AGENT-ROWS adds the color and the zone markers around it."
+signals. WIDTH, when positive, truncates the row to that many columns so a long
+agent name cannot widen the pane box past its allotment (render-border sizes to
+the widest line). This is the string the headless tests assert on, so it carries
+no escape codes; RENDER-AGENT-ROWS adds the color and the zone markers around it."
   (let ((name (or (getf agent :name) "?"))
         (status (agent-status-label (getf agent :status)))
         (marker (if (and picked (stringp (getf agent :name))
                           (string= picked (getf agent :name)))
                     "*"
                     " ")))
-    (format nil "~A ● ~A ~A" marker name status)))
+    (let ((text (format nil "~A ● ~A ~A" marker name status)))
+      (if (and width (plusp width))
+          (truncate-text text width)
+          text))))
 (export 'agent-row-text)
 
-(defun render-agent-rows (agents &key picked)
-  "The agent pane body: a header line containing both `agent` and `status`, then one
-line per snapshot entry.
+(defun agent-detail-lines (agent)
+  "Up to two lines for the PICKED row's snapshot fields the pane never showed:
+  line 1 — budget and capabilities;
+  line 2 — endpoint, transcript length and handle.
+The image already sends all of these in every agent-snapshot, so this costs no
+RPC — it makes the projection worth its bytes and gives an operator a society
+view htop cannot show. TWO lines rather than one because a single 80-column
+label-crammed line truncated most of them away; each line is short enough to
+survive the widest common pane, and the caller truncates either that does not.
+PURE and total: a non-list AGENT is NIL; missing keys degrade to placeholders
+and nothing signals."
+  (unless (listp agent)
+    (return-from agent-detail-lines nil))
+  (let* ((budget-val (getf agent :budget))
+         (budget (cond ((eq budget-val :unlimited) "unlimited")
+                       ((listp budget-val)
+                        (format nil "~A tok/~As"
+                                (or (getf budget-val :tokens) "?")
+                                (or (getf budget-val :seconds) "?")))
+                       (t "?")))
+         (caps (or (getf agent :capabilities) "-"))
+         (endpoint (or (getf agent :endpoint) "default"))
+         (length (or (getf agent :transcript-length) "?"))
+         (handle (or (getf agent :handle) "-")))
+    (list (format nil "  budget=~A caps=~A" budget caps)
+          (format nil "  endpoint=~A len=~A handle=~A"
+                  endpoint length handle))))
+(export 'agent-detail-lines)
+
+(defun render-agent-rows (agents &key picked width detail)
+  "The agent pane body: a header line containing both `agent` and `status`, the
+optional DETAIL lines for the picked agent (AGENT-DETAIL-LINES, a list), then
+one line per snapshot entry.
 MANUAL COMPOSITION, not make-table: the table component has no zone support, so a
 row built through it cannot be clicked (research F5). Each row is rendered with a
-foreground color chosen by AGENT-LIGHT (green/red/yellow), a picked-row highlight
-(blue background + bold) when PICKED names that agent, and wrapped in
+foreground color chosen by AGENT-LIGHT (green/red/yellow) and wrapped in
 (tui:zone-mark \"agent-row:<name>\" ...) so the row is a click target. The whole row,
-including its closing marker, stays on ONE line and short enough for *agent-width*
-so the viewport does not clip the end marker (research risk 4).
+including its closing marker, stays on ONE line and is truncated to WIDTH columns
+when WIDTH is given, so the viewport never has to clip the end marker (research
+risk 4) and the pane box never outgrows the layout.
 An empty society renders the header alone — the pane must still be visible.
 Calling it with no :picked is valid and renders every row unhighlighted."
   (let ((lines (list (format nil "  ~A  ~A" "agent" "status"))))
+    (dolist (line (if (listp detail) detail (when detail (list detail))))
+      (push (if (and width (plusp width))
+                 (truncate-text line width)
+                 line)
+            lines))
     (dolist (agent agents)
       (let* ((name (or (getf agent :name) "?"))
              (color (ecase (agent-light agent)
@@ -385,28 +620,74 @@ Calling it with no :picked is valid and renders every row unhighlighted."
              ;; agent-row-text, but no longer gets a blue background +
              ;; bold highlight.
              (style (tui:make-style :foreground color))
-             (text (tui:render-styled style (agent-row-text agent :picked picked))))
+             (text (tui:render-styled style
+                                      (agent-row-text agent :picked picked :width width))))
         (push (tui:zone-mark (format nil "agent-row:~A" name) text) lines)))
     (lines-to-string (nreverse lines))))
 (export 'render-agent-rows)
 
-(defun render-approval-strip (pending)
+(defparameter *approval-decisions* '(:grant-once :grant-session :grant-always :deny)
+  "The resolution decisions the image's sexpr.tui:resolve-approval accepts, in the
+order the strip renders them. The set is the image's contract
+(notes/tui.md §9); a request may offer any subset via :restarts.")
+(export '*approval-decisions*)
+
+(defun approval-decisions (pending)
+  "The decisions to offer for PENDING: the canonical order intersected with the
+request's :restarts when that is a list, else the two always-safe defaults
+(:grant-once :deny). PURE and total — a non-list :restarts, NIL, or T degrades to
+the defaults rather than signalling."
+  (let* ((plist (if (listp pending) pending nil))
+         (offered (getf plist :restarts)))
+    (if (and (listp offered) offered)
+        (let ((subset (remove-duplicates offered :test #'eq)))
+          (or (remove-if-not (lambda (d) (member d subset)) *approval-decisions*)
+              '(:grant-once :deny)))
+        '(:grant-once :deny))))
+(export 'approval-decisions)
+
+(defun approval-zone-id (decision)
+  "The zone id of one approval decision's button: \"approval:<decision>\". The
+SYMBOL-NAME is used because ~A on a keyword would drop the colon and, worse,
+print the name in the case the reader happened to intern it; zone ids are part
+of the client's own click contract and are matched literally."
+  (format nil "approval:~A" (string-downcase (symbol-name decision))))
+(export 'approval-zone-id)
+
+(defun render-approval-strip (pending &optional width)
   "The approval resolution strip: NIL when PENDING is NIL, else one line naming the
-capability/target/description and carrying the two zoned affordances the mouse
-dispatch hit-tests — (tui:zone-mark \"approval:grant-once\" \"[grant-once]\") and
-(tui:zone-mark \"approval:deny\" \"[deny]\").
+capability/target/description and carrying one zoned affordance per decision the
+request offers (APPROVAL-DECISIONS) — e.g. (tui:zone-mark \"approval:grant-once\"
+\"[grant-once]\"). Rendering every offered restart is what makes grant-session /
+grant-always reachable: they were previously carried on the wire and never shown.
+WIDTH, when positive, truncates the descriptive part so the whole strip stays
+inside its row (the zone markers are ANSI and count zero columns).
 PENDING is the model's pending-approval plist (or T when only a flag arrived); a
 non-list PENDING degrades to placeholders rather than signalling. The strip is
 composed as its own line OUTSIDE the chat scrollback, so stored transcript text is
 never polluted with zone markers (research open question 2)."
   (when pending
-    (let ((plist (if (listp pending) pending nil)))
-      (format nil "approval: ~A ~A ~A  ~A ~A"
-              (or (getf plist :capability) "?")
-              (or (getf plist :target) "")
-              (or (getf plist :description) "")
-              (tui:zone-mark "approval:grant-once" "[grant-once]")
-              (tui:zone-mark "approval:deny" "[deny]")))))
+    (let* ((plist (if (listp pending) pending nil))
+           (decisions (approval-decisions pending))
+           (buttons (mapcar (lambda (d)
+                              (tui:zone-mark (approval-zone-id d)
+                                             (format nil "[~A]"
+                                                     (string-downcase (symbol-name d)))))
+                            decisions))
+           ;; buttons are joined by a single space, so the row costs the sum of
+           ;; their widths plus one space between neighbours; that much of WIDTH
+           ;; is reserved before the descriptive text is truncated.
+           (reserve (+ (reduce #'+ buttons
+                               :key (lambda (b) (tui:visible-length b)))
+                       (max 0 (1- (length buttons)))))
+           (info (format nil "approval: ~A ~A ~A"
+                         (or (getf plist :capability) "?")
+                         (or (getf plist :target) "")
+                         (or (getf plist :description) "")))
+           (info (if (and width (plusp width))
+                     (truncate-text info (max 0 (- width reserve)))
+                     info)))
+      (format nil "~A  ~{~A~^ ~}" info buttons))))
 (export 'render-approval-strip)
 
 (defun render-section (title body &key focused (width nil width-p))
@@ -428,8 +709,12 @@ standalone callers want."
 (defun render-status-bar (text &optional (width 240))
   "The one-line status bar: connection state and the last error. It is deliberately
 plain — no border — so an error is never hidden behind layout decoration.
-CLIPPED to WIDTH columns so the bar cannot outgrow the frame it sits in."
-  (one-line (or text "") width))
+FITTED to WIDTH display columns (ANSI- and wide-character-aware), so the bar
+cannot outgrow the frame it sits in; an older caller's width is still respected."
+  (let ((text (or text "")))
+    (if (plusp width)
+        (truncate-text text width)
+        text)))
 (export 'render-status-bar)
 
 (defun %textarea-slot (textarea slot-name)

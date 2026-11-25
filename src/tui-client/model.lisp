@@ -65,6 +65,14 @@ is smaller, but it must exist for the same reason.")
   "The pane heights before the first window-size-msg arrives.")
 (export '*default-term-height*)
 
+(defparameter *tui-poll-interval* 5
+  "Ticks between fallback polls when the push channel is absent or closed. At the
+default 0.5s tick that is a 2.5s poll — slow enough not to hammer swank, fast
+enough for an operator to see a status change without the push channel. The poll
+is the documented recovery path for an image that came up without one
+(docs/sexpr-tui.md §11); without it the agent pane simply froze after init.")
+(export '*tui-poll-interval*)
+
 ;;;; --- the model -------------------------------------------------------
 
 (defclass tui-model ()
@@ -117,6 +125,11 @@ finalize-msg, before the reply line.")
    (agent-viewport :initform nil :accessor model-agent-viewport)
    (focused :initform :chat :accessor model-focused
             :documentation "Which textarea owns key input: :chat or :repl. Tab cycles.")
+   (follow-p :initform t :accessor model-follow-p
+             :documentation "Whether the chat viewport follows the newest line. T at
+the bottom; the user scrolling up holds position so history stays put while a turn
+streams (cl-tuition's viewport supports scrolling but nothing in the client used it
+until the wheel/page keys were wired).")
    (term-width :initarg :term-width :initform *default-term-width* :accessor model-term-width)
    (term-height :initarg :term-height :initform *default-term-height* :accessor model-term-height)
    (stats :initform nil :accessor model-stats
@@ -135,6 +148,30 @@ one failure this UI must never produce.")
 NIL handle), or NIL. `note-error` writes here rather than straight to status-text
 because `refresh-status` rebuilds status-text from connection stats at the end of
 every update and would otherwise drop the note before the operator could see it.")
+   (subscriptions :initform nil :accessor model-subscriptions
+                  :documentation "Agent names this client has subscribed on the push
+channel. Tracked so a poll/reconcile never subscribes twice: the server registers
+one listener per subscribe, and a duplicate would double-deliver every delta.")
+   (poll-interval :initarg :poll-interval :initform *tui-poll-interval*
+                  :accessor model-poll-interval
+                  :documentation "How many ticks between fallback polls when the push
+channel is absent or closed. See *TUI-POLL-INTERVAL*.")
+   (poll-tick :initform 0 :accessor model-poll-tick
+              :documentation "Ticks since the last fallback poll.")
+   (reconnect-cooldown :initarg :reconnect-cooldown :initform 0
+                       :accessor model-reconnect-cooldown
+                       :documentation "Ticks before another reconnect attempt. A
+closed channel is retried on a throttle so a dead image cannot turn the TUI
+into a hot loop of connect failures.")
+   (pending-repl-p :initform nil :accessor model-pending-repl-p
+                   :documentation "T while a REPL eval runs off the TEA thread.
+The status bar says so and Ctrl+X abandons the wait.")
+   (repl-generation :initform 0 :accessor model-repl-generation
+                    :documentation "Bumped by CANCEL-REPL so an in-flight worker's
+result is recognized as stale and dropped instead of rendered.")
+   (last-async-result :initform nil :accessor model-last-async-result
+                      :documentation "Headless-test hook: with no tuition program,
+the REPL worker stores its result message here instead of calling tui:send.")
    (quitting :initform nil :accessor model-quitting)))
 
 ;;;; --- bounded scrollback ----------------------------------------------
@@ -145,9 +182,26 @@ because entries are stored newest-first."
   (if (<= (length list) cap) list (subseq list 0 cap)))
 
 (defun append-line (list cap line)
-  "Append LINE to the bounded scrollback LIST. Returns the new list."
-  (%cap (cons (one-line line) list) cap))
+  "Append LINE to the bounded LIST, newest first. LINE must already be ONE logical
+display line (flat, unfitted): the chat and REPL renderers fit lines to the pane
+width, so the stored value keeps its whole content and a resize can re-fit it.
+Returns the new list."
+  (%cap (cons line list) cap))
 (export 'append-line)
+
+(defun flatten-line (line)
+  "Replace every newline in LINE with a space, so one transcript event is one
+logical line. Fitting to the pane is WRAP-TEXT's job, never a character-count
+clip: a clip would silently drop content and over-measure wide characters."
+  (substitute #\Space #\Newline (or line "")))
+(export 'flatten-line)
+
+(defun %fit-for-pane (logical-lines width)
+  "Wrap each entry of LOGICAL-LINES to WIDTH columns, preserving order. Delegates
+to view.lisp's WRAP-TEXT, so styled text (the grey reasoning block) and wide
+characters are fitted without corruption or overflow."
+  (mapcan (lambda (line) (wrap-text line width)) logical-lines))
+(export '%fit-for-pane)
 
 (defun model-render-chat (model)
   "Set the chat viewport content to the committed scrollback followed by the in-flight
@@ -159,26 +213,28 @@ it is appended at render time, so it can grow without touching the bounded scrol
 cap and is committed exactly once by finalize-msg."
   (let ((vp (model-chat-viewport model)))
     (when vp
-      (tui.viewport:viewport-set-content
-       vp (lines-to-string
-           ;; NON-DESTRUCTIVE reverse: the scrollback slot is stored NEWEST FIRST, so
-           ;; the view needs it oldest-first. NRVERSE would mutate the slot's cons
-           ;; cells in place, leaving the slot pointing at the old head (now the tail)
-           ;; and silently truncating the bounded scrollback to ONE line after every
-           ;; render (only the two most recent appends ever survived).
-           ;;
-           ;; one-line is applied to in-flight content so the streaming display
-           ;; matches the committed display (append-line strips newlines). Without
-           ;; this, a streamed fragment containing a newline makes the viewport
-           ;; jump during streaming and snap back when the line is committed.
-           (append (reverse (model-scrollback model))
-                   (when (model-in-flight-reasoning model)
-                     (list (tui:render-styled
-                            (tui:make-style :foreground tui:*fg-bright-black*)
-                            (one-line (format nil "~A: ~A" :reasoning (model-in-flight-reasoning model))))))
-                   (when (model-in-flight model)
-                     (list (one-line (model-in-flight model)))))))
-      (tui.viewport:viewport-goto-bottom vp)))
+      (let* ((width (chat-pane-width model))
+             ;; NON-DESTRUCTIVE reverse: the scrollback slot is stored NEWEST FIRST,
+             ;; so the view needs it oldest-first. NRVERSE would mutate the slot's cons
+             ;; cells in place and silently truncate the bounded scrollback.
+             (display (nreverse (copy-list
+                                 (%fit-for-pane (model-scrollback model) width)))))
+        (when (model-in-flight-reasoning model)
+          (setf display
+                (append display
+                        (wrap-text (tui:render-styled
+                                    (tui:make-style :foreground tui:*fg-bright-black*)
+                                    (format nil "~A: ~A"
+                                            :reasoning (model-in-flight-reasoning model)))
+                                   width))))
+        (when (model-in-flight model)
+          (setf display (append display (wrap-text (model-in-flight model) width))))
+        (tui.viewport:viewport-set-content vp (lines-to-string display))
+        ;; FOLLOW MODE: at the bottom the transcript tracks new output; scrolled
+        ;; away it holds its position so a streaming turn does not yank the
+        ;; operator back down mid-read.
+        (when (model-follow-p model)
+          (tui.viewport:viewport-goto-bottom vp)))))
   model)
 (export 'model-render-chat)
 
@@ -189,21 +245,27 @@ follows the newest line, which is what makes a streamed turn readable without
 scrolling."
   (setf (model-scrollback model)
         (append-line (model-scrollback model)
-                     (model-scrollback-cap model) line))
+                     (model-scrollback-cap model)
+                     (flatten-line line)))
   (model-render-chat model)
   model)
 
 (defun model-append-repl-line (model line)
-  "Append LINE to the REPL output, bounded by repl-cap."
+  "Append LINE to the REPL output as one logical line, bounded by repl-cap, then
+re-render wrapped to the pane width. A REPL result can be arbitrarily long (a
+printed structure, a file listing), so it gets the same fitting as chat."
   (setf (model-repl-lines model)
-        (append-line (model-repl-lines model) (model-repl-cap model) line))
+        (append-line (model-repl-lines model) (model-repl-cap model)
+                     (flatten-line line)))
   (let ((vp (model-repl-viewport model)))
     (when vp
       ;; NON-DESTRUCTIVE reverse for the same reason as MODEL-RENDER-CHAT: the
       ;; repl-lines slot is stored newest-first and NRVERSE would truncate it.
-      (tui.viewport:viewport-set-content vp
-                                         (lines-to-string
-                                          (reverse (model-repl-lines model))))
+      (tui.viewport:viewport-set-content
+       vp (lines-to-string
+           (nreverse (copy-list
+                      (%fit-for-pane (model-repl-lines model)
+                                     (chat-pane-width model))))))
       (tui.viewport:viewport-goto-bottom vp)))
   model)
 
@@ -252,23 +314,32 @@ the status bar stays data."
              (format nil "~A" status))))))
 (export 'reply-error-text)
 
+(defvar *swank-rpc-lock* (sb-thread:make-mutex :name "tui-swank-rpc")
+  "Serializes the full request/response cycle of every swank RPC. The async REPL
+worker and any synchronous caller (poll, resync, note) share one connection, so
+the write of a packet and the read of its reply must be one critical section or
+two threads interleave half a frame each.")
+(export '*swank-rpc-lock*)
+
 (defun swank-rpc (connection form-text &key (package "SWANK-IO-PACKAGE"))
   "Run one sexpr.tui RPC over SWANK-CONNECTION. Returns (VALUES value error).
 FORM-TEXT is packet TEXT (see the file header). ERROR is NIL on success, otherwise a
 string that belongs in the status bar: :abort, :reader-error, :eof, :no-match, or the
 text of a condition the connection raised. Nothing is ever signalled out of here — the
-caller decides what to do with the last error.
+caller decides what to do with the last error. THE WHOLE CYCLE IS SERIALIZED under
+*SWANK-RPC-LOCK* (an async worker may share this connection).
 PACKAGE is the buffer package the image reads the form in (default
 SWANK-IO-PACKAGE, which works for fully-qualified forms only — see
 send-repl-form for why the REPL form needs COMMON-LISP-USER)."
   (when (null connection)
     (return-from swank-rpc (values nil "no swank connection")))
   (handler-case
-      (let ((reply (swank-eval connection form-text :package package)))
-        (cond
-          ((eq (getf reply :status) :ok)
-           (values (swank-value connection reply) nil))
-          (t (values nil (reply-error-text reply)))))
+      (sb-thread:with-mutex (*swank-rpc-lock*)
+        (let ((reply (swank-eval connection form-text :package package)))
+          (cond
+            ((eq (getf reply :status) :ok)
+             (values (swank-value connection reply) nil))
+            (t (values nil (reply-error-text reply))))))
     (error (e)
       (handler-case (client-note-error! connection e) (error () nil))
       (values nil (format nil "rpc error: ~A" e)))))
@@ -337,6 +408,233 @@ object exists at all) rather than crashing init."
     (error () (not (null program)))))
 (export 'program-running-p)
 
+;;; --- async REPL ------------------------------------------------------
+;;;
+;;; Every other RPC was synchronous, so a REPL form that called the model froze
+;;; the whole UI for the length of the turn (up to the 30s readout timeout). The
+;;; REPL is where that hurts most — it is the operator's live console — so its
+;;; eval runs on a background thread and delivers an ordinary rpc-result-msg.
+;;; SWANK-RPC serializes the wire under *SWANK-RPC-LOCK*, so a worker and the
+;;; poller cannot interleave packets; a cancel bumps MODEL-REPL-GENERATION and
+;;; the stale result is dropped rather than rendered.
+
+(defparameter *tui-async-repl* t
+  "When T (the production default), a REPL eval runs on a background thread and
+delivers an rpc-result-msg, so a slow form cannot freeze typing. NIL keeps the
+synchronous path; the headless suite binds it so canned replies are consumed
+deterministically.")
+(export '*tui-async-repl*)
+
+(defun queue-async-repl (model connection form-text text)
+  "Run one REPL RPC off the TEA thread and deliver the result as a message.
+Returns MODEL immediately. The worker captures CONNECTION and its GENERATION at
+queue time: a reconnect replaces the slot, and a cancel bumps the generation, so
+the two races resolve without a lock (a stale result is dropped). With no
+tuition program the message lands in MODEL-LAST-ASYNC-RESULT for the headless
+tests. Never signals."
+  (let ((program (model-program model))
+        (generation (incf (model-repl-generation model))))
+    (setf (model-pending-repl-p model) t
+          (model-last-async-result model) nil)
+    (refresh-status model)
+    (sb-thread:make-thread
+     (lambda ()
+       (let (value error)
+         (multiple-value-setq (value error) (swank-rpc connection form-text))
+         (let* ((live (eql generation (model-repl-generation model)))
+                (message (if live
+                             (make-rpc-result-msg :form text :value value
+                                                 :error error)
+                             (make-async-done-msg :cancelled t))))
+           (if program
+               (tui:send program message)
+               (setf (model-last-async-result model) message))))
+       nil)
+     :name "tui-repl")
+  model))
+(export 'queue-async-repl)
+
+(defun cancel-repl (model)
+  "Abandon the in-flight REPL eval: bump the generation so the worker's result
+is dropped, clear the pending flag and say so. The blocking read itself cannot
+be killed, but the UI has been responsive the whole time; only the stale render
+is prevented. Returns MODEL."
+  (when (model-pending-repl-p model)
+    (incf (model-repl-generation model))
+    (setf (model-pending-repl-p model) nil)
+    (note-error model "repl cancelled")
+    (refresh-status model))
+  model)
+(export 'cancel-repl)
+
+;;; --- fallback poll ---------------------------------------------------
+;;;
+;;; The push channel is the normal path, but it is OPTIONAL: an image may come up
+;;; without one (the wrapper omits --push-port when nothing listens). The
+;;; documented recovery is a poll (docs/sexpr-tui.md §11), not a frozen UI: tick
+;;; re-arms itself forever, and this turns some of those ticks into a swank
+;;; reconcile. It also closes the membership gap until agent-added/agent-removed
+;;; exist on the bus: a society that grows during a session becomes visible.
+
+(defun push-connection-live-p (model)
+  "Whether MODEL's push channel exists and has not recorded a close. A NIL
+connection and a closed one are both 'no deltas' and both fall back to polling."
+  (let ((push (model-push-connection model)))
+    (and push (eql 0 (client-stats-get push :connection-closed)))))
+
+(defun reconcile-subscriptions (model agents)
+  "Subscribe the live push channel to every agent in AGENTS not already covered,
+and record the new set on MODEL. Membership changes are not pushed yet, so the
+poller is what keeps a growing society visible; subscribing twice would register
+two listeners and double-deliver every delta, hence the MODEL-SUBSCRIPTIONS set.
+A failed write is noted, never signalled."
+  (let ((push (model-push-connection model)))
+    (when (and push (push-connection-live-p model))
+      (let ((known (model-subscriptions model)))
+        (dolist (name (sort (remove nil (mapcar (lambda (a) (getf a :name)) agents))
+                            #'string<))
+          (unless (member name known :test #'string=)
+            (handler-case
+                (progn
+                  (write-wire push (list :subscribe :agent name))
+                  (push name known)
+                  (setf (model-subscriptions model) known))
+              (error (e)
+                (handler-case (client-note-error! push e) (error () nil))
+                (note-error model (format nil "subscribe failed: ~A" e)))))))))
+  model)
+(export 'reconcile-subscriptions)
+
+(defun poll-image (model)
+  "Reconcile the society and the picked transcript over swank. This is the image
+speaking as the truth when deltas cannot arrive: refresh agent-snapshot (rows,
+statuses, handles, lights), subscribe to any newcomer, then fetch the picked
+transcript from the cursor and append what is new. Every failure is noted, never
+signalled; a partial success keeps its last good state."
+  (let ((conn (model-swank-connection model)))
+    (when conn
+      (multiple-value-bind (agents error)
+          (rpc-agent-snapshot conn)
+        (when agents
+          (setf (model-agents model) agents)
+          (reconcile-subscriptions model agents)
+          (refresh-agent-viewport model))
+        (note-error model error))
+      (when (model-picked-agent model)
+        (multiple-value-bind (events cursor error)
+            (rpc-transcript-delta conn (model-picked-agent model) (model-cursor model))
+          (dolist (line (mapcar #'event-to-line (or events '())))
+            (model-append-chat-line model line))
+          (when (integerp cursor) (setf (model-cursor model) cursor))
+          (note-error model error)))))
+  model)
+(export 'poll-image)
+
+(defun tick-fallback-poll (model)
+  "Run POLL-IMAGE on a throttle when the push channel cannot be carrying deltas.
+A live push channel makes polling unnecessary (and undesirable: the deltas are the
+truth). The counter saturates at MODEL-POLL-INTERVAL and resets on a poll, so the
+cadence is one poll per interval regardless of how ticks are paced."
+  (if (push-connection-live-p model)
+      model
+      (let ((tick (1+ (model-poll-tick model))))
+        (if (>= tick (max 1 (model-poll-interval model)))
+            (progn
+              (setf (model-poll-tick model) 0)
+              (poll-image model))
+            (setf (model-poll-tick model) tick))))
+  model)
+(export 'tick-fallback-poll)
+
+;;; --- reconnect -------------------------------------------------------
+;;;
+;;; The wrapper can leave a channel down (--no-server, an image that died, a
+;;; network partition) and the image can outlive either socket. The Genera
+;;; posture is attach/detach, so a closed channel is RETRIED on a throttle
+;;; rather than leaving a zombie UI: a configured-but-closed push or swank
+;;; connection is rebuilt, re-subscribed, re-read and reconciled. A channel that
+;;; was never configured (NIL — e.g. --push-port omitted) has nothing to retry
+;;; and stays on the poll path instead.
+
+(defparameter *tui-reconnect-cooldown* 6
+  "Ticks between reconnect attempts once a configured channel is closed. Six
+ticks at the default 0.5s tick is three seconds: slow enough not to hammer a
+dead host, fast enough for an operator to see the TUI come back after restarting
+an image. Only failures are rate-limited; a successful reconnect resets the
+cooldown immediately.")
+(export '*tui-reconnect-cooldown*)
+
+(defun swank-connection-live-p (model)
+  "Whether MODEL's swank channel exists and has not recorded a close."
+  (let ((conn (model-swank-connection model)))
+    (and conn (eql 0 (client-stats-get conn :connection-closed)))))
+
+(defun reconnect-channels (model)
+  "Rebuild whichever CONFIGURED channel is closed. Swank first (every other RPC
+needs it), then push (its reader, subscriptions and program slot). Each success
+reconciles state; each failure is noted and retried later by the cooldown. A NIL
+channel is skipped: it was never configured, so there is nothing to reattach.
+Nothing here signals."
+  ;; swank
+  (let ((old (model-swank-connection model)))
+    (when (and old (not (swank-connection-live-p model)))
+      (handler-case
+          (let ((conn (swank-connect (swank-connection-host old)
+                                     (swank-connection-port old))))
+            (setf (model-swank-connection model) conn)
+            (setf (model-reconnect-cooldown model) 0)
+            (note-error model (format nil "swank reconnected ~A:~A"
+                                      (swank-connection-host conn)
+                                      (swank-connection-port conn)))
+            ;; the new channel must carry the society before anything else asks
+            (poll-image model))
+        (error (e)
+          (handler-case (client-note-error! old e) (error () nil))
+          (note-error model (format nil "swank reconnect failed: ~A" e))))))
+  ;; push
+  (let ((old (model-push-connection model)))
+    (when (and old (not (push-connection-live-p model)))
+      (handler-case
+          (let ((conn (connect-push (tui-connection-host old)
+                                    (tui-connection-port old)
+                                    :program (model-program model))))
+            (setf (model-push-connection model) conn)
+            (setf (tui-connection-program conn) (model-program model))
+            (when (model-program model)
+              (start-wire-reader conn)
+              (setf (model-readers-running model) t))
+            (reconcile-subscriptions model (model-agents model))
+            (setf (model-reconnect-cooldown model) 0)
+            (note-error model (format nil "push reconnected ~A:~A"
+                                      (tui-connection-host conn)
+                                      (tui-connection-port conn))))
+        (error (e)
+          (handler-case (client-note-error! old e) (error () nil))
+          (note-error model (format nil "push reconnect failed: ~A" e))))))
+  (refresh-status model)
+  model)
+(export 'reconnect-channels)
+
+(defun maybe-reconnect (model)
+  "Throttle reconnect attempts while a CONFIGURED channel is closed. A NIL
+channel (e.g. --push-port omitted) is not a failure to retry — it was never
+configured, so the client stays on the poll path; only a channel that EXISTS and
+has recorded a close is rebuilt. When everything is healthy this costs one
+comparison per tick. Returns MODEL."
+  (let ((push-closed (let ((c (model-push-connection model)))
+                       (and c (not (push-connection-live-p model)))))
+        (swank-closed (let ((c (model-swank-connection model)))
+                        (and c (not (swank-connection-live-p model))))))
+    (when (or push-closed swank-closed)
+      (cond
+        ((plusp (model-reconnect-cooldown model))
+         (decf (model-reconnect-cooldown model)))
+        (t
+         (setf (model-reconnect-cooldown model) *tui-reconnect-cooldown*)
+         (reconnect-channels model)))))
+  model)
+(export 'maybe-reconnect)
+
 ;;;; --- status bar ------------------------------------------------------
 
 (defun connection-error-text (connection)
@@ -357,13 +655,18 @@ connection during render. An error is retained across successful refreshes until
 one supersedes it — clearing it on the next healthy tick would hide the failure."
   (let ((push (model-push-connection model))
         (swank (model-swank-connection model)))
+    ;; ONE ENTRY PER CONNECTION, keyed by label: an earlier version appended two
+    ;; anonymous three-element lists, producing a plist with duplicate keys that
+    ;; nothing could read unambiguously.
     (setf (model-stats model)
-          (append (when push (list (client-stats-get push :last-error)
-                                   (client-stats-get push :packets-read)
-                                   (client-stats-get push :connection-closed)))
-                  (when swank (list (client-stats-get swank :last-error)
-                                     (client-stats-get swank :packets-read)
-                                     (client-stats-get swank :connection-closed)))))
+          (list :push (when push
+                        (list :last-error (client-stats-get push :last-error)
+                              :packets-read (client-stats-get push :packets-read)
+                              :connection-closed (client-stats-get push :connection-closed)))
+                :swank (when swank
+                         (list :last-error (client-stats-get swank :last-error)
+                               :packets-read (client-stats-get swank :packets-read)
+                               :connection-closed (client-stats-get swank :connection-closed)))))
     (let* ((errors (loop for c in (remove nil (list push swank))
                          for err = (connection-error-text c)
                          when err collect err))
@@ -376,13 +679,16 @@ one supersedes it — clearing it on the next healthy tick would hide the failur
                          ((eq 0 (client-stats-get swank :connection-closed)) "swank: connected")
                          (t "swank: closed")))
           (readers (if (model-readers-running model) "readers: on" "readers: off"))
+          ;; an async REPL eval in flight is operator-visible state, not noise:
+          ;; it says why a result has not appeared yet.
+          (repl (if (model-pending-repl-p model) "repl: busy" "repl: idle"))
           (picked (or (model-picked-agent model) "no agent"))
           (notes (append (remove nil (list (model-note model)))
                          errors)))
       (setf (model-status-text model)
             (one-line
-             (format nil "~A | ~A | ~A | agent: ~A~@[ | ~A~]"
-                     swank-state push-state readers picked
+             (format nil "~A | ~A | ~A | ~A | agent: ~A~@[ | ~A~]"
+                     swank-state push-state readers repl picked
                      (when notes (last-error-of notes)))))))
   model)
 
@@ -473,9 +779,14 @@ picked agent. The picked name is threaded through so the pane's row highlight fo
 the model's picked state (S04/T05)."
   (let ((vp (model-agent-viewport model)))
     (when vp
-      (tui.viewport:viewport-set-content
-       vp (render-agent-rows (model-agents model)
-                             :picked (model-picked-agent model)))))
+      (let* ((picked-row (find (model-picked-agent model) (model-agents model)
+                               :key (lambda (a) (getf a :name)) :test #'string=)))
+        (tui.viewport:viewport-set-content
+         vp (render-agent-rows (sorted-agents (model-agents model))
+                               :picked (model-picked-agent model)
+                               :width (agent-pane-inner-width model)
+                               :detail (and picked-row
+                                           (agent-detail-lines picked-row)))))))
   model)
 
 ;;;; --- agent lights and per-agent state (M004/S04 T04) ----------------
@@ -560,6 +871,96 @@ matches no row is a no-op (the snapshot is unchanged)."
                       copy))))
 (export '%set-agent-streaming)
 
+;;; --- per-agent content scoping ---------------------------------------
+;;;
+;;; A society is multi-agent but the chat pane shows ONE transcript, so every
+;;; content-bearing wire frame must be scoped to the picked agent. DELTA always
+;;; honoured that; FINALIZE, TOOL-START, TOOL-RESULT, BUDGET-EXCEEDED and RESYNC
+;;; did not. An out-of-order FINALIZE for a neighbouring agent committed the
+;;; picked agent's half-streamed reply; a neighbour's tool output landed in the
+;;; picked transcript; a neighbour's resync refetched the picked transcript from
+;;; the wrong cursor. One predicate now answers the question everywhere.
+
+(defun agent-is-picked-p (model agent)
+  "Whether AGENT names the picked agent whose content belongs in the picked chat
+pane. NIL AGENT is treated as the picked agent: the server always sends one, so a
+missing field means the frame predates the convention, not a different agent.
+PURE: compares against model-picked-agent only."
+  (or (null agent)
+      (null (model-picked-agent model))
+      (and (stringp agent)
+           (string= agent (model-picked-agent model)))))
+(export 'agent-is-picked-p)
+
+;;; --- pane widths ------------------------------------------------------
+
+(defun chat-pane-width (model)
+  "The chat/REPL column width in columns, derived from the current terminal size.
+This is the width every chat and REPL line is fitted to (view.lisp's
+WRAP-TEXT/TRUNCATE-TEXT), so a long transcript line cannot widen its section box
+past the layout."
+  (nth 0 (multiple-value-list
+         (layout-dimensions (model-term-width model) (model-term-height model)))))
+(export 'chat-pane-width)
+
+(defun left-column-width (model)
+  "The full width of the left column INCLUDING its border: the strip and the status
+bar are padded to this, and the agent pane takes the rest."
+  (+ 2 (chat-pane-width model)))
+(export 'left-column-width)
+
+(defun agent-pane-inner-width (model)
+  "The agent pane's content width: its outer width minus the two border columns.
+Rows are truncated to this so a long agent name cannot widen the pane box."
+  (max 0 (- (nth 1 (multiple-value-list
+                   (layout-dimensions (model-term-width model)
+                                      (model-term-height model))))
+            2)))
+(export 'agent-pane-inner-width)
+
+(defun sorted-agents (agents)
+  "AGENTS ordered by :name, with a missing name sorting first. The snapshot's own
+order is hash-table iteration order and changes between calls, so the pane is only
+predictable if the client sorts it — which sexpr.tui:agent-snapshot says it should.
+PURE: returns a new list."
+  (sort (copy-list agents)
+        (lambda (a b)
+          (string< (or (getf a :name) "") (or (getf b :name) "")))))
+(export 'sorted-agents)
+
+(defun agent-row-name= (row name)
+  "Whether ROW's :name is the string NAME. Missing names never match."
+  (and (stringp name)
+       (stringp (getf row :name))
+       (string= (getf row :name) name)))
+
+(defun %merge-agent-row (model row)
+  "Insert ROW into MODEL's snapshot, replacing any row of the same name. ROW is a
+data-only projection from the image (agent-added); PURE of I/O. A malformed row
+without a name is dropped rather than inserted, so a bad frame cannot poison the
+pane."
+  (let ((name (getf row :name)))
+    (when (stringp name)
+      (let ((rows (model-agents model)))
+        (setf (model-agents model)
+              (if (find name rows :key (lambda (a) (getf a :name)) :test #'string=)
+                  (mapcar (lambda (a) (if (agent-row-name= a name) row a)) rows)
+                  (cons row rows))))))
+  model)
+(export '%merge-agent-row)
+
+(defun %drop-agent-row (model name)
+  "Remove the snapshot row named NAME and forget its local subscription. Returns
+MODEL. Data-only; the caller decides whether to tell the server."
+  (when (stringp name)
+    (setf (model-agents model)
+          (remove name (model-agents model)
+                  :key (lambda (a) (getf a :name)) :test #'string=))
+    (setf (model-subscriptions model)
+          (remove name (model-subscriptions model) :test #'string=)))
+  model)
+(export '%drop-agent-row)
+
 (defun resolve-pending-approval (model decision)
   "Resolve the picked agent's pending approval with DECISION (a keyword such as
 :grant-once). Returns MODEL.
@@ -620,13 +1021,15 @@ stale zone whose bounds are not hit is never returned."
           do (return name)))
 (export 'agent-at-mouse)
 
-(defun approval-action-at-mouse (msg)
-  "The approval decision a click at MSG selects: :grant-once when the
-grant-once zone is hit, :deny when the deny zone is hit, else NIL. PURE."
-  (cond
-    ((tui:zone-in-bounds-p (tui:zone-get "approval:grant-once") msg) :grant-once)
-    ((tui:zone-in-bounds-p (tui:zone-get "approval:deny") msg) :deny)
-    (t nil)))
+(defun approval-action-at-mouse (msg &optional (decisions *approval-decisions*))
+  "The approval decision a click at MSG selects: the DECISIONS member whose zone
+(\"approval:<decision>\") contains MSG, or NIL. Every button the strip renders is
+hit-testable, so grant-session / grant-always are reachable by mouse and not just
+by the two hardcoded keys. PURE."
+  (loop for decision in decisions
+        for zone = (tui:zone-get (approval-zone-id decision))
+        when (and zone (tui:zone-in-bounds-p zone msg))
+          do (return decision)))
 (export 'approval-action-at-mouse)
 
 (defun model-switch-agent (model name)
@@ -655,26 +1058,120 @@ signalled."
         (model-append-chat-line model line))
       (when (integerp cursor) (setf (model-cursor model) cursor))
       (note-error model error))
+    ;; the strip shows the NEW picked agent's pending request, not the old one's.
+    ;; Without this, switching to a second waiting agent kept the first one's
+    ;; approval on screen and C-g/C-d would resolve the wrong row.
+    (let ((row (find name (model-agents model)
+                     :key (lambda (a) (getf a :name)) :test #'string=)))
+      (setf (model-pending-approval model) (and row (getf row :pending-approval))))
     (refresh-agent-viewport model))
   model)
 (export 'model-switch-agent)
 
 (defun handle-mouse (model msg)
   "Handle one mouse event and return (VALUES MODEL NIL).
-Only a LEFT mouse PRESS does anything. While an approval is pending, a click is
-resolved through APPROVAL-ACTION-AT-MOUSE first — the strip owns the click so a stray
-row click cannot switch away from the agent awaiting resolution. Otherwise a click on
-a row zone switches the picked agent via MODEL-SWITCH-AGENT. Every other event is a
-no-op."
+Only a LEFT mouse PRESS does anything. A click on an approval affordance resolves
+the picked agent's pending approval (whichever decision was hit). ANY OTHER CLICK
+FALLS THROUGH to the agent rows: while an approval is pending the strip used to own
+every click, which made a second waiting agent unreachable — but notes/tui.md §9
+wants simultaneous approvals resolved one by one, and that requires being able to
+select the other yellow row. Every other event is a no-op."
   (when (and (tui:mouse-press-event-p msg)
              (eq (tui:mouse-event-button msg) :left))
-    (if (model-pending-approval model)
-        (let ((action (approval-action-at-mouse msg)))
-          (when action (resolve-pending-approval model action)))
-        (let ((name (agent-at-mouse (model-agents model) msg)))
-          (when name (model-switch-agent model name)))))
+    (let ((action (and (model-pending-approval model)
+                       (approval-action-at-mouse
+                        msg (approval-decisions (model-pending-approval model))))))
+      (if action
+          (resolve-pending-approval model action)
+          (let ((name (agent-at-mouse (model-agents model) msg)))
+            (when name (model-switch-agent model name))))))
   (values model nil))
 (export 'handle-mouse)
+
+;;; --- scrolling -------------------------------------------------------
+;;;
+;;; cl-tuition's viewport already implements wheel/page scrolling, but the client
+;;; never called it: unhandled keys went to the focused textarea and only
+;;; left-press mouse events were read, so history and long agent lists were
+;;; unreachable. The wheel is routed by LAYOUT GEOMETRY (not by a zone mark):
+;;; a zone around a whole multi-line pane only records its first line, so a
+;;; geometric hit-test is both simpler and total. Coordinates are 1-based, the
+;;; convention zone-info-start-x/y already established.
+
+(defun pane-at-mouse (model msg)
+  "The pane (:chat, :repl or :agents) under MSG's terminal coordinates, derived
+from layout-dimensions; NIL over the chrome rows. The left column is split into
+the chat section (its viewport plus the *section-overhead* rows) and the REPL
+section below it; anything right of the left column's border is the agent pane.
+PURE."
+  (let ((x (tui:mouse-event-x msg))
+        (y (tui:mouse-event-y msg)))
+    (when (and (plusp x) (plusp y))
+      (multiple-value-bind (chat-w agent-w chat-h repl-h agent-h)
+          (layout-dimensions (model-term-width model) (model-term-height model))
+        (declare (ignore agent-w repl-h agent-h))
+        (let ((left-width (+ chat-w 2))
+              (chat-rows (+ chat-h *section-overhead*))
+              (body-rows (+ chat-h repl-h (* 2 *section-overhead*))))
+          (cond
+            ((> x left-width) (if (<= y body-rows) :agents nil))
+            ((<= y chat-rows) :chat)
+            ((<= y body-rows) :repl)
+            (t nil)))))))
+(export 'pane-at-mouse)
+
+(defun %scroll-viewport (model viewport delta &optional (track-follow nil))
+  "Scroll VIEWPORT by DELTA lines (negative up), or to an edge when DELTA is :top
+or :bottom. When TRACK-FOLLOW is T, re-derive follow mode from the resulting
+position: at the bottom the chat follows new output, scrolled away it holds its
+position. A NIL viewport is a no-op. Returns MODEL."
+  (when viewport
+    (cond
+      ((eq delta :top) (tui.viewport:viewport-goto-top viewport))
+      ((eq delta :bottom) (tui.viewport:viewport-goto-bottom viewport))
+      ((plusp delta) (tui.viewport:viewport-scroll-down viewport delta))
+      ((minusp delta) (tui.viewport:viewport-scroll-up viewport (- delta))))
+    (when track-follow
+      (setf (model-follow-p model)
+            (tui.viewport:viewport-at-bottom-p viewport))))
+  model)
+(export '%scroll-viewport)
+
+(defun scroll-key-delta (model key ctrl)
+  "The scroll amount for KEY in the focused pane, or NIL when KEY is not a scroll
+key. Page keys move a page, Home/End jump to an edge, Ctrl+B/Ctrl+F are the
+emacs-shaped page back/forward. The page size comes from the FOCUSED pane, so the
+same key behaves correctly with either input focused."
+  (let ((page (if (eq (model-focused model) :repl)
+                  (tui.viewport:viewport-height (model-repl-viewport model))
+                  (tui.viewport:viewport-height (model-chat-viewport model)))))
+    (cond
+      ((eq key :page-up) (- page))
+      ((eq key :page-down) page)
+      ((or (eq key :home) (and ctrl (characterp key) (char= key #\b))) :top)
+      ((or (eq key :end) (and ctrl (characterp key) (char= key #\f))) :bottom)
+      (t nil))))
+(export 'scroll-key-delta)
+
+(defun handle-scroll (model msg)
+  "Handle one mouse SCROLL event and return (VALUES MODEL NIL). The wheel scrolls
+the pane it is over by three lines; a direction that is not :up/:down is a no-op.
+Every other mouse message falls through to the caller's dispatch."
+  (let ((pane (pane-at-mouse model msg))
+        (direction (tui:mouse-scroll-direction msg)))
+    (when (and pane direction)
+      (let ((delta (ecase direction
+                     (:up -3)
+                     (:down 3)
+                     (:left 0)
+                     (:right 0))))
+        (unless (zerop delta)
+          (case pane
+            (:chat (%scroll-viewport model (model-chat-viewport model) delta t))
+            (:repl (%scroll-viewport model (model-repl-viewport model) delta))
+            (:agents (%scroll-viewport model (model-agent-viewport model) delta)))))))
+  (values model nil))
+(export 'handle-scroll)
 
 ;;;; --- init ------------------------------------------------------------
 
@@ -699,9 +1196,18 @@ Nothing here signals: every failure is recorded and the last good state is kept.
   ;; a FAILED greeter is the common first sight of a fresh image without
   ;; a provider: explain it before the operator concludes the TUI is broken
   (note-agent-failure model)
+  ;; validate a caller-supplied --agent against the snapshot BEFORE trusting it:
+  ;; an unknown name would leave the pane on a phantom agent, the chat empty, and
+  ;; the only explanation buried in the status bar.
+  (when (and (model-picked-agent model) (model-agents model)
+             (not (find (model-picked-agent model) (model-agents model)
+                        :key (lambda (a) (getf a :name)) :test #'string=)))
+    (note-error model (format nil "unknown agent ~A — picked the first snapshot row instead"
+                              (model-picked-agent model)))
+    (setf (model-picked-agent model) nil))
   ;; default the picked agent to the first snapshot row (sorted by name for a stable
   ;; choice) so a client started without --agent still has a society view and a
-  ;; target; --agent overrides it by being set before init runs.
+  ;; target; a validated --agent overrides it by being set before init runs.
   (when (and (null (model-picked-agent model)) (model-agents model))
     (let ((names (sort (remove nil (mapcar (lambda (a) (getf a :name)) (model-agents model)))
                        #'string<)))
@@ -737,6 +1243,8 @@ Nothing here signals: every failure is recorded and the last good state is kept.
                   ;; subscribe before any listener is registered. Keywords are
                   ;; package-independent; the server resolves the operator by name.
                   (write-wire push (list :subscribe :agent agent))
+                  ;; remember it, so the fallback poll never subscribes twice
+                  (push agent (model-subscriptions model))
                   nil)
               (error (e)
                 (handler-case (client-note-error! push e) (error () nil))
@@ -779,11 +1287,25 @@ The cmd is NIL except for the two quit keys. Nothing here signals."
       ((eq key :escape)
        (setf (model-quitting model) t)
        (values model (%quit-cmd)))
+      ;; Abandon an in-flight REPL eval. The blocking read cannot be killed, but
+      ;; the UI has stayed responsive; this prevents the stale render.
+      ((and ctrl (characterp key) (char-equal key #\x))
+       (cancel-repl model)
+       (values model nil))
       ((eq key :tab)
        (set-focus model (if (eq (model-focused model) :chat) :repl :chat))
        (values model nil))
       ((eq key :enter)
        (handle-enter model))
+      ;; Viewport scrolling: page keys and Ctrl+B/F scroll the FOCUSED pane. These
+      ;; are intercepted before the textarea branch, so they can never corrupt the
+      ;; input; the arrows stay with the textarea cursor.
+      ((scroll-key-delta model key ctrl)
+       (let ((delta (scroll-key-delta model key ctrl)))
+         (if (eq (model-focused model) :repl)
+             (%scroll-viewport model (model-repl-viewport model) delta)
+             (%scroll-viewport model (model-chat-viewport model) delta t)))
+       (values model nil))
       ;; Approval keyboard fallback, intercepted ONLY while an approval is pending and
       ;; placed BEFORE the textarea branch so it cannot steal printable keys (D027).
       ;; C-g grants once, C-d denies; with no pending approval both fall through to
@@ -807,6 +1329,115 @@ either. A NIL handle produces a status-bar error, not a crash."
       (send-repl-form model)))
 (export 'handle-enter)
 
+(defparameter *chat-commands*
+  '("/help" "/spawn" "/kill" "/approvals" "/clear")
+  "The client-side slash verbs the chat input understands. They act on the
+projection (or through ordinary RPCs); they are never sent to the model as
+notes.")
+(export '*chat-commands*)
+
+(defun chat-command-help-lines ()
+  "The /help text: one REPL line per verb."
+  (list "/help        show this help"
+        "/spawn GOAL  spawn a worker subagent and return its handle"
+        "/kill [NAME] terminate an agent (default: picked)"
+        "/approvals   list every agent waiting on an approval"
+        "/clear       clear the chat transcript"))
+(export 'chat-command-help-lines)
+
+(defun %command-parts (text)
+  "Split a slash command TEXT into (VALUES name args): NAME without the leading
+slash, ARGS trimmed. PURE."
+  (let* ((space (position #\Space text :start 1))
+         (name (subseq text 1 (or space (length text))))
+         (args (if space
+                   (string-trim '(#\Space #\Tab) (subseq text space))
+                   "")))
+    (values name args)))
+
+(defun handle-chat-command (model text &optional ta)
+  "Execute one slash command from the chat input and return MODEL.
+The verbs are CLIENT-SIDE: they operate on the projection (R023) and reach the
+image only through the ordinary typed RPCs, so they inherit the same boundary
+rules and failure handling. The textarea is reset either way (a command is not
+an unfinished note). Nothing here signals."
+  (multiple-value-bind (name args) (%command-parts (or text ""))
+    (let ((args (or args "")))
+      (cond
+        ((string-equal name "help")
+         (dolist (line (chat-command-help-lines))
+           (model-append-repl-line model line)))
+        ((string-equal name "clear")
+         (setf (model-scrollback model) nil
+               (model-in-flight model) nil
+               (model-in-flight-reasoning model) nil)
+         (let ((vp (model-chat-viewport model)))
+           (when vp (tui.viewport:viewport-set-content vp ""))))
+        ((string-equal name "approvals")
+         (let ((rows (remove-if-not (lambda (a) (getf a :pending-approval))
+                                    (model-agents model))))
+           (if (null rows)
+               (model-append-repl-line model "approvals: none pending")
+               (dolist (row rows)
+                 (let ((p (getf row :pending-approval)))
+                   (model-append-repl-line
+                    model
+                    (format nil "approval: ~A ~A ~A"
+                            (or (getf row :name) "?")
+                            (or (getf p :capability) "?")
+                            (or (getf p :target) ""))))))))
+        ((string-equal name "spawn")
+         (cond
+           ((string= args "")
+            (note-error model "usage: /spawn GOAL"))
+           ((null (model-swank-connection model))
+            (note-error model "no swank connection — cannot spawn"))
+           (t
+            (let ((form-text (format nil "(sexpr.tui:spawn ~A)"
+                                     (swank-escape-string args))))
+              (multiple-value-bind (value error)
+                  (swank-rpc (model-swank-connection model) form-text)
+                (declare (ignore value))
+                (if error
+                    (note-error model (format nil "spawn failed: ~A" error))
+                    (progn
+                      (model-append-chat-line
+                       model (format nil "spawned: ~A" value))
+                      ;; refresh so the newcomer's row appears even if no push
+                      ;; channel announced it
+                      (poll-image model))))))))
+        ((string-equal name "kill")
+         (let* ((target-name (if (string= args "")
+                                 (model-picked-agent model)
+                                 args))
+                (row (and (stringp target-name)
+                          (find target-name (model-agents model)
+                                :key (lambda (a) (getf a :name)) :test #'string=)))
+                (handle (and row (getf row :handle))))
+           (cond
+             ((null handle)
+              (note-error model
+                          (format nil "no handle for agent ~A — cannot kill"
+                                  (or target-name "?"))))
+             ((null (model-swank-connection model))
+              (note-error model "no swank connection — cannot kill"))
+             (t
+              (let ((form-text (format nil "(sexpr.tui:kill ~A)"
+                                       (swank-escape-string handle))))
+                (multiple-value-bind (value error)
+                    (swank-rpc (model-swank-connection model) form-text)
+                  (declare (ignore value))
+                  (if error
+                      (note-error model (format nil "kill failed: ~A" error))
+                      (model-append-chat-line
+                       model (format nil "killed: ~A (~A)" handle target-name)))))))))
+        (t
+         (note-error model (format nil "unknown command /~A — try /help" name)))))
+    (when ta (tui.textarea:textarea-reset ta))
+    (refresh-status model)
+    model))
+(export 'handle-chat-command)
+
 (defun send-chat-note (model)
   "Send a chat note to the picked agent via `sexpr.tui:inject-note`.
 Uses the agent's :handle (never its name). Fire-and-forget: the confirmation
@@ -818,6 +1449,10 @@ is rendered locally; a reply only appears if the agent is actually running.
       ((or (null text) (string= text ""))
        (values model nil))
       (t
+       ;; A slash command is a client-side verb, never a note to the model.
+       (when (and (plusp (length text)) (char= (char text 0) #\/))
+         (handle-chat-command model text ta)
+         (return-from send-chat-note (values model nil)))
        (let ((conn (model-swank-connection model))
              (picked (model-picked-agent model)))
          (cond
@@ -838,18 +1473,34 @@ is rendered locally; a reply only appears if the agent is actually running.
                              (format nil "no handle for agent ~A — cannot send note" picked))
                  (values model nil))
                 (t
-                 (let* ((form-text (format nil "(sexpr.tui:inject-note ~A ~A)"
-                                           (swank-escape-string handle)
-                                           (swank-escape-string text)))
-                        (id (swank-next-id conn)))
-                   (handler-case
-                       (write-packet conn (rpc-payload form-text :id id))
-                     (error (e)
-                       (handler-case (client-note-error! conn e) (error () nil))
-                       (note-error model (format nil "note failed: ~A" e))))
-                   (model-append-chat-line model
-                                           (format nil "noted ~A: ~A" handle text))
-                   (when ta (tui.textarea:textarea-reset ta))
+                 ;; Synchronous inject-note: the reply says whether the note was
+                 ;; appended, and reading it keeps one request/one reply on the
+                 ;; swank channel (a fire-and-forget packet leaves an unanswered
+                 ;; reply that a later RPC must skip as unsolicited).
+                 (let ((form-text (format nil "(sexpr.tui:inject-note ~A ~A)"
+                                          (swank-escape-string handle)
+                                          (swank-escape-string text)))
+                       value error)
+                   (declare (ignore value))
+                   (multiple-value-setq (value error)
+                     (swank-rpc conn form-text))
+                   (if error
+                       ;; Nothing was appended in the image, so keep the draft (the
+                       ;; operator can retry) and add no local echo.
+                       (progn
+                         (handler-case (client-note-error! conn error) (error () nil))
+                         (note-error model (format nil "note failed: ~A" error)))
+                       ;; Render the SAME user event the transcript carries and advance
+                       ;; the cursor past it, so a resync/refetch cannot duplicate the
+                       ;; line or drift from the image's event count. The old synthetic
+                       ;; "noted <handle>: ..." was invisible to the cursor: it
+                       ;; duplicated on refetch and vanished on switch.
+                       (progn
+                         (model-append-chat-line
+                          model
+                          (event-to-line (list :type :user :content text)))
+                         (incf (model-cursor model))
+                         (when ta (tui.textarea:textarea-reset ta))))
                    (values model nil))))))))))))
 (export 'send-chat-note)
 
@@ -900,6 +1551,12 @@ blocks the connection thread, and the TUI freezes forever."
                              (cl:error (e) (cl:format nil \"ERR: ~~A\" e))))"
                             (swank-escape-string (or name ""))
                             (swank-escape-string text))))
+              ;; Production default: run off the TEA thread so a slow form
+              ;; cannot freeze input. The result comes back as rpc-result-msg.
+              (when *tui-async-repl*
+                (queue-async-repl model conn form-text text)
+                (when ta (tui.textarea:textarea-reset ta))
+                (return-from send-repl-form (values model nil)))
               (multiple-value-bind (value error)
                   (swank-rpc conn form-text)
                 (model-append-repl-line model
@@ -968,6 +1625,11 @@ skipped rather than signalled, so calling this before build-panes is a no-op."
     (when (model-agent-viewport model)
       (setf (tui.viewport:viewport-width (model-agent-viewport model)) agent-w
             (tui.viewport:viewport-height (model-agent-viewport model)) agent-h)))
+  ;; Content fitted to a WIDTH must be re-fitted when the width changes: agent
+  ;; rows/detail are truncated at render time, and cl-tuition's pad-block-rect
+  ;; pads but never truncates, so a stale wider line would widen the pane box
+  ;; past the frame on a shrink (a 60-column terminal rendered 64).
+  (refresh-agent-viewport model)
   model)
 (export 'set-pane-dimensions)
 
@@ -996,9 +1658,7 @@ the single `update` method owns the dispatch."
        (when agent
          (%set-agent-streaming model agent t)
          (refresh-agent-viewport model))
-       (when (or (null agent)
-                 (null (model-picked-agent model))
-                 (string= agent (model-picked-agent model)))
+       (when (agent-is-picked-p model agent)
          (cond
            ((eq kind :tool)
             ;; a tool's streamed output is its own committed line, never joined into
@@ -1021,22 +1681,27 @@ the single `update` method owns the dispatch."
        (values model nil)))
     ;; push channel: the streaming turn ended — commit the in-flight line (S05)
     ((finalize-msg-p msg)
-     (let ((agent (finalize-msg-agent msg))
-           (line (model-in-flight model))
-           (reasoning (model-in-flight-reasoning model)))
-       ;; commit the reasoning line FIRST (if any), then the reply line, so
-       ;; the thinking block appears above the reply in the scrollback.
-       (when reasoning
-         (setf (model-in-flight-reasoning model) nil)
-         (model-append-chat-line model
-                                  (tui:render-styled (tui:make-style :foreground tui:*fg-bright-black*)
-                                                     (one-line (format nil "~A: ~A" :reasoning reasoning)))))
-       ;; commit the accumulated reply line as ONE scrollback line and clear the buffer
-       ;; BEFORE re-rendering, so the committed line is not also shown as in-flight.
-       (when line
-         (setf (model-in-flight model) nil)
-         (model-append-chat-line model line)
-         (setf (model-status-text model) "turn done"))
+     (let* ((agent (finalize-msg-agent msg))
+            (line (model-in-flight model))
+            (reasoning (model-in-flight-reasoning model))
+            (matches (agent-is-picked-p model agent)))
+       ;; COMMIT ONLY THE PICKED AGENT'S STREAM. A stale or out-of-order finalize for
+       ;; a neighbouring agent must not commit (or clear) the picked in-flight line.
+       (when matches
+         ;; commit the reasoning line FIRST (if any), then the reply line, so
+         ;; the thinking block appears above the reply in the scrollback.
+         (when reasoning
+           (setf (model-in-flight-reasoning model) nil)
+           (model-append-chat-line model
+                                    (tui:render-styled
+                                     (tui:make-style :foreground tui:*fg-bright-black*)
+                                     (format nil "~A: ~A" :reasoning reasoning))))
+         ;; commit the accumulated reply line as ONE logical line and clear the
+         ;; buffer BEFORE re-rendering, so it is not also shown as in-flight.
+         (when line
+           (setf (model-in-flight model) nil)
+           (model-append-chat-line model line)
+           (setf (model-status-text model) "turn done")))
        ;; clear the red light for the finished agent (an out-of-order finalize with
        ;; no in-flight line is still a safe no-op beyond this).
        (when agent
@@ -1045,41 +1710,50 @@ the single `update` method owns the dispatch."
      (values model nil))
     ;; push channel: a tool call began (S05) — a plain prefixed progress line
     ((tool-start-msg-p msg)
-     (model-append-chat-line
-      model
-      (format nil "tool: ~A (call ~A) started"
-              (or (tool-start-msg-name msg) "?")
-              (or (tool-start-msg-call-id msg) "?")))
+     (when (agent-is-picked-p model (tool-start-msg-agent msg))
+       (model-append-chat-line
+        model
+        (format nil "tool: ~A (call ~A) started"
+                (or (tool-start-msg-name msg) "?")
+                (or (tool-start-msg-call-id msg) "?"))))
      (values model nil))
     ;; push channel: a tool call finished (S05)
     ((tool-result-msg-p msg)
-     (model-append-chat-line
-      model
-      (format nil "tool: ~A -> ~A"
-              (or (tool-result-msg-call-id msg) "?")
-              (or (tool-result-msg-text msg) "")))
+     (when (agent-is-picked-p model (tool-result-msg-agent msg))
+       (model-append-chat-line
+        model
+        (format nil "tool: ~A -> ~A"
+                (or (tool-result-msg-call-id msg) "?")
+                (or (tool-result-msg-text msg) ""))))
      (values model nil))
     ;; push channel: the token budget was hit and the stream aborted mid-turn (S05)
     ((budget-exceeded-msg-p msg)
      (let ((used (budget-exceeded-msg-tokens-used msg))
            (limit (budget-exceeded-msg-limit msg)))
-       ;; the durable signal is the committed budget line; the status text is set too
-       ;; (refresh-status rebuilds it each update, matching the resync branch).
-       (setf (model-status-text model)
-             (one-line (format nil "budget: ~A/~A tokens"
-                               (or used "?") (or limit "?"))))
-       (model-append-chat-line
-        model
-        (format nil "budget: ~A/~A tokens" (or used "?") (or limit "?"))))
+       ;; ONLY THE PICKED AGENT'S budget belongs in the picked transcript; another
+       ;; agent's abort is visible on its own row.
+       (when (agent-is-picked-p model (budget-exceeded-msg-agent msg))
+         ;; the durable signal is the committed budget line; the status text is set too
+         ;; (refresh-status rebuilds it each update, matching the resync branch).
+         (setf (model-status-text model)
+               (one-line (format nil "budget: ~A/~A tokens"
+                                 (or used "?") (or limit "?"))))
+         (model-append-chat-line
+          model
+          (format nil "budget: ~A/~A tokens" (or used "?") (or limit "?")))))
      (values model nil))
     ;; push channel: backpressure — the server dropped fragments
     ((resync-msg-p msg)
      (let* ((cursor (or (resync-msg-cursor msg) (model-cursor model)))
-            (agent (model-picked-agent model))
+            (target (or (resync-msg-agent msg) (model-picked-agent model)))
+            (picked (model-picked-agent model))
             (events nil) (new-cursor cursor) (error nil))
-       (when agent
+       ;; ONLY THE PICKED TRANSCRIPT CAN HAVE LOST FRAGMENTS. The client discards
+       ;; every other agent's deltas, so a resync naming another agent is not its
+       ;; concern — refetching anyway would read the wrong agent at the wrong cursor.
+       (when (and target picked (string= target picked))
          (multiple-value-setq (events new-cursor error)
-           (rpc-transcript-delta (model-swank-connection model) agent cursor))
+           (rpc-transcript-delta (model-swank-connection model) target cursor))
          (dolist (line (mapcar #'event-to-line (or events '())))
            (model-append-chat-line model line))
          (when (integerp new-cursor) (setf (model-cursor model) new-cursor)))
@@ -1087,8 +1761,10 @@ the single `update` method owns the dispatch."
        ;; so nothing-new is the expected outcome of a mid-stream resync.
        (note-error model error)
        (setf (model-status-text model)
-             (one-line (format nil "resync: refetched from cursor ~D~@[ (~A)~]"
-                               cursor (or error "")))))
+             (one-line (format nil (if (and target picked (string= target picked))
+                                       "resync: refetched ~A from cursor ~D~@[ (~A)~]"
+                                       "resync: ~A is not the picked agent — ignored")
+                               target cursor (or error "")))))
      (values model nil))
     ;; push channel: the subscribe race-closure
     ((subscribed-msg-p msg)
@@ -1178,17 +1854,65 @@ the single `update` method owns the dispatch."
            (setf (model-pending-approval model) pending))
          (refresh-agent-viewport model)))
      (values model nil))
+    ;; push channel: a newcomer joined the society (registry announcement)
+    ((agent-added-msg-p msg)
+     (let ((name (agent-added-msg-agent msg))
+           (row (agent-added-msg-row msg)))
+       (when (and (stringp name) (listp row))
+         (%merge-agent-row model row)
+         ;; its lights are live only if the channel is subscribed to it
+         (reconcile-subscriptions model (model-agents model))
+         (when (null (model-picked-agent model))
+           (let ((names (mapcar (lambda (a) (getf a :name))
+                                (sorted-agents (model-agents model)))))
+             (setf (model-picked-agent model) (first names))))
+         (refresh-agent-viewport model)))
+     (values model nil))
+    ;; push channel: an agent left the society
+    ((agent-removed-msg-p msg)
+     (let ((name (agent-removed-msg-agent msg)))
+       (when (stringp name)
+         (%drop-agent-row model name)
+         ;; drop the server-side listener now rather than at disconnect
+         (let ((push (model-push-connection model)))
+           (when (and push (push-connection-live-p model))
+             (handler-case
+                 (write-wire push (list :unsubscribe :agent name))
+               (error (e)
+                 (handler-case (client-note-error! push e) (error () nil))
+                 (note-error model (format nil "unsubscribe failed: ~A" e))))))
+         (when (equal (model-picked-agent model) name)
+           ;; the shown transcript vanished with the agent: clear it and land on
+           ;; another row rather than keeping a ghost picked
+           (setf (model-picked-agent model) nil
+                 (model-pending-approval model) nil
+                 (model-scrollback model) nil
+                 (model-in-flight model) nil
+                 (model-in-flight-reasoning model) nil)
+           (let ((vp (model-chat-viewport model)))
+             (when vp (tui.viewport:viewport-set-content vp "")))
+           (let ((names (remove nil (mapcar (lambda (a) (getf a :name))
+                                            (sorted-agents (model-agents model))))))
+             (when names (setf (model-picked-agent model) (first names)))))
+         (refresh-agent-viewport model)))
+     (values model nil))
     ;; swank: a REPL or RPC reply rendered into the REPL pane
     ((rpc-result-msg-p msg)
      (let ((form (rpc-result-msg-form msg))
            (value (rpc-result-msg-value msg))
            (err (rpc-result-msg-error msg)))
+       (setf (model-pending-repl-p model) nil)
        (model-append-repl-line model
                                (format nil "~A=> ~A" (or form "?")
                                        (if err
                                            (format nil "ERR: ~A" err)
                                            (format nil "~A" value))))
        (note-error model (when err (format nil "eval: ~A" err))))
+     (values model nil))
+    ;; the worker finished after a cancel: clear the pending flag, say nothing
+    ;; (cancel-repl already explained itself)
+    ((async-done-msg-p msg)
+     (setf (model-pending-repl-p model) nil)
      (values model nil))
     ;; a wire packet we could not dispatch: show it, never drop it
     ((wire-ignored-msg-p msg)
@@ -1207,12 +1931,18 @@ the single `update` method owns the dispatch."
            (model-term-height model) (tui:window-size-msg-height msg))
      (resize-panes model)
      (values model nil))
-    ;; cursor blink and the fallback poll
-    ((tui:tick-msg-p msg) (values model (tui:tick *tui-init-tick*)))
+    ;; cursor blink, fallback poll, and a throttled reattach when a configured
+    ;; channel has closed (docs/sexpr-tui.md §11; notes/tui.md §7).
+    ((tui:tick-msg-p msg)
+     (tick-fallback-poll model)
+     (maybe-reconnect model)
+     (values model (tui:tick *tui-init-tick*)))
     ;; quit
     ((tui:quit-msg-p msg)
      (setf (model-quitting model) t)
      (values model (%quit-cmd)))
+    ;; mouse wheel: scroll the pane under the cursor (cl-tuition viewport keys)
+    ((tui:mouse-scroll-event-p msg) (handle-scroll model msg))
     ;; mouse: click-to-focus or approval resolution (S04)
     ((tui:mouse-press-event-p msg) (handle-mouse model msg))
     ;; keyboard
@@ -1246,7 +1976,8 @@ as its own line between the body and the status bar."
     (when (model-agent-viewport model)
       (tui.viewport:viewport-view (model-agent-viewport model)))
     (model-status-text model)
-    (render-approval-strip (model-pending-approval model))
+    (render-approval-strip (model-pending-approval model)
+                           (left-column-width model))
     :chat-focused (eq (model-focused model) :chat)
     :repl-focused (eq (model-focused model) :repl)
     ;; The frame is sized from the terminal, not from the content: without these two

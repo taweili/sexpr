@@ -37,6 +37,12 @@
 (defparameter *tests-passed* 0)
 (defparameter *tests-failed* 0)
 
+;; Production evaluates REPL forms off the TEA thread (*TUI-ASYNC-REPL* = T).
+;; The canned-stream harness needs deterministic, synchronous consumption, so
+;; the suite pins the flag to NIL; the async tests below bind it around a
+;; scenario (and serialize on *SWANK-RPC-LOCK* to make the race deterministic).
+(setf *tui-async-repl* nil)
+
 (defun ok (description form)
   (incf *tests-run*)
   (if form
@@ -154,9 +160,13 @@ Normalizing to names is what makes the boundary assertion testable."
       (and (delta-msg-p msg)
            (equal (delta-msg-agent msg) "A")
            (equal (delta-msg-content msg) "hi"))))
-  (test "the foreign symbol is not EQ to any client-side DELTA symbol (EQ dispatch would fail)"
+  (test "name dispatch is load-bearing: a foreign symbol can share its name with a client symbol"
+    ;; The contract is SYMBOL-NAME comparison, not EQ. A client-side DELTA now
+    ;; exists (the scroll delta), so the old absence assertion no longer holds;
+    ;; what must hold is that a foreign-package symbol whose NAME matches still
+    ;; decodes because dispatch never compares packages.
     (and (not (eq foreign (find-symbol "DELTA" :sexpr-tui)))
-         (null (find-symbol "DELTA" :sexpr-tui))))
+         (delta-msg-p (decode-wire conn (list foreign :agent "A" :content "hi")))))
   (test "wire-operator resolves a foreign-package subscribe symbol by name"
     (equal (wire-operator (list (intern "subscribe" :cl-user) :agent "A")) "SUBSCRIBE"))
   (test "lowercase wire operators dispatch (the wire is not case-normalized on the wire)"
@@ -1267,7 +1277,8 @@ can assert on the packet text the model wrote."
 (test "T05: chat note packet contains the handle id and not the agent name"
   (multiple-value-bind (conn out)
       (canned-swank-with-output (swank-reply :ok nil 1)
-                                (swank-reply :ok '(nil . 0) 2))
+                                (swank-reply :ok '(nil . 0) 2)
+                                (swank-reply :ok "noted" 3))
     (let ((model (make-instance 'tui-model
                                 :swank-connection conn
                                 :picked-agent "Alpha")))
@@ -1287,9 +1298,33 @@ can assert on the packet text the model wrote."
                (search "inject-note" packet-text)
                (search "hello agent" packet-text)
                (string= "" (tui.textarea:textarea-value ta))
-               ;; model-scrollback is a LIST of lines; `search` on a list compares
-               ;; elements by EQL, not substrings, so join first.
-               (search "noted" (lines-to-string (model-scrollback model)))))))))
+               ;; the local echo is the transcript's own USER event, and the cursor
+               ;; advanced past it so a refetch/resync cannot duplicate it
+               (search "USER: hello agent"
+                       (lines-to-string (model-scrollback model)))
+               (= 1 (model-cursor model))))))))
+
+(test "T05: a failed note keeps the draft, advances nothing, and explains itself"
+  ;; inject-note is synchronous now: an abort means nothing was appended in the
+  ;; image, so the draft stays editable and no local echo/cursor move happens.
+  (multiple-value-bind (conn out)
+      (canned-swank-with-output (swank-reply :ok nil 1)
+                                (swank-reply :ok '(nil . 0) 2)
+                                (swank-reply :abort "no such handle" 3))
+    (let ((model (make-instance 'tui-model
+                                :swank-connection conn
+                                :picked-agent "Alpha")))
+      (tui:init model)
+      (get-output-stream-string out)
+      (setf (model-agents model)
+            (list (list :name "Alpha" :status :running :handle "subagent-1")))
+      (let ((ta (model-chat-textarea model)))
+        (tui.textarea:textarea-set-value ta "draft survives")
+        (tui:update model (make-enter-msg))
+        (and (string= "draft survives" (tui.textarea:textarea-value ta))
+             (= 0 (model-cursor model))
+             (null (model-scrollback model))
+             (search "no such handle" (model-status-text model)))))))
 
 (test "T05: REPL packet contains the let wrapper with the picked name"
   (multiple-value-bind (conn out)
@@ -2103,7 +2138,642 @@ and the accessor must not be called on it."
          (= 24 (length chat-lines)))))
 
 
-;;;; --- summary -------------------------------------------------------------
+;;;;; --- P0 review fixes: scoping, fitting, echo, validation, polling ------
+
+(test "P0: a foreign finalize neither commits nor clears the picked in-flight line"
+  ;; Regression: FINALIZE used to commit model-in-flight regardless of its :agent,
+  ;; so a stale/out-of-order finalize for a neighbour ended the picked turn early.
+  (let ((model (init-two-agent-model :picked "Alpha")))
+    (tui:update model (make-delta-msg :agent "Beta" :content "b"))
+    (tui:update model (make-finalize-msg :agent "Beta" :event-index 0))
+    (and ;; Beta's own red light is cleared ...
+         (eq :green (agent-light (model-agent-row model "Beta")))
+         ;; ... and Alpha's stream, once started, survives Beta's finalize
+         (progn
+           (tui:update model (make-delta-msg :agent "Alpha" :content "half"))
+           (tui:update model (make-finalize-msg :agent "Beta" :event-index 0))
+           (and (equal "half" (model-in-flight model))
+                (null (model-scrollback model)))))))
+
+(test "P0: another agent's tool output and budget never enter the picked transcript"
+  (let ((model (init-two-agent-model :picked "Alpha")))
+    (tui:update model (make-tool-start-msg :agent "Beta" :call-id "c" :name "shell"))
+    (tui:update model (make-tool-result-msg :agent "Beta" :call-id "c" :value 1 :text "hi"))
+    (tui:update model (make-budget-exceeded-msg :agent "Beta" :tokens-used 9 :limit 8))
+    (and (null (model-scrollback model))
+         (not (search "tool:" (tui:view model)))
+         (not (search "budget:" (tui:view model))))))
+
+(test "P0: a resync naming another agent is ignored (no RPC, no cursor move)"
+  (multiple-value-bind (swank out)
+      (canned-swank-capturing (two-agent-snapshot-reply)
+                              (swank-reply :ok '(nil . 0) 2))
+    (declare (ignore out))
+    (let ((model (init-two-agent-model :picked "Alpha" :swank swank)))
+      (let ((before (client-stats-get swank :packets-read)))
+        (tui:update model (make-resync-msg :agent "Beta" :cursor 5))
+        (and (= before (client-stats-get swank :packets-read))
+             (= 0 (model-cursor model)))))))
+
+(test "P0: a resync for the picked agent still refetches from its cursor"
+  (multiple-value-bind (swank out)
+      (canned-swank-capturing (two-agent-snapshot-reply)
+                              (swank-reply :ok '(nil . 0) 2)
+                              (swank-reply :ok '(((:type :user :content "recovered")) . 6) 3))
+    (declare (ignore out))
+    (let ((model (init-two-agent-model :picked "Alpha" :swank swank)))
+      (tui:update model (make-resync-msg :agent "Alpha" :cursor 3))
+      (and (= 6 (model-cursor model))
+           (search "recovered" (lines-to-string (model-scrollback model)))))))
+
+(test "P0: wrap-text breaks between words, hard-breaks only oversized words"
+  (and (equal '("aaa bbb" "ccc") (wrap-text "aaa bbb ccc" 7))
+       (equal '("abcd" "efgh" "ij") (wrap-text "abcdefghij" 4))
+       (equal '("") (wrap-text "" 10))
+       ;; every produced line fits the requested width
+       (every (lambda (line) (<= (tui:visible-length line) 8))
+              (wrap-text "the quick brown fox jumps over the lazy dog" 8))))
+
+(test "P0: wrap-text keeps ANSI escapes intact and counts them as zero columns"
+  (let* ((styled (concatenate 'string (string #\ESC) "[31m" "aa bb cc" (string #\ESC) "[0m"))
+         (lines (wrap-text styled 5)))
+    (and (= 2 (length lines))
+         (every (lambda (line) (<= (tui:visible-length line) 5)) lines)
+         ;; the colour escape travels with the text instead of being split
+         (search (string #\ESC) (first lines))
+         (search (string #\ESC) (second lines)))))
+
+(test "P0: wrap-text measures wide characters as two columns"
+  (and (equal '("你好" "世界") (wrap-text "你好世界" 4))
+       (equal '("a你" "好b") (wrap-text "a你好b" 4))))
+
+(test "P0: truncate-text fits one line by display width and marks the drop"
+  (let ((short (truncate-text "abcdef" 10))
+        (clipped (truncate-text "abcdefghij" 6))
+        (wide (truncate-text "你好世界" 5)))
+    (and (string= "abcdef" short)
+         (search "…" clipped)
+         (= 6 (tui:visible-length clipped))
+         (= 5 (tui:visible-length wide))
+         (search "…" wide))))
+
+(test "P0: a transcript line wider than the pane cannot widen the frame"
+  ;; render-border sizes a box to its widest line and the viewport prints long
+  ;; lines whole, so before fitting one 200-column event blew the frame past the
+  ;; terminal and pushed the agent pane off screen.
+  (let* ((model (sized-model 80 24))
+         (long (make-string 200 :initial-element #\x)))
+    (model-append-chat-line model long)
+    (multiple-value-bind (w h) (frame-dims (tui:view model))
+      (and (= 80 w) (= 24 h))))
+  ;; ... and the content survives wrapping rather than being clipped away
+  (let* ((model (sized-model 80 24))
+         (long (format nil "~{~A~}" (loop for i from 1 to 60 collect "0123456789"))))
+    (model-append-chat-line model long)
+    (let* ((v (tui.viewport:viewport-view (model-chat-viewport model)))
+           (lines (tui:split-string-by-newline v)))
+      (and ;; every display line fits the chat column (54 at 80x24)
+           (every (lambda (l) (<= (tui:visible-length l) 54)) lines)
+           ;; and the digits survive: the first and the final chunk are both there
+           (search "0123456789" v)
+           (search "456789" v)))))
+
+(test "P0: agent rows are truncated to the pane and sorted by name"
+  (let* ((rows (list (list :name "Zeta" :status :idle)
+                     (list :name (make-string 60 :initial-element #\N) :status :running)
+                     (list :name "Alpha" :status :idle)))
+         (rendered (render-agent-rows (sorted-agents rows)
+                                      :picked "Alpha" :width 22)))
+    (and ;; sorted by name (ASCII): Alpha, then the long N-name, then Zeta
+         (< (search "Alpha" rendered) (search "Zeta" rendered))
+         ;; the 60-char name was cut to the pane width, not allowed to widen it
+         (every (lambda (line) (<= (tui:visible-length line) 22))
+                (remove-if-not (lambda (l) (search "N" l))
+                               (tui:split-string-by-newline rendered))))))
+
+(test "P0: --agent names an unknown agent is rejected and the first row picked"
+  (multiple-value-bind (swank out)
+      (canned-swank-capturing (two-agent-snapshot-reply)
+                              (swank-reply :ok '(nil . 0) 2))
+    (declare (ignore out))
+    (let ((model (make-instance 'tui-model :swank-connection swank
+                                          :picked-agent "Ghost")))
+      (tui:init model)
+      (and (string= "Alpha" (model-picked-agent model))
+           (search "unknown agent Ghost" (model-status-text model))
+           ;; the initial transcript fetch named the fallback, not the phantom
+           (search "transcript-delta \"Alpha\"" (get-output-stream-string out))))))
+
+(test "P0: switching agents restores the NEW picked agent's pending approval"
+  (let ((model (init-two-agent-model :picked "Alpha")))
+    (tui:update model (make-approval-needed-msg :agent "Alpha" :capability "net"
+                                                :target "a" :description "da"))
+    (tui:update model (make-approval-needed-msg :agent "Beta" :capability "fs"
+                                                :target "b" :description "db"))
+    (let ((alpha-pending (model-pending-approval model)))
+      (model-switch-agent model "Beta")
+      (let ((now (model-pending-approval model)))
+        (and (listp now)
+             (string= "b" (getf now :target))
+             (not (equal alpha-pending now)))))))
+
+(test "P0: a click outside the approval strip reaches a second waiting agent"
+  ;; While an approval is pending the strip used to swallow EVERY click, making
+  ;; the other yellow rows unreachable — contradicting the one-by-one flow in
+  ;; notes/tui.md §9.
+  (multiple-value-bind (swank out)
+      (canned-swank-capturing (two-agent-snapshot-reply)
+                              (swank-reply :ok '(nil . 0) 2)
+                              (swank-reply :ok '(nil . 0) 3)   ; Beta's transcript
+                              (swank-reply :ok "granted" 4))
+    (let ((model (init-two-agent-model :picked "Alpha" :swank swank)))
+      (tui:update model (make-approval-needed-msg :agent "Alpha" :capability "net"
+                                                  :target "a" :description "da"))
+      (tui:update model (make-approval-needed-msg :agent "Beta" :capability "fs"
+                                                  :target "b" :description "db"))
+      (tui:view model)                       ; record the row zones
+      (let ((zone (tui:zone-get "agent-row:Beta")))
+        (and zone
+             (progn
+               (tui:update model (press-zone zone))
+               (and (string= "Beta" (model-picked-agent model))
+                    ;; the strip now belongs to Beta ...
+                    (equal "b" (getf (model-pending-approval model) :target))
+                    ;; ... and Alpha is still waiting (yellow, not resolved)
+                    (eq :yellow (agent-light (model-agent-row model "Alpha")))
+                    (progn
+                      ;; resolve Beta through the strip
+                      (tui:view model)
+                      (let ((grant (tui:zone-get "approval:grant-once")))
+                        (and grant
+                             (progn
+                               (tui:update model (press-zone grant))
+                               (and (null (model-pending-approval model))
+                                    (eq :green (agent-light (model-agent-row model "Beta")))
+                                    (eq :yellow (agent-light (model-agent-row model "Alpha")))
+                                    (search "resolve-approval \"Beta\" :GRANT-ONCE"
+                                            (get-output-stream-string out))))))))))))))
+
+(test "P0: the strip renders every restart the request offers"
+  ;; Zone registration happens in tui:view's root zone-scan, not in a bare strip
+  ;; call; the clickable-path for a non-default decision is covered by the
+  ;; click-through test above, which resolves through approval:grant-once.
+  (let ((strip (render-approval-strip (list :capability "net" :target "t"
+                                            :description "d"
+                                            :restarts '(:grant-session :deny)))))
+    (and (search "grant-session" strip)
+         (search "deny" strip)
+         (not (search "grant-once" strip)))))
+
+(test "P0: the tick fallback polls swank when there is no live push channel"
+  ;; docs/sexpr-tui.md §11 promises polling when the image came up without a push
+  ;; server; the tick branch used to do nothing but re-arm, freezing the UI.
+  (multiple-value-bind (swank out)
+      (canned-swank-capturing (two-agent-snapshot-reply)
+                              (swank-reply :ok '(nil . 0) 2)
+                              (swank-reply :ok '((:name "Alpha" :status :finished)
+                                                 (:name "Beta" :status :idle)) 3)
+                              (swank-reply :ok '(((:type :model :content "polled")) . 9) 4))
+    (declare (ignore out))
+    (let ((model (make-instance 'tui-model :swank-connection swank
+                                          :push-connection nil
+                                          :picked-agent "Alpha"
+                                          :poll-interval 1)))
+      (tui:init model)
+      (let ((before (client-stats-get swank :packets-read)))
+        (tui:update model (tui:make-tick-msg))
+        (and (= 2 (- (client-stats-get swank :packets-read) before))
+             (eq :green (agent-light (model-agent-row model "Alpha")))
+             (search "polled" (lines-to-string (model-scrollback model))))))))
+
+(test "P0: a live push channel suppresses the fallback poll"
+  (multiple-value-bind (push out) (capturing-push)
+        (declare (ignore out))
+        (let* ((swank (apply #'canned-swank *init-replies*))
+               (model (make-instance 'tui-model :swank-connection swank
+                                               :push-connection push
+                                               :picked-agent "Alpha"
+                                               :poll-interval 1)))
+          (tui:init model)
+          (let ((before (client-stats-get swank :packets-read)))
+            (tui:update model (tui:make-tick-msg))
+            (= before (client-stats-get swank :packets-read))))))
+
+(test "P0: the stats plist has one labelled entry per connection"
+  (let* ((swank (apply #'canned-swank *init-replies*))
+         (model (make-instance 'tui-model :swank-connection swank
+                                         :picked-agent "Alpha")))
+    (tui:init model)
+    (let ((stats (model-stats model)))
+      (and (listp (getf stats :swank))
+           (null (getf stats :push))
+           (= 2 (getf (getf stats :swank) :packets-read))
+           (= 2 (client-stats-get swank :packets-read))))))
+
+(test "P1: agent-added / agent-removed decode from server-shaped frames"
+  (and (let* ((conn (test-connection
+                     :stream (make-string-input-stream
+                              (wire-line "agent-added :agent \"Gamma\" :row (:name \"Gamma\" :status :idle)"))))
+              (msg (decode-wire conn (read-wire conn))))
+         (and (agent-added-msg-p msg)
+              (equal "Gamma" (agent-added-msg-agent msg))
+              (equal '(:name "Gamma" :status :idle) (agent-added-msg-row msg))))
+       (let* ((conn (test-connection
+                     :stream (make-string-input-stream
+                              (wire-line "agent-removed :agent \"Gamma\""))))
+              (msg (decode-wire conn (read-wire conn))))
+         (and (agent-removed-msg-p msg)
+              (equal "Gamma" (agent-removed-msg-agent msg))))))
+
+(test "P1: agent-added merges the projected row into the pane without an RPC"
+  (multiple-value-bind (swank out)
+      (canned-swank-capturing (two-agent-snapshot-reply)
+                              (swank-reply :ok '(nil . 0) 2))
+    (declare (ignore out))
+    (let ((model (init-two-agent-model :picked "Alpha" :swank swank)))
+      (let ((before (client-stats-get swank :packets-read)))
+        (tui:update model (make-agent-added-msg
+                           :agent "Gamma"
+                           :row '(:name "Gamma" :status :running :handle "h3")))
+        (and (= before (client-stats-get swank :packets-read))
+             (model-agent-row model "Gamma")
+             (search "Gamma"
+                     (tui.viewport:viewport-view (model-agent-viewport model))))))))
+
+(test "P1: agent-removed drops the row, unsubscribes, and re-picks another row"
+  (multiple-value-bind (push out) (capturing-push)
+    (let ((model (init-two-agent-model :picked "Beta" :push push)))
+      (tui:update model (make-agent-removed-msg :agent "Beta"))
+      (and (null (model-agent-row model "Beta"))
+           ;; the removed row was picked: the pane lands on another agent rather
+           ;; than keeping a ghost
+           (string= "Alpha" (model-picked-agent model))
+           (null (member "Beta" (model-subscriptions model) :test #'string=))
+           (search ":UNSUBSCRIBE" (get-output-stream-string out))
+           (not (search "Beta"
+                        (tui.viewport:viewport-view (model-agent-viewport model))))))))
+
+;;;; --- P1: scrolling, panes under the cursor, follow mode -----------------
+
+(defun wheel (x y direction)
+  "A wheel-scroll event at terminal column X, row Y (both 1-based)."
+  (tui:make-mouse-scroll-event :x x :y y :direction direction))
+
+(defun long-chat-model (n)
+  "A sized model with N committed chat lines, so the chat pane overflows."
+  (let ((model (sized-model 80 24)))
+    (dotimes (i n)
+      (model-append-chat-line model (format nil "line ~D" i)))
+    model))
+
+(test "P1: the wheel scrolls the pane it is over, and scrolling up holds position"
+  (let* ((model (long-chat-model 60))
+         (chat-vp (model-chat-viewport model)))
+    (and
+     ;; at the bottom a fresh append follows the newest line ...
+     (and (model-follow-p model)
+          (model-append-chat-line model "newest")
+          (tui.viewport:viewport-at-bottom-p chat-vp))
+     ;; ... a wheel-up over the CHAT pane scrolls and suspends follow ...
+     (eq :chat (pane-at-mouse model (wheel 10 5 :up)))
+     (progn
+       (tui:update model (wheel 10 5 :up))
+       (and (plusp (tui.viewport:viewport-y-offset chat-vp))
+            (null (model-follow-p model))))
+     ;; ... a streamed fragment no longer yanks the view back down ...
+     (let ((offset (tui.viewport:viewport-y-offset chat-vp)))
+       (tui:update model (make-delta-msg :agent "Alpha" :content "x"))
+       (= offset (tui.viewport:viewport-y-offset chat-vp)))
+     ;; ... and wheeling back down resumes following
+     (progn
+       (dotimes (i 30)
+         (tui:update model (wheel 10 5 :down)))
+       (and (tui.viewport:viewport-at-bottom-p chat-vp)
+            (model-follow-p model))))))
+
+
+(test "P1: the wheel reaches an agent list longer than its pane"
+  (let* ((agents (loop for i from 1 to 30
+                       collect (list :name (format nil "Agent~2,'0D" i)
+                                     :status :idle)))
+         (swank (apply #'canned-swank *init-replies*))
+         (model (init-two-agent-model :picked "Alpha" :swank swank)))
+    (setf (model-agents model) agents)
+    (refresh-agent-viewport model)
+    ;; Column 70 / row 3 is over the agent pane at 80x24 (the left column is
+    ;; chat-width 54 plus its two border columns), and routing is geometric.
+    (let ((ev (tui:make-mouse-scroll-event :x 70 :y 3 :direction :down)))
+      (and (eq :agents (pane-at-mouse model ev))
+           (progn
+             (tui:update model ev)
+             (plusp (tui.viewport:viewport-y-offset
+                     (model-agent-viewport model))))))))
+
+(test "P1: page keys scroll the focused pane without touching the input"
+  (let* ((model (long-chat-model 60))
+         (ta (model-chat-textarea model)))
+    (tui.textarea:textarea-set-value ta "keep me")
+    (setf model (car (multiple-value-list
+                      (tui:update model (make-key-msg :key :page-up)))))
+    (and (string= "keep me" (tui.textarea:textarea-value ta))
+         (plusp (tui.viewport:viewport-y-offset (model-chat-viewport model)))
+         (progn
+           (setf model (car (multiple-value-list
+                             (tui:update model (make-key-msg :key :end)))))
+           (tui.viewport:viewport-at-bottom-p (model-chat-viewport model))))))
+
+;;;; --- P1: agent detail and slash commands -------------------------------
+
+(defun two-agent-handle-reply ()
+  "A snapshot reply whose rows carry handles, so /kill has something to target."
+  (swank-reply :ok '((:name "Alpha" :status :idle :handle "h-A")
+                     (:name "Beta" :status :idle :handle "h-B"))
+               1))
+
+(test "P1: the agent pane shows the picked snapshot fields as detail lines"
+  (let ((model (init-two-agent-model :picked "Alpha")))
+    ;; a wide terminal so the widest pane (48) leaves room for both detail lines
+    (setf (model-term-width model) 200
+          (model-term-height model) 45)
+    (resize-panes model)
+    (setf (model-agents model)
+          (list (list :name "Alpha" :status :running :handle "h1"
+                      :budget :unlimited
+                      :capabilities '(:fs-read :spawn)
+                      :endpoint :ollama
+                      :transcript-length 7)))
+    (refresh-agent-viewport model)
+    (let ((pane (tui.viewport:viewport-view (model-agent-viewport model))))
+      (and (search "budget=unlimited" pane)
+           ;; ~A prints keywords without their colon
+           (search "caps=(FS-READ SPAWN)" pane)
+           (search "endpoint=OLLAMA" pane)
+           (search "len=7" pane)
+           (search "handle=h1" pane)
+           ;; and neither line widens the pane past its inner width
+           (every (lambda (line)
+                    (<= (tui:visible-length line)
+                        (agent-pane-inner-width model)))
+                  (tui:split-string-by-newline pane))))))
+
+(test "P1: /help lists every verb in the REPL pane"
+  (let ((model (init-two-agent-model)))
+    (handle-chat-command model "/help")
+    (let ((out (lines-to-string (model-repl-lines model))))
+      (and (every (lambda (verb) (search verb out)) *chat-commands*)
+           (= 0 (length (tui.textarea:textarea-value
+                         (model-chat-textarea model))))))))
+
+(test "P1: an unknown slash verb explains itself and is not sent to the model"
+  (multiple-value-bind (swank out)
+      (canned-swank-capturing (two-agent-snapshot-reply)
+                              (swank-reply :ok '(nil . 0) 2))
+    (declare (ignore out))
+    (let ((model (init-two-agent-model :picked "Alpha" :swank swank)))
+      (get-output-stream-string out)
+      (handle-chat-command model "/frobnicate")
+      (and (search "unknown command" (model-note model))
+           (string= "" (get-output-stream-string out))))))
+
+(test "P1: /clear empties the chat transcript"
+  (let ((model (long-chat-model 5)))
+    (handle-chat-command model "/clear")
+    (and (null (model-scrollback model))
+         ;; an empty viewport still renders its blank rows, so assert on text
+         (not (search "line" (tui.viewport:viewport-view
+                              (model-chat-viewport model)))))))
+
+(test "P1: /approvals lists exactly the waiting rows from the snapshot"
+  (let ((model (init-two-agent-model)))
+    (setf (model-agents model)
+          (list (list :name "Alpha" :status :running
+                      :pending-approval '(:capability :net :target "http://x"))
+                (list :name "Beta" :status :idle)))
+    (handle-chat-command model "/approvals")
+    (let ((out (lines-to-string (model-repl-lines model))))
+      (and (search "Alpha NET http://x" out)
+           (not (search "Beta" out)))))
+  ;; and the none-pending case is explicit rather than blank
+  (let ((model (init-two-agent-model)))
+    (handle-chat-command model "/approvals")
+    (search "none pending" (lines-to-string (model-repl-lines model)))))
+
+(test "P1: /spawn sends the spawn RPC and reconciles the newcomer into the pane"
+  (multiple-value-bind (swank out)
+      (canned-swank-capturing (two-agent-snapshot-reply)
+                              (swank-reply :ok '(nil . 0) 2)
+                              (swank-reply :ok "subagent-9" 3)   ; spawn result
+                              (swank-reply :ok '((:name "Gamma" :status :running)) 4)
+                              (swank-reply :ok '(nil . 0) 5))
+    (let ((model (init-two-agent-model :picked "Alpha" :swank swank)))
+      (get-output-stream-string out)           ; drain init requests
+      (handle-chat-command model "/spawn integrate tests")
+      (and (search "(sexpr.tui:spawn \"integrate tests\")"
+                   (get-output-stream-string out))
+           (search "spawned:" (lines-to-string (model-scrollback model)))
+           ;; the post-spawn reconcile fetched the new row and its transcript
+           (model-agent-row model "Gamma")
+           (string= "" (tui.textarea:textarea-value (model-chat-textarea model)))))))
+
+(test "P1: /kill targets a handle by name (default: the picked agent)"
+  (multiple-value-bind (swank out)
+      (canned-swank-capturing (two-agent-handle-reply)
+                              (swank-reply :ok '(nil . 0) 2)
+                              (swank-reply :ok "killed h-B" 3))
+    (let ((model (init-two-agent-model :picked "Alpha" :swank swank)))
+      (get-output-stream-string out)
+      (handle-chat-command model "/kill Beta")
+      (and (search "(sexpr.tui:kill \"h-B\")" (get-output-stream-string out))
+           (search "killed: h-B (Beta)" (lines-to-string (model-scrollback model))))))
+  ;; with no argument it kills the picked agent
+  (multiple-value-bind (swank out)
+      (canned-swank-capturing (two-agent-handle-reply)
+                              (swank-reply :ok '(nil . 0) 2)
+                              (swank-reply :ok "killed h-A" 3))
+    (let ((model (init-two-agent-model :picked "Alpha" :swank swank)))
+      (get-output-stream-string out)
+      (handle-chat-command model "/kill")
+      (search "(sexpr.tui:kill \"h-A\")" (get-output-stream-string out)))))
+
+(test "P1: a slash command typed into the chat input is handled, not sent"
+  (multiple-value-bind (swank out)
+      (canned-swank-capturing (two-agent-snapshot-reply)
+                              (swank-reply :ok '(nil . 0) 2))
+    (let ((model (init-two-agent-model :picked "Alpha" :swank swank)))
+      (tui.textarea:textarea-set-value (model-chat-textarea model) "/help")
+      (tui:update model (make-enter-msg))
+      (and (search "/spawn" (lines-to-string (model-repl-lines model)))
+           (string= "" (tui.textarea:textarea-value (model-chat-textarea model)))
+           ;; only the two init packets were read: no note RPC was issued
+           (= 2 (client-stats-get swank :packets-read))))))
+
+;;;; --- P1: reconnect ------------------------------------------------------
+
+(test "P1: channel liveness reads the close counter, not mere existence"
+  (let* ((swank (apply #'canned-swank *init-replies*))
+         (push (multiple-value-bind (conn out) (capturing-push)
+                 (declare (ignore out))
+                 conn))
+         (model (make-instance 'tui-model :swank-connection swank
+                                         :push-connection push)))
+    (and (swank-connection-live-p model)
+         (push-connection-live-p model)
+         (progn (client-count! swank :connection-closed 1)
+                (null (swank-connection-live-p model)))
+         (progn (client-count! push :connection-closed 1)
+                (null (push-connection-live-p model))))))
+
+(test "P1: a channel that was never configured is left alone"
+  (let* ((swank (apply #'canned-swank *init-replies*))
+         (model (make-instance 'tui-model :swank-connection swank
+                                         :push-connection nil)))
+    (maybe-reconnect model)
+    (and (null (model-push-connection model))
+         (= 0 (model-reconnect-cooldown model)))))
+
+(test "P1: a closed swank channel is rebuilt and reconciles the society"
+  (let* ((old (apply #'canned-swank *init-replies*))
+         (model (make-instance 'tui-model :swank-connection old
+                                         :picked-agent "Alpha"
+                                         :reconnect-cooldown 0))
+         (real (fdefinition 'swank-connect)))
+    (setf (model-agents model) (list (list :name "Alpha" :status :idle)))
+    (client-count! old :connection-closed 1)
+    (unwind-protect
+        (progn
+          (setf (fdefinition 'swank-connect)
+                (lambda (host port)
+                  (declare (ignore host port))
+                  ;; canned-swank takes &rest replies: call it directly. APPLY
+                  ;; would treat the last reply STRING as the argument list.
+                  (canned-swank (two-agent-snapshot-reply)
+                                (swank-reply :ok '(nil . 0) 2))))
+          (maybe-reconnect model)
+          (and (swank-connection-live-p model)
+               (not (eq old (model-swank-connection model)))
+               (search "swank reconnected" (model-note model))
+               (model-agent-row model "Beta")))
+      (setf (fdefinition 'swank-connect) real))))
+
+(test "P1: a closed push channel is rebuilt, re-subscribed and left readable"
+  (let* ((swank (apply #'canned-swank *init-replies*))
+         (new-out (make-string-output-stream))
+         (new-in (make-string-input-stream ""))
+         (real (fdefinition 'connect-push))
+         (model nil))
+    (multiple-value-bind (old old-out) (capturing-push)
+      (declare (ignore old-out))
+      (setf model (make-instance 'tui-model :swank-connection swank
+                                           :push-connection old
+                                           :picked-agent "Alpha"
+                                           :reconnect-cooldown 0))
+      (setf (model-agents model)
+            (list (list :name "Alpha" :status :idle)
+                  (list :name "Beta" :status :idle)))
+      (client-count! old :connection-closed 1)
+      (unwind-protect
+          (progn
+            (setf (fdefinition 'connect-push)
+                  (lambda (host port &key program)
+                    (declare (ignore host port))
+                    (let ((conn (make-client-connection
+                                 :stream (make-two-way-stream new-in new-out))))
+                      (setf (tui-connection-program conn) program)
+                      conn)))
+            (maybe-reconnect model)
+            (and (push-connection-live-p model)
+                 (not (eq old (model-push-connection model)))
+                 (search ":SUBSCRIBE" (get-output-stream-string new-out))
+                 (= 0 (model-reconnect-cooldown model))))
+        (setf (fdefinition 'connect-push) real)))))
+
+(test "P1: reconnect attempts are throttled while failures continue"
+  ;; No image is listening: the attempt fails fast, and a second call inside
+  ;; the cooldown decrements it rather than attempting again.
+  (let* ((dead (let ((c (apply #'canned-swank *init-replies*)))
+                 (client-count! c :connection-closed 1)
+                 c))
+         (model (make-instance 'tui-model :swank-connection dead
+                                         :push-connection nil
+                                         :reconnect-cooldown 0)))
+    (maybe-reconnect model)
+    (let ((after-first (model-reconnect-cooldown model)))
+      (maybe-reconnect model)
+      (and (search "reconnect failed" (model-note model))
+           (= (1- after-first) (model-reconnect-cooldown model))))))
+
+;;;; --- P1: async REPL and cancel ------------------------------------------
+
+(defun wait-for (predicate &key (timeout 2.0))
+  "Poll PREDICATE until it returns non-NIL or TIMEOUT seconds pass."
+  (let ((deadline (+ (get-internal-real-time)
+                     (round (* timeout internal-time-units-per-second)))))
+    (loop for value = (funcall predicate)
+          until (or value (> (get-internal-real-time) deadline))
+          do (sleep 0.01)
+          finally (return value))))
+
+(test "P1: an async REPL eval returns at once and delivers its result"
+  (multiple-value-bind (conn out)
+      (canned-swank-with-output (swank-reply :ok nil 1)
+                                (swank-reply :ok '(nil . 0) 2)
+                                (swank-reply :ok "result" 3))
+    (declare (ignore out))
+    (let ((model (make-instance 'tui-model :swank-connection conn
+                                          :picked-agent "Alpha")))
+      (tui:init model)
+      (setf (model-focused model) :repl)
+      (tui.textarea:textarea-set-value (model-repl-textarea model) "(+ 1 2)")
+      (let ((*tui-async-repl* t))
+        (tui:update model (make-enter-msg)))
+      (and ;; the UI returned with the eval still pending, and did not block on
+           ;; the reply before returning ...
+           (model-pending-repl-p model)
+           (string= "" (tui.textarea:textarea-value (model-repl-textarea model)))
+           ;; ... and the worker delivered a normal rpc-result-msg
+           (let ((msg (wait-for (lambda () (model-last-async-result model)))))
+             (and (rpc-result-msg-p msg)
+                  (equal "result" (rpc-result-msg-value msg))
+                  ;; feeding it through update clears pending and renders,
+                  ;; exactly as a program delivery would
+                  (progn
+                    (setf model (car (multiple-value-list
+                                      (tui:update model msg))))
+                    (and (null (model-pending-repl-p model))
+                         (search "result"
+                                 (lines-to-string (model-repl-lines model)))))))))))
+
+(test "P1: Ctrl+X abandons a busy REPL eval and drops the stale result"
+  ;; Holding *SWANK-RPC-LOCK* keeps the worker parked inside swank-rpc, so the
+  ;; cancel is deterministic instead of racing a fast canned reply.
+  (let* ((conn (canned-swank (swank-reply :ok nil 1)
+                             (swank-reply :ok '(nil . 0) 2)
+                             (swank-reply :ok "late" 3)))
+         (model (make-instance 'tui-model :swank-connection conn
+                                         :picked-agent "Alpha")))
+    (tui:init model)
+    (setf (model-focused model) :repl)
+    (tui.textarea:textarea-set-value (model-repl-textarea model) "(slow)")
+    (sb-thread:with-mutex (*swank-rpc-lock*)
+      (let ((*tui-async-repl* t))
+        (tui:update model (make-enter-msg)))
+      (let ((generation (model-repl-generation model)))
+        (tui:update model (make-key-msg :key #\x :ctrl t))
+        (and (null (model-pending-repl-p model))
+             (= (1+ generation) (model-repl-generation model))
+             (search "cancelled" (model-note model)))))
+    ;; the lock is released; the worker finishes, sees the stale generation and
+    ;; reports done rather than rendering the late result
+    (let ((msg (wait-for (lambda () (model-last-async-result model)))))
+      (and (async-done-msg-p msg)
+           (async-done-msg-cancelled msg)
+           (progn
+             (tui:update model msg)
+             (and (null (model-pending-repl-p model))
+                  (not (search "late"
+                               (lines-to-string (model-repl-lines model))))))))))
+
+;;; --- summary -------------------------------------------------------------
 
 (format t "~%~D tests, ~D passed, ~D failed~%" *tests-run* *tests-passed* *tests-failed*)
 ;; CL has no QUIT — it is SB-EXT:QUIT. The package :shadow is kept because :tuition

@@ -183,10 +183,36 @@ input's border is drawn in cyan (`*focus-color*`) as the visible cue.
 | `Escape` | quit |
 | `Ctrl+G` | grant an approval once (only while an approval is pending) |
 | `Ctrl+D` | deny an approval (only while an approval is pending) |
+| `Ctrl+X` | abandon an in-flight REPL eval (the UI never froze, but the stale render is dropped) |
+| `PgUp`/`PgDn`/`Home`/`End`, `Ctrl+B`/`Ctrl+F` | scroll the pane that owns key input |
+| wheel | scroll the pane under the cursor |
 
 The agent pane (right) lists every agent with status lights: green (idle),
 red (busy), yellow (waiting for approval). Row click = focus — the chat pane
-rebinds to that agent's transcript and the REPL binds `*agent*` to it.
+rebinds to that agent's transcript and the REPL binds `*agent*` to it. The
+picked row also shows a two-line detail (`budget`, `capabilities`,
+`endpoint`, transcript length, handle) taken from the same snapshot, so no
+extra round trip buys it. A society that grows mid-session appears through
+`agent-added`/`agent-removed`; membership is reconciled by the poll path when
+no push channel exists.
+
+### Chat slash commands
+
+A chat message starting with `/` is a client-side verb, never a note to the
+model:
+
+| Command | Effect |
+|---------|--------|
+| `/help` | list the verbs |
+| `/spawn GOAL` | spawn a worker subagent, then reconcile the newcomer into the pane |
+| `/kill [NAME]` | terminate an agent (default: the picked one) |
+| `/approvals` | list every agent waiting on an approval |
+| `/clear` | clear the chat transcript |
+
+The REPL eval itself runs off the UI thread: a form that calls the model no
+longer freezes typing, the status bar says `repl: busy`, and `Ctrl+X` abandons
+it. Other RPCs (snapshot polls, resyncs, notes) are still synchronous; a slow
+image can therefore still pause those paths for up to the 30 s reply timeout.
 
 ---
 

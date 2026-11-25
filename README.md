@@ -579,6 +579,15 @@ focused input's border is drawn in cyan (`*focus-color*`) as the visible
 cue. `Enter` submits the focused input; `Ctrl+C` and `Escape` quit;
 while an approval is pending, `Ctrl+G` grants once and `Ctrl+D` denies.
 
+The agent pane shows a two-line detail for the picked agent (budget,
+capabilities, endpoint, transcript length, handle) from the same snapshot.
+Scrollback scrolls with the wheel or the page keys, and a REPL eval runs off
+the UI thread (`repl: busy` in the status bar, `Ctrl+X` to abandon it), so a
+slow form no longer freezes typing. Chat accepts client-side slash verbs —
+`/help`, `/spawn GOAL`, `/kill [NAME]`, `/approvals`, `/clear`. A closed push
+or swank channel is reattached on a throttle, and without a push channel the
+client polls the image instead of freezing.
+
 ## Building the binary
 
 `make build` produces a self-contained `./sexpr` executable via

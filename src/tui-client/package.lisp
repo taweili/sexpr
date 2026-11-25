@@ -114,6 +114,19 @@
    #:budget-exceeded-msg-agent
    #:budget-exceeded-msg-tokens-used
    #:budget-exceeded-msg-limit
+   #:agent-added-msg
+   #:make-agent-added-msg
+   #:agent-added-msg-p
+   #:agent-added-msg-agent
+   #:agent-added-msg-row
+   #:agent-removed-msg
+   #:make-agent-removed-msg
+   #:agent-removed-msg-p
+   #:agent-removed-msg-agent
+   #:async-done-msg
+   #:make-async-done-msg
+   #:async-done-msg-p
+   #:async-done-msg-cancelled
 
    ;; --- swank RPC client (swank-rpc.lisp, T02) ---
    #:swank-connection
@@ -156,6 +169,10 @@
    ;; --- panes and layout (view.lisp, T04) ---
    #:lines-to-string
    #:one-line
+   #:wrap-text
+   #:truncate-text
+   #:char-display-width
+   #:*char-width-cache*
    #:make-chat-viewport
    #:make-chat-textarea
    #:make-repl-viewport
@@ -163,8 +180,12 @@
    #:make-agent-viewport
    #:agent-row
    #:agent-row-text
+   #:agent-detail-lines
    #:render-agent-rows
    #:render-approval-strip
+   #:approval-decisions
+   #:approval-zone-id
+   #:*approval-decisions*
    #:render-section
    #:render-status-bar
    #:compose-layout
@@ -203,6 +224,8 @@
    #:model-cursor
    #:model-scrollback
    #:model-in-flight
+   #:model-append-chat-line
+   #:model-append-repl-line
    #:model-render-chat
    #:model-scrollback-cap
    #:model-repl-lines
@@ -220,12 +243,25 @@
    #:model-readers-running
    #:model-note
    #:model-quitting
+   #:model-subscriptions
+   #:model-poll-interval
+   #:model-poll-tick
+   #:model-reconnect-cooldown
+   #:model-pending-repl-p
+   #:model-repl-generation
+   #:model-last-async-result
+   #:queue-async-repl
+   #:cancel-repl
+   #:*tui-async-repl*
+   #:*swank-rpc-lock*
    #:tui-init-tick
    #:scrollback-cap
    #:repl-cap
    #:default-term-width
    #:default-term-height
+   #:*tui-poll-interval*
    #:append-line
+   #:flatten-line
    #:event-to-line
    #:reply-error-text
    #:swank-rpc
@@ -233,11 +269,29 @@
    #:rpc-transcript-delta
    #:rpc-resolve-approval
    #:agent-light
+   #:agent-is-picked-p
+   #:sorted-agents
+   #:chat-pane-width
+   #:left-column-width
+   #:agent-pane-inner-width
+   #:push-connection-live-p
+   #:reconcile-subscriptions
+   #:poll-image
+   #:tick-fallback-poll
+   #:swank-connection-live-p
+   #:reconnect-channels
+   #:maybe-reconnect
+   #:*tui-reconnect-cooldown*
+   #:model-reconnect-cooldown
    #:resolve-pending-approval
    #:agent-at-mouse
    #:approval-action-at-mouse
    #:model-switch-agent
    #:handle-mouse
+   #:handle-scroll
+   #:pane-at-mouse
+   #:scroll-key-delta
+   #:model-follow-p
    #:program-running-p
    #:refresh-status
    #:last-error-of
@@ -251,6 +305,9 @@
    #:handle-enter
    #:send-chat-note
    #:send-repl-form
+   #:handle-chat-command
+   #:chat-command-help-lines
+   #:*chat-commands*
    #:resize-panes
 
    ;; --- entry point (main.lisp, T05) ---

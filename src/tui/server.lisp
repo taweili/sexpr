@@ -530,6 +530,21 @@ this closure may take."
                                        :target (getf event :target)
                                        :description (getf event :description)
                                        :restarts (getf event :restarts))))
+        ;; MEMBERSHIP (notes/tui.md §6 vocabulary). The registry announces only
+        ;; the NAME; the server enriches :agent-added with the full data-only row
+        ;; so the client can insert it WITHOUT a swank round trip (R023 — the
+        ;; projection is built here, where %agent-to-sexpr lives). A removed
+        ;; agent has no live object left to project, so the name alone suffices.
+        (:agent-added
+         (let* ((name (or (getf event :agent-id) agent-id))
+                (row (let ((agent (%lookup-agent name)))
+                       (and agent (%agent-to-sexpr agent)))))
+           (%enqueue-backpressured client agent-id
+                                   (list 'agent-added :agent name :row row))))
+        (:agent-removed
+         (%enqueue-backpressured client agent-id
+                                 (list 'agent-removed
+                                       :agent (or (getf event :agent-id) agent-id))))
         (otherwise nil)))))
 
 (defun %cursor-for (agent-id)

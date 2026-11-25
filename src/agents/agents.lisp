@@ -111,18 +111,35 @@ still matches, so a dying worker cannot clobber a replacement's :running."))
   "Maps agent names to agent objects, for lineage tracking.")
 
 (defun register-agent! (agent)
-  "Register AGENT in the global table. Returns AGENT."
+  "Register AGENT in the global table and announce it on the event bus.
+Returns AGENT.
+
+The announcement is what keeps a remote TUI's agent pane honest about
+MEMBERSHIP (not just status): without it a society that grows mid-session
+never shows the newcomer until something else refreshes the snapshot. The
+event carries only the NAME — the push server enriches it with the full
+data-only row before a client sees it (R023), and the kernel never names
+the TUI."
   (setf (gethash (sexpr.kernel:agent-name agent) *agent-table*) agent)
   (let ((parent (sexpr.kernel:agent-parent agent)))
     (when parent
       (setf (sexpr.kernel:agent-child-list parent)
             (append (sexpr.kernel:agent-child-list parent)
                     (list agent)))))
+  (sexpr.kernel:emit-event
+   (sexpr.kernel:agent-name agent)
+   (list :type :agent-added
+         :agent-id (sexpr.kernel:agent-name agent)))
   agent)
 
 (defun deregister-agent! (agent)
-  "Remove AGENT from the global table. Returns AGENT."
+  "Remove AGENT from the global table and announce the removal on the bus.
+Returns AGENT. See REGISTER-AGENT! for why the event exists."
   (remhash (sexpr.kernel:agent-name agent) *agent-table*)
+  (sexpr.kernel:emit-event
+   (sexpr.kernel:agent-name agent)
+   (list :type :agent-removed
+         :agent-id (sexpr.kernel:agent-name agent)))
   agent)
 
 (defun agent-children ()
