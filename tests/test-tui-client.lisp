@@ -2804,6 +2804,45 @@ and the accessor must not be called on it."
                      (lines-to-string (model-scrollback model)))
              (search "inject-note" (get-output-stream-string out)))))))
 
+(test "P2: render-textarea fits a long draft instead of widening its pane"
+  ;; The flicker bug: cl-tuition's textarea never wraps, so an unfitted input row
+  ;; grew the section box, widened the whole frame past the terminal, and the
+  ;; terminal soft-wrapped every row below it while the operator typed.
+  (let* ((ta (make-chat-textarea))
+         (width 20))
+    (dotimes (i 60) (tui.textarea:textarea-insert-string ta "a"))
+    (let* ((view (render-textarea ta width))
+           (plain (%strip-ansi view)))
+      (and (<= (tui:visible-length plain) width)
+           ;; the cursor is at the end, so the window FOLLOWS THE TAIL: the cut
+           ;; is marked and the characters just typed are the ones shown
+           (search "…" plain)
+           (search "aaaa" plain)
+           ;; and the insert position is still drawn in reverse video
+           (search "[7m" view)
+           ;; nothing is fitted when no width is given (standalone behaviour)
+           (null (search "…" (render-textarea ta)))))))
+
+(test "P2: a long draft leaves the frame exactly WIDTH x HEIGHT"
+  ;; The operator-visible half of the same bug: the frame must not reflow.
+  (multiple-value-bind (conn out)
+      (canned-swank-with-output (swank-reply :ok nil 1)
+                                (swank-reply :ok '(nil . 0) 2))
+    (declare (ignore out))
+    (let ((model (make-instance 'tui-model :swank-connection conn)))
+      (tui:init model)
+      (setf (model-term-width model) 80
+            (model-term-height model) 24)
+      (resize-panes model)
+      (tui.textarea:textarea-set-value
+       (model-chat-textarea model)
+       (make-string 200 :initial-element #\x))
+      (let* ((lines (tui:split-string-by-newline (tui:view model))))
+        (and (= 24 (length lines))
+             (every (lambda (line)
+                      (<= (tui:visible-length line) 80))
+                    lines))))))
+
 ;;; --- summary -------------------------------------------------------------
 
 (format t "~%~D tests, ~D passed, ~D failed~%" *tests-run* *tests-passed* *tests-failed*)

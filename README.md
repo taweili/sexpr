@@ -586,6 +586,12 @@ A resize event reflows every pane, growing or shrinking. The layout is
 total: a 0x0 or negative window degrades to the smallest usable panes
 rather than signalling.
 
+Input rows are fitted to the same budget. cl-tuition's textarea never wraps,
+so an unfitted draft would grow its section box, widen the frame past the
+terminal, and soft-wrap every row below it — visible as flicker while typing.
+A draft longer than the pane instead becomes a horizontally scrolling window
+marked with a leading `…`, with the cursor kept in view at the insert position.
+
 ### Input focus
 
 `Tab` moves key input between the chat and REPL inputs, and exactly one

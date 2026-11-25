@@ -2371,33 +2371,39 @@ Without it the agent-row and approval zones are never registered and nothing is
 clickable (the zone-mark call is a no-op for recording). The approval strip is passed
 as its own line between the body and the status bar."
   (tui:zone-scan
-   (compose-layout
-    (if (model-overlay model)
-        ;; The overlay replaces the transcript AND the input; the layout still
-        ;; reserves the input rows, so the panel fills those too.
-        (render-overlay model (chat-pane-width model)
-                        (+ (chat-pane-height model)
-                           (max 0 (1- *chat-input-lines*))))
-        (when (model-chat-viewport model)
-          (tui:join-vertical :left
-                             (tui.viewport:viewport-view (model-chat-viewport model))
-                             (when (model-chat-textarea model)
-                               (render-textarea (model-chat-textarea model))))))
-    (when (model-repl-viewport model)
-      (tui:join-vertical :left
-                         (tui.viewport:viewport-view (model-repl-viewport model))
-                         (when (model-repl-textarea model)
-                           (render-textarea (model-repl-textarea model)))))
-    (when (model-agent-viewport model)
-      (tui.viewport:viewport-view (model-agent-viewport model)))
-    (model-status-text model)
-    (render-approval-strip (model-pending-approval model)
-                           (left-column-width model))
-    :chat-focused (eq (model-focused model) :chat)
-    :repl-focused (eq (model-focused model) :repl)
-    ;; The frame is sized from the terminal, not from the content: without these two
-    ;; compose-layout pads nothing and the pane would render at the width of its
-    ;; longest transcript line instead of the width of the screen.
-    :width (model-term-width model)
-    :height (model-term-height model))))
+   (let ((input-width (input-pane-width model)))
+     (compose-layout
+      (if (model-overlay model)
+          ;; The overlay replaces the transcript AND the input; the layout still
+          ;; reserves the input rows, so the panel fills those too.
+          (render-overlay model (chat-pane-width model)
+                          (+ (chat-pane-height model)
+                             (max 0 (1- *chat-input-lines*))))
+          (when (model-chat-viewport model)
+            (tui:join-vertical :left
+                               (tui.viewport:viewport-view (model-chat-viewport model))
+                               (when (model-chat-textarea model)
+                                 ;; Fitted to the pane: an unfitted row grows the
+                                 ;; section box, widens the frame past the terminal,
+                                 ;; and soft-wraps everything below it.
+                                 (render-textarea (model-chat-textarea model)
+                                                  input-width)))))
+      (when (model-repl-viewport model)
+        (tui:join-vertical :left
+                           (tui.viewport:viewport-view (model-repl-viewport model))
+                           (when (model-repl-textarea model)
+                             (render-textarea (model-repl-textarea model)
+                                              input-width))))
+      (when (model-agent-viewport model)
+        (tui.viewport:viewport-view (model-agent-viewport model)))
+      (model-status-text model)
+      (render-approval-strip (model-pending-approval model)
+                             (left-column-width model))
+      :chat-focused (eq (model-focused model) :chat)
+      :repl-focused (eq (model-focused model) :repl)
+      ;; The frame is sized from the terminal, not from the content: without these two
+      ;; compose-layout pads nothing and the pane would render at the width of its
+      ;; longest transcript line instead of the width of the screen.
+      :width (model-term-width model)
+      :height (model-term-height model)))))
 (export 'tui:view)

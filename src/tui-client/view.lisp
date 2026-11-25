@@ -816,23 +816,81 @@ so the renderer degrades rather than signalling."
     (error () nil)))
 (export '%textarea-slot)
 
-(defun render-textarea (textarea)
-  "Render one textarea line for the frame: PROMPT + content, with the cursor
-as a REVERSE-VIDEO character on the focused line.
+(defun %fit-input-window (text col budget)
+  "VALUES (WINDOW CURSOR-INDEX MARKER-P) for one input row of at most BUDGET
+columns. TEXT is the logical line, COL its insert position; a COL at or past the
+end contributes one virtual space, so the cursor always has a cell to occupy.
+The window FOLLOWS THE TAIL: while typing, the text just typed stays visible and
+the front is cut, with MARKER-P true so the caller draws an ellipsis.
+PURE."
+  (let* ((len (length text))
+         (virtual (and (integerp col) (>= col len)))
+         (full (if virtual (concatenate 'string text " ") text))
+         (n (length full)))
+    (flet ((window-for (avail)
+             (let ((start (cond ((<= n avail) 0)
+                                (virtual (- n avail))
+                                (t (max 0 (- col (1- avail)))))))
+               (list start (min n (+ start avail))))))
+      (destructuring-bind (start end) (window-for (max 1 budget))
+        (if (plusp start)
+            ;; The cut leaves context behind: spend one column on the marker
+            ;; and re-slice so the marker is not itself clipped.
+            (destructuring-bind (start end) (window-for (max 1 (1- budget)))
+              (let ((win (subseq full start end)))
+                (if (string= win "")
+                    (values "" 0 t)
+                    (values win
+                            (max 0 (min (- col start) (1- (length win))))
+                            t))))
+            (values (subseq full start end) (min col (- end start)) nil))))))
+
+(defun %styled-input-row (prefix window cursor-index focused)
+  "PREFIX + WINDOW, with the cell at CURSOR-INDEX in reverse video when FOCUSED.
+CURSOR-INDEX NIL draws no cursor at all (a placeholder is not a cursor
+position), and an index equal to the window length draws a reverse-video space —
+the insert position past the last character. PURE."
+  (let* ((n (length window))
+         (has-cursor (and cursor-index (<= 0 cursor-index n)))
+         (before (if has-cursor (subseq window 0 (min cursor-index n)) window))
+         (at (cond ((not has-cursor) "")
+                   ((< cursor-index n) (string (char window cursor-index)))
+                   (t " ")))
+         (after (if (and has-cursor (< cursor-index n))
+                    (subseq window (1+ cursor-index))
+                    "")))
+    (format nil "~A~A~A~A" prefix before
+            (if (and has-cursor focused)
+                (tui:render-styled (tui:make-style :reverse t) at)
+                at)
+            after)))
+
+(defun render-textarea (textarea &optional (width nil))
+  "Render the textarea's rows for the frame: PROMPT + content per row, the cursor
+as a REVERSE-VIDEO character on the focused row.
 
 WHY NOT cl-tuition's textarea-view: it wraps the character under the cursor in
-[..] — while typing, an input reading "hello" renders as "hello[ ]"
-(bracket-space-bracket once the cursor passes the last character), the "extra []"
+[..] — while typing, an input reading \"hello\" renders as \"hello[ ]\"
+(bracket-space-bracket once the cursor passes the last character), the \"extra []\"
 the operator sees. Its cursor-blink slot is dead (never read by the view), so
 there is no accessor to change the cursor style. The project already treats the
 section border (*focus-color*) as the focus cue, so the cursor only needs to mark
 the insert position — reverse video is the terminal-standard way to do that.
 
-MIRRORS cl-tuition's contract: the placeholder branch fires when the value is
-empty (and shows no cursor — a placeholder is not a cursor position); the cursor
-appears only on the focused line at the insert column. PURE and total: anything
-unreadable degrades to an empty string rather than signalling, so a half-built
-pane cannot take the frame down."
+WIDTH, when given, is the row budget in columns (the pane's inner width). An
+unfitted row OVERFLOWS its section: cl-tuition's textarea never wraps, so a draft
+longer than the pane makes the section box grow to fit it, the whole frame widens
+past the terminal, and the terminal soft-wraps every row below — the flicker seen
+while typing a long message. A too-long row therefore becomes a tail-following
+window marked with a leading ellipsis (see %FIT-INPUT-WINDOW), keeping the cursor
+visible and the frame exactly WIDTH wide. NIL fits nothing, which is what the
+standalone callers and tests want.
+
+Every row the component holds is rendered, up to its own HEIGHT — the component
+does not wrap, so ROW/COL address a vector of logical lines. An empty value shows
+the placeholder on one row with no cursor. PURE and total: anything unreadable
+degrades to an empty string rather than signalling, so a half-built pane cannot
+take the frame down."
   (handler-case
       (let* ((lines (%textarea-slot textarea "LINES"))
              (row (%textarea-slot textarea "ROW"))
@@ -840,35 +898,51 @@ pane cannot take the frame down."
              (focused (tui.textarea:textarea-focused textarea))
              (prompt (tui.textarea:textarea-prompt textarea))
              (placeholder (tui.textarea:textarea-placeholder textarea))
-             (value (tui.textarea:textarea-value textarea)))
-        (cond
-          ((string= value "")
-           ;; empty: the placeholder, and no cursor — cl-tuition's own rule (a
-           ;; placeholder is not a cursor position). A NIL placeholder renders
-           ;; as nothing after the prompt.
-           (format nil "~A~A" prompt placeholder))
-          ((and lines (integerp row) (integerp col))
-           (let* ((line-text (if (< row (length lines)) (aref lines row) ""))
-                  (before (subseq line-text 0 (min col (length line-text))))
-                  (at-cursor (if (< col (length line-text))
-                                (string (char line-text col))
-                                " "))
-                  (after (if (< col (length line-text))
-                             (subseq line-text (min (1+ col) (length line-text)))
-                             ""))
-                  ;; REVERSE video, never brackets — the focus cue is the section
-                  ;; border (*focus-color*), the cursor only marks the insert spot.
-                  (cursor (if focused
-                              (tui:render-styled (tui:make-style :reverse t)
-                                                at-cursor)
-                              at-cursor)))
-             (format nil "~A~A~A~A" prompt before cursor after)))
-          (t "")))
+             (value (tui.textarea:textarea-value textarea))
+             (height (max 1 (tui.textarea:textarea-height textarea))))
+        (flet ((draw (text cursor-col)
+                 "One fitted, styled row: prompt + optional ellipsis + window."
+                 (let* ((budget (when width
+                                  (max 1 (- width (tui:visible-length prompt)))))
+                        (cursor-col (when (integerp cursor-col)
+                                      (max 0 cursor-col))))
+                   (if (null budget)
+                       (%styled-input-row prompt
+                                          (if (and cursor-col
+                                                   (>= cursor-col (length text)))
+                                              (concatenate 'string text " ")
+                                              text)
+                                          cursor-col
+                                          focused)
+                       (multiple-value-bind (win idx marker)
+                           (%fit-input-window text cursor-col budget)
+                         (format nil "~A~A~A"
+                                 prompt
+                                 (if marker "…" "")
+                                 (%styled-input-row "" win idx focused)))))))
+          (cond
+            ((string= value "")
+             (let ((line (format nil "~A~A" prompt placeholder)))
+               (if width (truncate-text line width) line)))
+            ((and lines (integerp row) (integerp col))
+             (lines-to-string
+              (loop for r from 0 below height
+                    collect (draw (if (< r (length lines)) (aref lines r) "")
+                                  (when (= r row) col)))))
+            (t ""))))
       ;; PURE and total: a NIL textarea (or an unreadable slot) degrades to an
       ;; empty string rather than signalling — a half-built pane cannot take
       ;; the frame down.
       (error () "")))
 (export 'render-textarea)
+
+(defun input-pane-width (model)
+  "The column budget for the chat and REPL input rows: the chat section's INNER
+width. layout-dimensions returns it directly (the border columns are added
+outside it), so this is the number to pass RENDER-TEXTAREA. PURE."
+  (nth-value 0 (layout-dimensions (model-term-width model)
+                                  (model-term-height model))))
+(export 'input-pane-width)
 
 ;;;; --- overlays ----------------------------------------------------------
 
