@@ -17,6 +17,8 @@
 #     ./sexpr-tui.sh --dry-run       print what would be generated, launch nothing
 #
 # Environment (all optional, all default the local-dev way):
+#   SEXPR_ENV_FILE           .env path             (default <script dir>/.env;
+#                            exported variables win over .env)
 #   SEXPR_TUI_HOST           image host            (default 127.0.0.1)
 #   SEXPR_TUI_SWANK_PORT     swank port            (default 4004)
 #   SEXPR_TUI_PUSH_PORT      push port             (default 4005)
@@ -56,10 +58,64 @@
 set -uo pipefail
 
 # ---------------------------------------------------------------------------
+# .env support
+# ---------------------------------------------------------------------------
+
+# Load KEY=VALUE pairs from FILE into the environment, without overriding any
+# variable already exported. Parsed rather than sourced, so a .env cannot
+# execute code. Supported syntax: blank lines, '#' comments, an optional
+# 'export ' prefix, and single- or double-quoted values. An unquoted value may
+# carry an inline ' # comment'; a quoted value must end at its closing quote.
+# ${...} expansion is deliberately left literal.
+load_dotenv() {
+    local file="$1"
+    if [[ ! -f "$file" || ! -r "$file" ]]; then
+        return 0
+    fi
+    local line key value
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        if [[ -z "$line" || "$line" == '#'* ]]; then
+            continue
+        fi
+        if [[ "$line" == "export "* ]]; then
+            line="${line#export }"
+            line="${line#"${line%%[![:space:]]*}"}"
+        fi
+        if [[ "$line" != *=* ]]; then
+            continue
+        fi
+        key="${line%%=*}"
+        value="${line#*=}"
+        if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            continue
+        fi
+        value="${value#"${value%%[![:space:]]*}"}"
+        if [[ "${value:0:1}" == '"' || "${value:0:1}" == "'" ]]; then
+            if [[ ${#value} -ge 2 && "${value: -1}" == "${value:0:1}" ]]; then
+                value="${value:1:${#value}-2}"
+            fi
+        else
+            if [[ "$value" =~ (.*)[[:space:]]+\#.* ]]; then
+                value="${BASH_REMATCH[1]}"
+            fi
+            value="${value%"${value##*[![:space:]]}"}"
+        fi
+        if [[ -z "${!key+x}" ]]; then
+            printf -v "$key" '%s' "$value"
+            export "$key"
+        fi
+    done < "$file"
+}
+
+# ---------------------------------------------------------------------------
 # config
 # ---------------------------------------------------------------------------
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
+load_dotenv "${SEXPR_ENV_FILE:-$ROOT/.env}"
 
 HOST="${SEXPR_TUI_HOST:-127.0.0.1}"
 SWANK_PORT="${SEXPR_TUI_SWANK_PORT:-4004}"
@@ -100,7 +156,9 @@ options:
   --dry-run              print the boot file and the client command, launch nothing
   --help, -h             this message
 
-environment (override with `VAR=value ./sexpr-tui.sh ...`):
+environment (override with `VAR=value ./sexpr-tui.sh ...`; a .env next to this
+script sets them too, and exported variables win over .env):
+  SEXPR_ENV_FILE            .env path             (default <script dir>/.env)
   SEXPR_TUI_HOST            image host            (default 127.0.0.1)
   SEXPR_TUI_SWANK_PORT      swank port            (default 4004)
   SEXPR_TUI_PUSH_PORT       push port             (default 4005)

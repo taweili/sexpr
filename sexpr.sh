@@ -4,9 +4,11 @@
 # Local dev wrapper: run ./sexpr against the on-host OpenAI-compatible
 # endpoint with Qwythos-9B-v2, wrapped in rlwrap for line editing in
 # the chat loop. Override any setting by exporting it before invoking,
-# e.g. `SEXPR_MODEL=Other ./sexpr.sh`.
+# e.g. `SEXPR_MODEL=Other ./sexpr.sh`, or by putting it in a .env file next
+# to this script (exported variables still win over .env).
 #
 # Environment variables (all optional, all default the local-dev way):
+#   SEXPR_ENV_FILE        .env path             (default: <script dir>/.env)
 #   SEXPR_PROVIDER       provider name         (default: openai-compatible)
 #   SEXPR_BASE_URL       provider base URL     (default: http://localhost:6969/v1)
 #   SEXPR_MODEL          model name            (default: Qwythos-9B-v2)
@@ -36,10 +38,67 @@
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
+# .env support
+# ---------------------------------------------------------------------------
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Load KEY=VALUE pairs from FILE into the environment, without overriding any
+# variable already exported. Parsed rather than sourced, so a .env cannot
+# execute code. Supported syntax: blank lines, '#' comments, an optional
+# 'export ' prefix, and single- or double-quoted values. An unquoted value may
+# carry an inline ' # comment'; a quoted value must end at its closing quote.
+# ${...} expansion is deliberately left literal.
+load_dotenv() {
+    local file="$1"
+    if [[ ! -f "$file" || ! -r "$file" ]]; then
+        return 0
+    fi
+    local line key value
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        if [[ -z "$line" || "$line" == '#'* ]]; then
+            continue
+        fi
+        if [[ "$line" == "export "* ]]; then
+            line="${line#export }"
+            line="${line#"${line%%[![:space:]]*}"}"
+        fi
+        if [[ "$line" != *=* ]]; then
+            continue
+        fi
+        key="${line%%=*}"
+        value="${line#*=}"
+        if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            continue
+        fi
+        value="${value#"${value%%[![:space:]]*}"}"
+        if [[ "${value:0:1}" == '"' || "${value:0:1}" == "'" ]]; then
+            if [[ ${#value} -ge 2 && "${value: -1}" == "${value:0:1}" ]]; then
+                value="${value:1:${#value}-2}"
+            fi
+        else
+            if [[ "$value" =~ (.*)[[:space:]]+\#.* ]]; then
+                value="${BASH_REMATCH[1]}"
+            fi
+            value="${value%"${value##*[![:space:]]}"}"
+        fi
+        if [[ -z "${!key+x}" ]]; then
+            printf -v "$key" '%s' "$value"
+            export "$key"
+        fi
+    done < "$file"
+}
+
+load_dotenv "${SEXPR_ENV_FILE:-$SCRIPT_DIR/.env}"
+
+# ---------------------------------------------------------------------------
 # example subcommand
 # ---------------------------------------------------------------------------
 
-EXAMPLES_DIR="$(cd "$(dirname "$0")" && pwd)/examples"
+EXAMPLES_DIR="$SCRIPT_DIR/examples"
 
 run_example() {
     local file="$1"
@@ -215,7 +274,9 @@ so the full flag list is:
 Run examples with:
   ./sexpr.sh example [OPTIONS] [NAME]
 
-environment (override with `VAR=value ./sexpr.sh ...`):
+environment (override with `VAR=value ./sexpr.sh ...`; a .env next to this
+script sets them too, and exported variables win over .env):
+  SEXPR_ENV_FILE        .env path             (default: <script dir>/.env)
   SEXPR_PROVIDER       provider name         (default: openai-compatible)
   SEXPR_BASE_URL       provider base URL     (default: http://localhost:6969/v1)
   SEXPR_MODEL          model name            (default: Qwythos-9B-v2)

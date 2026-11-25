@@ -61,6 +61,10 @@ export OPENAI_API_KEY="sk-..."   # or ANTHROPIC_API_KEY, GEMINI_API_KEY, ...
 | `SEXPR_MODEL` | model name |
 | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` | provider API key |
 
+Both wrappers load a `.env` beside themselves before applying their defaults,
+so the variables above can live in one file; exported variables win, and
+`SEXPR_ENV_FILE` points at a file elsewhere.
+
 ---
 
 ## 3. The `./sexpr.sh` wrapper
