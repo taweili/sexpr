@@ -234,6 +234,26 @@ fake-stream. Real providers are untouched for everything else."
                 (equal (event-usage event) (list :total-tokens 7))
                 (null (event-tool-calls event)))))
 
+       ;; Regression: OpenAI-compatible servers (LongCat among them) append a
+       ;; trailing metadata chunk — choices: [], no delta, carrying usage —
+       ;; AFTER the chunk that reports finish_reason. Reading finish/usage off
+       ;; the last chunk alone lost the only finish signal, so finished-p never
+       ;; returned T and run-until-finished kept asking the model forever.
+       (test "2b. a trailing metadata chunk must not erase the finish reason"
+         (setf *fake-stream*
+               (make-instance 'fake-stream
+                              :chunks (list (make-fake-chunk "Hi")
+                                            (make-fake-chunk "" :finish-reason :stop)
+                                            (make-fake-chunk "" :usage (list :total-tokens 42)))
+                              :content "Hi"
+                              :tool-calls nil))
+         (let ((event (model-step-streaming
+                       (spawn :goal "g" :name "streamer" :endpoint :ollama))))
+           (and (eq (event-finish event) :stop)
+                (finished-p event)
+                ;; usage still comes through, from whichever chunk carried it
+                (equal (event-usage event) (list :total-tokens 42)))))
+
        (test "3. streamed tool-calls are translated to the model-step plist shape"
          (setf *fake-stream*
                (make-instance 'fake-stream

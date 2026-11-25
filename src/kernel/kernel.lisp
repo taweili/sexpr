@@ -163,7 +163,9 @@ process tree views and capability inheritance.")
    (status
     :accessor agent-status
     :initform :running
-    :documentation "One of :running, :finished, :failed, :killed.")
+    :documentation "One of :running, :finished, :failed, :killed. :idle is the
+display vocabulary for an agent with no live turn — only seed-subagent writes
+it — so a placeholder is never mistaken for a busy one.")
    (streaming-p
     :initarg :streaming-p
     :accessor agent-streaming-p
@@ -338,8 +340,10 @@ plist shape (:content / :tool-calls / :model / :usage / :finish) model-step
 returns. Tool schemas are translated through sexpr.provider:translate-tool-
 schemas; the endpoint resolves through sexpr.provider:*model-endpoint*,
 both by qualified call so the transport's types stay behind the provider
-seam. :model is NIL (the transport's stream-model reader is not exported);
-:finish and :usage come from the final chunk.
+seam. :model is NIL (the transport's stream-model reader is not exported).
+:finish and :usage are collected across the WHOLE stream, not read off the
+final chunk — see the pull loop for why a trailing metadata chunk must not
+erase the finish reason.
 
 BUDGET: cumulative tokens are compared against (agent-budget agent) after
 each chunk. When the ceiling is crossed the stream is closed through the
@@ -370,7 +374,8 @@ tell a completed stream from a stalled one (F3). Each :delta is marked
                    :provider endpoint
                    :system (or (agent-system agent) (agent-goal agent))
                    :tools tools))
-         (last-chunk nil)
+         (last-finish-reason nil)
+         (last-usage nil)
          (tokens-used 0)
          (budget-exceeded-p nil)
          (interrupted-p nil))
@@ -393,7 +398,19 @@ tell a completed stream from a stalled one (F3). Each :delta is marked
                              (invoke-restart 'cl-llm-provider:abort-stream))))
              (loop :for chunk = (cl-llm-provider:read-stream-chunk stream)
                    :while chunk
-                   :do (setf last-chunk chunk)
+                   :do ;; Finish reason and usage are read from ANY chunk, not
+                       ;; just the last one. OpenAI-compatible servers commonly
+                       ;; append a trailing metadata chunk (choices: []) that
+                       ;; carries usage AFTER the chunk reporting finish_reason;
+                       ;; taking only the last chunk dropped the stream's only
+                       ;; finish signal, so finished-p never returned T and
+                       ;; run-until-finished asked the model again forever — the
+                       ;; chat reply that never stops growing.
+                       (let ((finish (cl-llm-provider:chunk-finish-reason chunk)))
+                         (when (and finish (null last-finish-reason))
+                           (setf last-finish-reason finish)))
+                       (let ((chunk-usage (cl-llm-provider:chunk-usage chunk)))
+                         (when chunk-usage (setf last-usage chunk-usage)))
                        (setf tokens-used (%stream-chunk-tokens chunk tokens-used))
                        ;; Reasoning deltas (thinking blocks) are emitted
                        ;; with :kind :reasoning so the TUI can render them
@@ -450,8 +467,8 @@ tell a completed stream from a stalled one (F3). Each :delta is marked
                                   :arguments (cl-llm-provider:tool-call-arguments tc)))
                           (cl-llm-provider:stream-tool-calls stream))
       :model nil
-      :usage (when last-chunk (cl-llm-provider:chunk-usage last-chunk))
-      :finish (when last-chunk (cl-llm-provider:chunk-finish-reason last-chunk)))
+      :usage last-usage
+      :finish last-finish-reason)
      (when budget-exceeded-p (list :budget-exceeded t))
      (when interrupted-p (list :interrupted t)))))
 (export 'model-step-streaming)
