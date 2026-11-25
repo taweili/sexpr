@@ -2521,13 +2521,21 @@ and the accessor must not be called on it."
                         (agent-pane-inner-width model)))
                   (tui:split-string-by-newline pane))))))
 
-(test "P1: /help lists every verb in the REPL pane"
-  (let ((model (init-two-agent-model)))
-    (handle-chat-command model "/help")
-    (let ((out (lines-to-string (model-repl-lines model))))
-      (and (every (lambda (verb) (search verb out)) *chat-commands*)
-           (= 0 (length (tui.textarea:textarea-value
-                         (model-chat-textarea model))))))))
+(test "P1: /help opens the help overlay, not the REPL pane"
+  ;; The REPL pane is the dev console for eval results. /help used to print the
+  ;; verb list there, and the same content was already rendered by the `?`
+  ;; overlay (HELP-LINES includes CHAT-COMMAND-HELP-LINES). The rendered frame
+  ;; is asserted rather than the slot, so the test pins what the operator sees.
+  (let* ((model (init-two-agent-model))
+         (repl-before (copy-list (model-repl-lines model)))
+         (frame (progn (handle-chat-command model "/help")
+                       (tui:view model))))
+    (and (search "verbs:" frame)
+         (every (lambda (verb) (search verb frame)) *chat-commands*)
+         ;; nothing was written to the REPL pane
+         (equal repl-before (model-repl-lines model))
+         (= 0 (length (tui.textarea:textarea-value
+                       (model-chat-textarea model)))))))
 
 (test "P1: an unknown slash verb explains itself and is not sent to the model"
   (multiple-value-bind (swank out)
@@ -2548,20 +2556,24 @@ and the accessor must not be called on it."
          (not (search "line" (tui.viewport:viewport-view
                               (model-chat-viewport model)))))))
 
-(test "P1: /approvals lists exactly the waiting rows from the snapshot"
+(test "P1: /approvals lists exactly the waiting rows in the chat pane"
+  ;; Command output belongs to the pane it was issued from, like /spawn and
+  ;; /kill; the REPL pane is reserved for eval results.
   (let ((model (init-two-agent-model)))
     (setf (model-agents model)
           (list (list :name "Alpha" :status :running
                       :pending-approval '(:capability :net :target "http://x"))
                 (list :name "Beta" :status :idle)))
     (handle-chat-command model "/approvals")
-    (let ((out (lines-to-string (model-repl-lines model))))
+    (let ((out (lines-to-string (model-scrollback model))))
       (and (search "Alpha NET http://x" out)
-           (not (search "Beta" out)))))
+           (not (search "Beta" out))
+           (null (model-repl-lines model)))))
   ;; and the none-pending case is explicit rather than blank
   (let ((model (init-two-agent-model)))
     (handle-chat-command model "/approvals")
-    (search "none pending" (lines-to-string (model-repl-lines model)))))
+    (and (search "none pending" (lines-to-string (model-scrollback model)))
+         (null (model-repl-lines model)))))
 
 (test "P1: /spawn sends the spawn RPC and reconciles the newcomer into the pane"
   (multiple-value-bind (swank out)
@@ -2607,10 +2619,14 @@ and the accessor must not be called on it."
     (let ((model (init-two-agent-model :picked "Alpha" :swank swank)))
       (tui.textarea:textarea-set-value (model-chat-textarea model) "/help")
       (tui:update model (make-enter-msg))
-      (and (search "/spawn" (lines-to-string (model-repl-lines model)))
-           (string= "" (tui.textarea:textarea-value (model-chat-textarea model)))
-           ;; only the two init packets were read: no note RPC was issued
-           (= 2 (client-stats-get swank :packets-read))))))
+      (let ((frame (tui:view model)))
+        (and (search "verbs:" frame)
+             ;; the overlay carries the verb list, the REPL pane nothing
+             (search "/spawn" frame)
+             (null (model-repl-lines model))
+             (string= "" (tui.textarea:textarea-value (model-chat-textarea model)))
+             ;; only the two init packets were read: no note RPC was issued
+             (= 2 (client-stats-get swank :packets-read)))))))
 
 ;;;; --- P1: reconnect ------------------------------------------------------
 

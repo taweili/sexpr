@@ -214,7 +214,7 @@ model:
 
 | Command | Effect |
 |---------|--------|
-| `/help` | list the verbs |
+| `/help` | open the help overlay (the same one `?` opens; `Esc` closes it) |
 | `/spawn GOAL` | spawn a worker subagent, then reconcile the newcomer into the pane |
 | `/kill [NAME]` | terminate an agent (default: the picked one) |
 | `/approvals` | list every agent waiting on an approval |

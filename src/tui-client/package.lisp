@@ -281,6 +281,7 @@
    #:agent-is-picked-p
    #:sorted-agents
    #:chat-pane-width
+   #:chat-pane-height
    #:left-column-width
    #:agent-pane-inner-width
    #:push-connection-live-p

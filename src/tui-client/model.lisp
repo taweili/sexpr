@@ -943,6 +943,15 @@ past the layout."
          (layout-dimensions (model-term-width model) (model-term-height model)))))
 (export 'chat-pane-width)
 
+(defun chat-pane-height (model)
+  "The chat VIEWPORT's row count, derived from the current terminal size. The
+`?`/`Ctrl+P`/`Ctrl+F` OVERLAY replaces the transcript and the input line, so its
+panel must fill exactly this many rows plus the input rows it hides — which is
+what tui:view computes from this. PURE."
+  (nth 2 (multiple-value-list
+         (layout-dimensions (model-term-width model) (model-term-height model)))))
+(export 'chat-pane-height)
+
 (defun left-column-width (model)
   "The full width of the left column INCLUDING its border: the strip and the status
 bar are padded to this, and the agent pane takes the rest."
@@ -1722,7 +1731,8 @@ notes.")
 (export '*chat-commands*)
 
 (defun chat-command-help-lines ()
-  "The /help text: one REPL line per verb."
+  "The client-side verb list shown by HELP-LINES: the `?` overlay and /help.
+PURE."
   (list "/help        show this help"
         "/spawn GOAL  spawn a worker subagent and return its handle"
         "/kill [NAME] terminate an agent (default: picked)"
@@ -1750,8 +1760,12 @@ an unfinished note). Nothing here signals."
     (let ((args (or args "")))
       (cond
         ((string-equal name "help")
-         (dolist (line (chat-command-help-lines))
-           (model-append-repl-line model line)))
+         ;; The help text belongs where help already lives: the `?` OVERLAY,
+         ;; whose HELP-LINES includes this verb list. Writing it to the REPL
+         ;; pane put chat command output in the dev console — the pane that is
+         ;; reserved for eval results — and duplicated content the overlay
+         ;; already renders. Opening it also keeps the transcript clean.
+         (open-overlay model :help))
         ((string-equal name "clear")
          (setf (model-scrollback model) nil
                (model-in-flight model) nil
@@ -1760,13 +1774,15 @@ an unfinished note). Nothing here signals."
          (let ((vp (model-chat-viewport model)))
            (when vp (tui.viewport:viewport-set-content vp ""))))
         ((string-equal name "approvals")
+         ;; Answered in the pane the operator asked from, like /spawn and /kill.
+         ;; The REPL pane is the dev console for eval results (see /help).
          (let ((rows (remove-if-not (lambda (a) (getf a :pending-approval))
                                     (model-agents model))))
            (if (null rows)
-               (model-append-repl-line model "approvals: none pending")
+               (model-append-chat-line model "approvals: none pending")
                (dolist (row rows)
                  (let ((p (getf row :pending-approval)))
-                   (model-append-repl-line
+                   (model-append-chat-line
                     model
                     (format nil "approval: ~A ~A ~A"
                             (or (getf row :name) "?")
