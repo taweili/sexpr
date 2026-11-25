@@ -328,7 +328,8 @@ The `./sexpr.sh` and `./sexpr-tui.sh` wrappers also load a `.env` beside
 themselves before applying their defaults, so `SEXPR_PROVIDER`, `SEXPR_MODEL`,
 `SEXPR_BASE_URL`, `SEXPR_CAPABILITIES`, and the `SEXPR_TUI_*` settings can live
 in one file. Exported variables win over `.env`; set `SEXPR_ENV_FILE` to load
-one from elsewhere.
+one from elsewhere. `dot.env` is the committed, annotated template — copy it
+to `.env` and edit.
 
 Then from Lisp:
 

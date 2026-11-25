@@ -52,7 +52,6 @@ lpt[1-9].*
 *.code-workspace
 .env
 .env.*
-!.env.example
 node_modules/
 .next/
 dist/
