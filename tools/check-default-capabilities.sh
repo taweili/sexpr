@@ -138,6 +138,20 @@ else
     fail "default goal NOT injected"
 fi
 
+# 7. Both wrappers must agree on the default capability set, so editing one
+#    cannot silently leave the other behind.
+echo
+echo "[case 7] sexpr-tui.sh carries the same default caps as sexpr.sh"
+cli_default="$(grep -o 'SEXPR_CAPABILITIES:-[a-z,-]*' "$WRAP" | head -1 || true)"
+tui_default="$(grep -o 'SEXPR_CAPABILITIES:-[a-z,-]*' "$ROOT/sexpr-tui.sh" | head -1 || true)"
+printf '    sexpr.sh:      %s\n' "$cli_default"
+printf '    sexpr-tui.sh:  %s\n' "$tui_default"
+if [[ -n "$cli_default" && "$cli_default" == "$tui_default" ]]; then
+    pass "both wrappers default to the same list"
+else
+    fail "wrapper defaults differ"
+fi
+
 echo
 if [[ $fails -eq 0 ]]; then
     echo "OK — all assertions passed."

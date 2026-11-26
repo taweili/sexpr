@@ -69,6 +69,11 @@ transcript to the model, so a goal-only call carries no user message, and
 providers whose chat template requires one (llama-server's `--jinja`) refuse
 such a request.
 
+The boot agent's capability set comes from `SEXPR_CAPABILITIES`, the same
+variable `./sexpr.sh` forwards. It defaults to all eight grants — `fs-read`,
+`fs-write`, `process`, `lisp-eval`, `spawn`, `collect`, `manage`, `inspect` —
+and `:fs-read` is always added, so a narrow override still reads files.
+
 Both off (`SEXPR_TUI_SEED=0 SEXPR_TUI_GREETER=0`) gives the historical
 behaviour: a truly empty image you populate with `/spawn GOAL`.
 
@@ -129,6 +134,7 @@ Every knob is overridable, with no build step and no binary:
 | `SEXPR_PROVIDER` | `openai-compatible` | provider name |
 | `SEXPR_BASE_URL` | `http://localhost:6969/v1` | provider base URL |
 | `SEXPR_MODEL` | `Qwythos-9B-v2` | model name |
+| `SEXPR_CAPABILITIES` | all eight grants | boot agent's capability set; same default as `sexpr.sh` |
 
 Examples:
 

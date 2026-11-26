@@ -75,6 +75,7 @@ dry() {
     env SEXPR_TUI_STATE_DIR="$STATE" SEXPR_TUI_HOST=127.0.0.1 \
         SEXPR_TUI_SWANK_PORT="${T_SWANK:-4004}" SEXPR_TUI_PUSH_PORT="${T_PUSH:-4005}" \
         SEXPR_TUI_GREETER="${GREETER:-0}" SEXPR_TUI_SEED="${SEED:-1}" \
+        SEXPR_CAPABILITIES="${CAPS:-}" \
         "$WRAP" --dry-run "$@" 2>&1
 }
 
@@ -106,7 +107,7 @@ for s in "usage: sexpr-tui.sh" "--no-server" "--server-only" "--dry-run" \
          "SEXPR_TUI_HOST" "SEXPR_TUI_SWANK_PORT" "SEXPR_TUI_PUSH_PORT" \
          "SEXPR_TUI_STATE_DIR" "SEXPR_TUI_READY_TIMEOUT" \
          "SEXPR_TUI_SBCL" "SEXPR_TUI_SBCLINIT" "SEXPR_TUI_GREETER" \
-         "SEXPR_TUI_SEED"; do
+         "SEXPR_TUI_SEED" "SEXPR_CAPABILITIES"; do
     need "$s" "$out"
 done
 
@@ -136,7 +137,8 @@ need '(sexpr.provider:configure-provider)' "$b"
 # seed must not start a worker — sexpr.tui:spawn does, and that is exactly the
 # "chat started by itself" bug.
 need '(sexpr.tui:seed "hello world"' "$b"
-need ':lisp-eval' "$b"
+# The seeded agent carries the same default grants as ./sexpr.sh (all eight).
+need ':fs-read :fs-write :process :lisp-eval :spawn :collect :manage :inspect' "$b"
 absent 'sexpr.tui:spawn' "$b"
 absent 'inject-note' "$b"
 
@@ -184,7 +186,25 @@ b="$(boot_file)"
 need '(sexpr.tui:spawn "hello world"' "$b"
 need '(sexpr.tui:inject-note greeter "hello world")' "$b"
 absent 'sexpr.tui:seed' "$b"
-# Restore the pinned default for the cases below.
+
+echo
+echo "[2d] SEXPR_CAPABILITIES sets the boot agent's grants"
+# Narrow override: exactly that list, nothing else.
+CAPS=fs-read out="$(dry)"
+b="$(boot_file)"
+need ":capabilities '(:fs-read))" "$b"
+absent ':fs-write' "$b"
+absent ':lisp-eval' "$b"
+# A grant without :fs-read still gets it, matching the CLI's additive default.
+CAPS=fs-write out="$(dry)"
+b="$(boot_file)"
+need ":capabilities '(:fs-write :fs-read))" "$b"
+# Whitespace around a comma is trimmed, as in sexpr.sh.
+CAPS='fs-read, process' out="$(dry)"
+b="$(boot_file)"
+need ":capabilities '(:fs-read :process))" "$b"
+absent ':fs-write' "$b"
+CAPS='' # restore the pinned default for the cases below
 rm -rf "$STATE"; mkdir -p "$STATE"
 dry >/dev/null
 

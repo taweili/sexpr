@@ -117,7 +117,7 @@ verify: build
 	@echo 'ALL PROBES PASSED'
 
 # Wrapper-only checks: no SBCL, no ./sexpr build needed. Verifies that
-# ./sexpr.sh forwards all four built-in capabilities by default and that
+# ./sexpr.sh forwards all eight capabilities by default and that
 # the SEXPR_CAPABILITIES env override narrows the set. See
 # tools/check-default-capabilities.sh for the probe matrix. Also runs the
 # sexpr-tui.sh launcher checks, which boot no image either.

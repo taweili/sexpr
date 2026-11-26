@@ -61,7 +61,7 @@ export OPENAI_API_KEY="sk-..."   # or ANTHROPIC_API_KEY, GEMINI_API_KEY, ...
 ```
 
 The wrapper `./sexpr.sh` sets local-dev defaults (OpenAI-compatible server on
-`localhost:6969`, model `Qwythos-9B-v2`, all four capabilities) and execs
+`localhost:6969`, model `Qwythos-9B-v2`, all eight capabilities) and execs
 `./sexpr` under `rlwrap`:
 
 ```sh
@@ -320,8 +320,8 @@ export SEXPR_PROVIDER="openai"        # :anthropic | :openai | :gemini | :ollama
 export SEXPR_MODEL="gpt-4o-mini"      # optional; defaults to the provider's default
 export SEXPR_BASE_URL="http://..."    # OpenAI-compatible endpoint (default:
                                        # https://api.openai.com/v1)
-export SEXPR_CAPABILITIES="fs-read"   # comma-separated; grants additive with
-                                       # the built-in default :fs-read
+export SEXPR_CAPABILITIES="fs-read"   # comma-separated caps, read by both
+                                       # wrappers; :fs-read is always added
 ```
 
 The `./sexpr.sh` and `./sexpr-tui.sh` wrappers also load a `.env` beside
@@ -400,7 +400,8 @@ prompt exits.
 |                   | comma-separated list is also accepted). Grants are |
 |                   | additive with the built-in default `:fs-read`. The |
 |                   | known set is `fs-read`, `fs-write`, `process`,     |
-|                   | `lisp-eval`.                                        |
+|                   | `lisp-eval` (built-ins) and `spawn`, `collect`,    |
+|                   | `manage`, `inspect` (multi-agent coordination).    |
 | `--help`, `-h`    | print usage and exit (never enters chat)           |
 
 `--provider`/`--model` reach the transport by the single qualified
@@ -542,7 +543,9 @@ for. A chat note typed into a finished agent still starts a fresh worker, so
 the note gets a turn of its own instead of sitting unanswered in the
 transcript. The image also honors the `SEXPR_PROVIDER` / `SEXPR_MODEL` /
 `SEXPR_BASE_URL` environment variables (see [Model provider](#model-provider)),
-exactly like the CLI does. `SEXPR_TUI_SEED=0` gives the historical behaviour:
+exactly like the CLI does. Its capability set comes from `SEXPR_CAPABILITIES`,
+which defaults to the same eight grants `./sexpr.sh` forwards. `SEXPR_TUI_SEED=0`
+gives the historical behaviour:
 a truly empty image you populate with `/spawn GOAL`.
 
 Every knob is overridable, with no build step and no binary:
@@ -558,6 +561,7 @@ Every knob is overridable, with no build step and no binary:
 | `SEXPR_TUI_SBCLINIT` | `~/.sbclinit` | loaded first, image and client |
 | `SEXPR_TUI_GREETER` | `0` | greet on boot: seed the agent, then say hello |
 | `SEXPR_TUI_SEED` | `1` | register an idle placeholder agent at boot |
+| `SEXPR_CAPABILITIES` | all eight grants | boot agent's capability set; same default as `sexpr.sh` |
 
 Flags (`--host`, `--swank-port`, `--push-port`) win over the environment;
 every other flag is forwarded to `sexpr-tui:main` verbatim. The boot file

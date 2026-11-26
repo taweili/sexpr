@@ -29,6 +29,10 @@
 #   SEXPR_PROVIDER           provider name         (default openai-compatible)
 #   SEXPR_BASE_URL           provider base URL     (default http://localhost:6969/v1)
 #   SEXPR_MODEL              model name            (default Qwythos-9B-v2)
+#   SEXPR_CAPABILITIES       comma-separated caps  (default all eight grants,
+#                            the same list sexpr.sh forwards). Becomes the
+#                            boot-time agent's :capabilities list. Set e.g.
+#                            fs-read for a read-only agent.
 #
 # OWNERSHIP: "server running" means the SWANK port accepts a TCP connection.
 # The wrapper starts an image only when that fails, and tears down only an
@@ -161,6 +165,27 @@ export SEXPR_PROVIDER="${SEXPR_PROVIDER:-openai-compatible}"
 export SEXPR_BASE_URL="${SEXPR_BASE_URL:-http://localhost:6969/v1}"
 export SEXPR_MODEL="${SEXPR_MODEL:-Qwythos-9B-v2}"
 
+# Capability grants — the same variable, default and comma/whitespace parsing
+# as sexpr.sh, so both wrappers hand their agent the same set. The list becomes
+# the boot-time agent's :capabilities (see write_server_boot); the four
+# built-in tool caps are fs-read, fs-write, process, lisp-eval and the four
+# multi-agent coordination caps are spawn, collect, manage, inspect.
+CAPS_LISP=""
+IFS=',' read -r -a caps <<< "${SEXPR_CAPABILITIES:-fs-read,fs-write,process,lisp-eval,spawn,collect,manage,inspect}"
+for cap in "${caps[@]}"; do
+    cap="$(printf '%s' "$cap" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    if [[ -n "$cap" ]]; then
+        CAPS_LISP+=" :$cap"
+    fi
+done
+# The CLI unions its --capability grants with a built-in :fs-read (cli.lisp),
+# so a narrow override still reads files. Match that here or the two wrappers
+# would disagree about what SEXPR_CAPABILITIES=fs-write means.
+if [[ "$CAPS_LISP" != *":fs-read"* && -n "$CAPS_LISP" ]]; then
+    CAPS_LISP+=" :fs-read"
+fi
+CAPS_LISP="(${CAPS_LISP# })"
+
 SERVER_PID=""
 CLIENT_PID=""
 SERVER_FIFO=""
@@ -200,6 +225,8 @@ script sets them too, and exported variables win over .env):
   SEXPR_PROVIDER            provider name         (default openai-compatible)
   SEXPR_BASE_URL            provider base URL     (default http://localhost:6969/v1)
   SEXPR_MODEL               model name            (default Qwythos-9B-v2)
+  SEXPR_CAPABILITIES        comma-separated caps  (default all eight grants,
+                            same default as sexpr.sh; the boot agent's set)
 
 sexpr-tui args (forwarded verbatim):
   --agent NAME             agent name to pick on connect
@@ -347,14 +374,14 @@ write_server_boot() {
 EOF
 
 # The first-screen agent, appended only in the combinations that ask for one.
-# A separate append rather than an interpolated block keeps the Lisp text from
-# being re-read by the shell (an unquoted heredoc treats $( as command
-# substitution). Placement at the end of the boot file is exact: it must follow
-# configure-provider so any turn it drives has a configured endpoint.
+# These heredocs ARE interpolated (for $CAPS_LISP), so a literal '$' in the
+# Lisp text would need escaping; there is none today. Placement at the end of
+# the boot file is exact: it must follow configure-provider so any turn it
+# drives has a configured endpoint.
 if [[ "$SEED" == "1" && "$GREETER" == "1" ]]; then
     # Seed AND greet: the placeholder carries the user line, and inject-note
     # starts its worker, so the welcome turn runs on boot (the old behaviour).
-    cat >> "$boot" <<'SEED'
+    cat >> "$boot" <<SEED
 
 ;;;; THE WELCOME AGENT (SEXPR_TUI_SEED=1, SEXPR_TUI_GREETER=1). One idle
 ;;;; placeholder is registered, then given its own first message so a worker
@@ -362,14 +389,14 @@ if [[ "$SEED" == "1" && "$GREETER" == "1" ]]; then
 ;;;; boot — that is what GREETER opts into. With no provider configured the
 ;;;; turn finishes as :failed and the image still comes up.
 (let ((placeholder (sexpr.tui:seed "hello world"
-                                  :capabilities '(:fs-read :lisp-eval)
+                                  :capabilities '$CAPS_LISP
                                   :note "hello world")))
   (sexpr.tui:inject-note placeholder "hello world"))
 SEED
 elif [[ "$SEED" == "1" ]]; then
     # The default: a real agent row, no worker, no model call. The operator's
     # first Enter drives its first turn.
-    cat >> "$boot" <<'SEED'
+    cat >> "$boot" <<SEED
 
 ;;;; THE PLACEHOLDER AGENT (SEXPR_TUI_SEED=1, the default; SEXPR_TUI_GREETER=0).
 ;;;; Registered but never started: sexpr.tui:seed creates no worker thread, so
@@ -378,16 +405,16 @@ elif [[ "$SEED" == "1" ]]; then
 ;;;; pane is blank and Enter has nowhere to send. The agent reads IDLE until the
 ;;;; operator types, and its first turn is whatever they type. Set
 ;;;; SEXPR_TUI_GREETER=1 to have it greet on boot instead.
-(sexpr.tui:seed "hello world" :capabilities '(:fs-read :lisp-eval))
+(sexpr.tui:seed "hello world" :capabilities '$CAPS_LISP)
 SEED
 elif [[ "$GREETER" == "1" ]]; then
     # GREETER without SEED: the historical boot behaviour, one spawned worker
     # that greets immediately, and no idle placeholder left behind.
-    cat >> "$boot" <<'SEED'
+    cat >> "$boot" <<SEED
 
 ;;;; THE WELCOME AGENT (SEXPR_TUI_GREETER=1, SEXPR_TUI_SEED=0): a worker is
 ;;;; spawned and greeted on boot. Costs one model round per image boot.
-(let ((greeter (sexpr.tui:spawn "hello world" :capabilities '(:fs-read :lisp-eval))))
+(let ((greeter (sexpr.tui:spawn "hello world" :capabilities '$CAPS_LISP))))
   (sexpr.tui:inject-note greeter "hello world"))
 SEED
 fi
